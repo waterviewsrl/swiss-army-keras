@@ -1,6 +1,7 @@
 
 from tensorflow import math
 from tensorflow.keras.layers import Layer
+from tensorflow.keras.utils import register_keras_serializable
 import tensorflow.keras.backend as K
 
 
@@ -13,6 +14,7 @@ def snake_(X, beta):
     return X + (1/beta)*math.square(math.sin(beta*X))
 
 
+@register_keras_serializable(package='swiss_army_keras')
 class GELU(Layer):
     '''
     Gaussian Error Linear Unit (GELU), an alternative of ReLU
@@ -45,6 +47,7 @@ class GELU(Layer):
         return input_shape
 
     
+@register_keras_serializable(package='swiss_army_keras')
 class Snake(Layer):
     '''
     Snake activation function $X + (1/b)*sin^2(b*X)$. Proposed to learn periodic targets.

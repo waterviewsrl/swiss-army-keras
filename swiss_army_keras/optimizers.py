@@ -2,151 +2,63 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-from tensorflow.python.eager import def_function
-from tensorflow.python.framework import ops
-from tensorflow.python.keras import backend_config
-from tensorflow.python.keras.optimizer_v2 import optimizer_v2
-from tensorflow.python.ops import array_ops
-from tensorflow.python.ops import control_flow_ops
-from tensorflow.python.ops import math_ops
-from tensorflow.python.ops import state_ops
-from tensorflow.python.training import training_ops
-from tensorflow.python.util.tf_export import keras_export
-
-
-import abc
-import contextlib
-import functools
-
-import six
-import tensorflow as tf
-import numpy as np
-from tensorflow.python.distribute import distribution_strategy_context as distribute_ctx
-from tensorflow.python.distribute import parameter_server_strategy
-from tensorflow.python.distribute import reduce_util as ds_reduce_util
-from tensorflow.python.distribute import values as ds_values
-from tensorflow.python.eager import backprop
-from tensorflow.python.eager import context
-from tensorflow.python.framework import dtypes
-from tensorflow.python.framework import ops
-from tensorflow.python.framework import tensor_util
-from tensorflow.python.keras import backend
-from tensorflow.python.keras import initializers
-from tensorflow.python.keras.engine import base_layer_utils
-from tensorflow.python.keras.optimizer_v2 import learning_rate_schedule
-from tensorflow.python.keras.utils import generic_utils
-from tensorflow.python.keras.utils import tf_utils
-from tensorflow.python.ops import array_ops
-from tensorflow.python.ops import clip_ops
-from tensorflow.python.ops import control_flow_ops
-from tensorflow.python.ops import gradients
-from tensorflow.python.ops import math_ops
-from tensorflow.python.ops import resource_variable_ops
-from tensorflow.python.ops import variables as tf_variables
-from tensorflow.python.platform import tf_logging as logging
-from tensorflow.python.saved_model import revived_types
-from tensorflow.python.training.tracking import base as trackable
-from tensorflow.python.training.tracking import tracking
-from tensorflow.python.util import nest
-from tensorflow.python.util import tf_inspect
-from tensorflow.python.util.tf_export import keras_export
-from tensorflow.python.util.tf_export import tf_export
+from typing import Callable, Dict, Union
 
 import numpy as np
 import tensorflow as tf
-from tensorflow.keras import backend as K
-from tensorflow.keras.optimizers import Optimizer
 
 
-from tensorflow.python.eager import context
-from tensorflow.python.framework import ops
-from tensorflow.python.ops import control_flow_ops
-from tensorflow.python.ops import math_ops
-from tensorflow.python.ops import resource_variable_ops
-from tensorflow.python.ops import state_ops
-from tensorflow.python.training import optimizer
-from tensorflow.python.training import training_ops
-
-
-from typeguard import typechecked
-
-from typing import Union, Callable, List, Dict
-
-
-# TODO: Remove once https://github.com/tensorflow/tensorflow/issues/44613 is resolved
-if tf.__version__[:3] > "2.5":
-    from keras.engine import keras_tensor
-else:
-    from tensorflow.python.keras.engine import keras_tensor
-
-
-Number = Union[
-    float,
-    int,
-    np.float16,
-    np.float32,
-    np.float64,
-    np.int8,
-    np.int16,
-    np.int32,
-    np.int64,
-    np.uint8,
-    np.uint16,
-    np.uint32,
-    np.uint64,
-]
-
-Initializer = Union[None, dict, str, Callable,
-                    tf.keras.initializers.Initializer]
-Regularizer = Union[None, dict, str, Callable,
-                    tf.keras.regularizers.Regularizer]
-Constraint = Union[None, dict, str, Callable, tf.keras.constraints.Constraint]
-Activation = Union[None, str, Callable]
-Optimizer = Union[tf.keras.optimizers.Optimizer, str]
-
-TensorLike = Union[
-    List[Union[Number, list]],
-    tuple,
-    Number,
-    np.ndarray,
-    tf.Tensor,
-    tf.SparseTensor,
-    tf.Variable,
-    keras_tensor.KerasTensor,
-]
+Number = Union[float, int, np.floating, np.integer]
 FloatTensorLike = Union[tf.Tensor, float, np.float16, np.float32, np.float64]
-AcceptableDTypes = Union[tf.DType, np.dtype, type, int, str, None]
+
+# All four optimizers below target the modern `tf.keras.optimizers.Optimizer`
+# base class (the `build()`/`update_step()` API introduced in TF 2.11, still
+# the public optimizer API on the legacy-Keras-2 `tf.keras` this package
+# forces via `TF_USE_LEGACY_KERAS`, see `swiss_army_keras/__init__.py`).
+# Earlier versions of this file targeted a mix of removed private
+# `tensorflow.python.keras.*`/`tensorflow.python.training.*` internals and
+# would not import on any reasonably current TensorFlow.
 
 
 def _solve(a, b, c):
-    """Return solution of a quadratic minimization.
-    The optimization equation is:
-         f(a, b, c) = argmin_w{1/2 * a * w^2 + b * w + c * |w|}
-    we get optimal solution w*:
-         w* = -(b - sign(b)*c)/a if |b| > c else w* = 0
-    REQUIRES: Dimensionality of a and b must be same
-    Args:
-      a: A Tensor
-      b: A Tensor
-      c: A Tensor with one element.
-    Returns:
-      A Tensor w, which is solution for the equation
+    """Closed-form solution of the L1/L2 proximal step used by `Yogi`.
+
+    Solves f(w) = argmin_w{1/2 * a * w^2 + b * w + c * |w|}.
+
+    Input
+    ----------
+        a: A Tensor
+        b: A Tensor
+        c: A Tensor with one element.
+
+    Output
+    ----------
+        w: A Tensor, the solution to the minimization above.
     """
     w = (c * tf.sign(b) - b) / a
     w = tf.cast(tf.abs(b) > c, dtype=b.dtype) * w
     return w
 
 
-#@tf.keras.utils.register_keras_serializable(package="Addons")
-
-
 class Yogi(tf.keras.optimizers.Optimizer):
-    """Optimizer that implements the Yogi algorithm in Keras.
+    """Optimizer that implements the Yogi algorithm.
+
     See Algorithm 2 of
     https://papers.nips.cc/paper/8186-adaptive-methods-for-nonconvex-optimization.pdf.
+
+    Input
+    ----------
+        learning_rate: A float or a schedule. The learning rate.
+        beta1: exponential decay rate for the 1st moment estimate. Set to 0
+               to disable momentum (plain adaptive-LR update on `v` only).
+        beta2: exponential decay rate for the 2nd moment (`v`) estimate.
+        epsilon: a constant trading off adaptivity and noise.
+        l1_regularization_strength: L1 proximal regularization strength, >= 0.
+        l2_regularization_strength: L2 proximal regularization strength, >= 0.
+        initial_accumulator_value: starting value for the `v` accumulator.
+        activation: 'sign' or 'tanh' — how `v` is updated from `g^2 - v`.
     """
 
-    @typechecked
     def __init__(
         self,
         learning_rate: Union[FloatTensorLike, Callable] = 0.01,
@@ -160,325 +72,127 @@ class Yogi(tf.keras.optimizers.Optimizer):
         name: str = "Yogi",
         **kwargs,
     ):
-        """Construct a new Yogi optimizer.
-        Args:
-          learning_rate: A Tensor or a floating point value.
-            The learning rate.
-          beta1: A float value or a constant float tensor.
-            The exponential decay rate for the 1st moment estimates.
-          beta2: A float value or a constant float tensor.
-            The exponential decay rate for the 2nd moment estimates.
-          epsilon: A constant trading off adaptivity and noise.
-          l1_regularization_strength: A float value, must be greater than or
-            equal to zero.
-          l2_regularization_strength: A float value, must be greater than or
-            equal to zero.
-          initial_accumulator_value: The starting value for accumulators.
-            Only positive values are allowed.
-          activation: Use hard sign or soft tanh to determin sign.
-          name: Optional name for the operations created when applying
-            gradients. Defaults to "Yogi".
-          **kwargs: keyword arguments. Allowed to be {`clipnorm`, `clipvalue`,
-            `lr`, `decay`}. `clipnorm` is clip gradients by norm; `clipvalue`
-            is clip gradients by value, `decay` is included for backward
-            compatibility to allow time inverse decay of learning rate. `lr`
-            is included for backward compatibility, recommended to use
-            `learning_rate` instead.
-        """
-        super().__init__(name, **kwargs)
-        self._set_hyper("learning_rate", kwargs.get("lr", learning_rate))
-        self._set_hyper("decay", self._initial_decay)
-        self._set_hyper("beta_1", beta1)
-        self._set_hyper("beta_2", beta2)
-        self._set_hyper("epsilon", epsilon)
-        self._set_hyper("l1_regularization_strength",
-                        l1_regularization_strength)
-        self._set_hyper("l2_regularization_strength",
-                        l2_regularization_strength)
+        if activation not in ("sign", "tanh"):
+            raise ValueError("activation must be 'sign' or 'tanh'")
+        super().__init__(name=name, **kwargs)
+        self._learning_rate = self._build_learning_rate(learning_rate)
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.epsilon = epsilon
+        self.l1_regularization_strength = l1_regularization_strength
+        self.l2_regularization_strength = l2_regularization_strength
+        self.initial_accumulator_value = initial_accumulator_value
+        self.activation = activation
 
-        self._beta1 = beta1
-        self._activation = activation
-        self._initial_accumulator_value = initial_accumulator_value
-        self._l1_regularization_strength = l1_regularization_strength
-        self._l2_regularization_strength = l2_regularization_strength
-
-    def _create_slots(self, var_list):
-        """See `tf.train.Optimizer._create_slots()`."""
-        # Create slots for the first and second moments, and maximum second moments.
+    def build(self, var_list):
+        if getattr(self, "_built", False):
+            return
+        super().build(var_list)
+        self._built = True
+        self._v = []
+        self._m = []
         for var in var_list:
-            init = tf.constant_initializer(self._initial_accumulator_value)
-            self.add_slot(var, "v", init)
-            if self._beta1 > 0.0:
-                self.add_slot(var, "m")
+            init_v = tf.fill(
+                tf.shape(var), tf.cast(self.initial_accumulator_value, var.dtype)
+            )
+            self._v.append(
+                self.add_variable_from_reference(
+                    model_variable=var, variable_name="v", initial_value=init_v
+                )
+            )
+            if self.beta1 > 0.0:
+                self._m.append(
+                    self.add_variable_from_reference(model_variable=var, variable_name="m")
+                )
 
-    def _resource_apply_dense(self, grad, var):
-        """See `tf.train.Optimizer._apply_dense()`."""
-        var_dtype = var.dtype.base_dtype
-        lr_t = self._decayed_lr(var_dtype)
-        beta1_t = self._get_hyper("beta_1", var_dtype)
-        beta2_t = self._get_hyper("beta_2", var_dtype)
-        epsilon_t = self._get_hyper("epsilon", var_dtype)
-        l1_t = self._get_hyper("l1_regularization_strength", var_dtype)
-        l2_t = self._get_hyper("l2_regularization_strength", var_dtype)
+    def update_step(self, gradient, variable):
+        var_dtype = variable.dtype
+        lr = tf.cast(self.learning_rate, var_dtype)
+        beta1 = tf.cast(self.beta1, var_dtype)
+        beta2 = tf.cast(self.beta2, var_dtype)
+        epsilon = tf.cast(self.epsilon, var_dtype)
+        l1 = tf.cast(self.l1_regularization_strength, var_dtype)
+        l2 = tf.cast(self.l2_regularization_strength, var_dtype)
+
         local_step = tf.cast(self.iterations + 1, var_dtype)
-        beta1_power = tf.pow(beta1_t, local_step)
-        beta2_power = tf.pow(beta2_t, local_step)
+        beta1_power = tf.pow(beta1, local_step)
+        beta2_power = tf.pow(beta2, local_step)
+        step_size = lr * tf.sqrt(1 - beta2_power) / (1 - beta1_power)
 
-        lr = lr_t * tf.sqrt(1 - beta2_power) / (1 - beta1_power)
+        var_key = self._var_key(variable)
+        v = self._v[self._index_dict[var_key]]
 
-        update_vs = []
-        if self._beta1 == 0.0:
-            # v_t = v + sign(g_t^2-v)(g_t^2)
-            v = self.get_slot(var, "v")
-            grad2 = grad * grad
-            if self._activation == "sign":
-                sign = tf.sign(grad2 - v)
-            elif self._activation == "tanh":
-                sign = tf.tanh(10 * (grad2 - v))
-            else:
-                raise NotImplementedError(
-                    "Activation function can be sign or tanh")
-            v_t = v.assign_add(
-                (1 - beta2_t) * sign * grad2, use_locking=self._use_locking
-            )
-            v_sqrt = tf.sqrt(v_t)
-
-            # Yogi effective LR
-            per_coord_lr = lr / (v_sqrt + epsilon_t)
-
-            # Variable update
-            # Step 1: Gradient descent
-            new_var = var - per_coord_lr * grad
-            # Step 2: Prox operator
-            if self._l1_regularization_strength > 0:
-                new_var = _solve(1 + l2_t * per_coord_lr, -
-                                 new_var, l1_t * per_coord_lr)
-            elif self._l2_regularization_strength > 0:
-                new_var = new_var / (1 + l2_t * per_coord_lr)
-            # Step 3: Update
-            var_update = var.assign(new_var, use_locking=self._use_locking)
-
-            update_vs.append(var_update)
-            update_vs.append(v_t)
-
+        dense_grad = (
+            tf.convert_to_tensor(gradient)
+            if isinstance(gradient, tf.IndexedSlices)
+            else gradient
+        )
+        grad2 = tf.square(dense_grad)
+        if self.activation == "sign":
+            sign = tf.sign(grad2 - v)
         else:
-            # m_t = beta1 * m + (1 - beta1) * g_t
-            m = self.get_slot(var, "m")
-            m_t = m.assign(
-                m * beta1_t + grad * (1 - beta1_t), use_locking=self._use_locking
-            )
+            sign = tf.tanh(10 * (grad2 - v))
+        v.assign_add((1 - beta2) * sign * grad2)
+        per_coord_lr = step_size / (tf.sqrt(v) + epsilon)
 
-            # v_t = v + sign(g_t^2-v)(g_t^2)
-            v = self.get_slot(var, "v")
-            grad2 = grad * grad
-            if self._activation == "sign":
-                sign = tf.sign(grad2 - v)
-            elif self._activation == "tanh":
-                sign = tf.tanh(10 * (grad2 - v))
-            else:
-                raise NotImplementedError(
-                    "Activation function can be sign or tanh")
-            v_t = v.assign_add(
-                (1 - beta2_t) * sign * grad2, use_locking=self._use_locking
-            )
-            v_sqrt = tf.sqrt(v_t)
-
-            # Yogi effective LR
-            per_coord_lr = lr / (v_sqrt + epsilon_t)
-
-            # Variable update
-            # Step 1: Gradient descent
-            new_var = var - per_coord_lr * m_t
-            # Step 2: Prox operator
-            if self._l1_regularization_strength > 0:
-                new_var = _solve(1 + l2_t * per_coord_lr, -
-                                 new_var, l1_t * per_coord_lr)
-            elif self._l2_regularization_strength > 0:
-                new_var = new_var / (1 + l2_t * per_coord_lr)
-            # Step 3: Update
-            var_update = var.assign(new_var, use_locking=self._use_locking)
-            update_vs.append(var_update)
-            update_vs.append(m_t)
-            update_vs.append(v_t)
-
-        # Create an op that groups all the above operations
-        return tf.group(*update_vs)
-
-    def _resource_apply_sparse(self, grad, var, indices):
-        """Applies sparse gradients to a variable.
-        Args:
-          grad: A tensor for the `values` of `tf.IndexedSlices`.
-          var: A `tf.Variable` object.
-          indices: A tensor for the `indices` of `tf.IndexedSlices`.
-        Returns:
-          An op which updates `var` with `grad` and `indices`.
-        """
-
-        var_dtype = var.dtype.base_dtype
-        lr_t = self._decayed_lr(var_dtype)
-        beta1_t = self._get_hyper("beta_1", var_dtype)
-        beta2_t = self._get_hyper("beta_2", var_dtype)
-        epsilon_t = self._get_hyper("epsilon", var_dtype)
-        l1_t = self._get_hyper("l1_regularization_strength", var_dtype)
-        l2_t = self._get_hyper("l2_regularization_strength", var_dtype)
-        local_step = tf.cast(self.iterations + 1, var_dtype)
-        beta1_power = tf.pow(beta1_t, local_step)
-        beta2_power = tf.pow(beta2_t, local_step)
-
-        lr = lr_t * tf.sqrt(1 - beta2_power) / (1 - beta1_power)
-
-        update_vs = []
-        if self._beta1 == 0.0:
-            # v_t = v + sign(g_t^2-v)(g_t^2)
-            v = self.get_slot(var, "v")
-            grad2 = grad * grad
-            v_slice = tf.gather(v, indices)
-            if self._activation == "sign":
-                sign = tf.sign(grad2 - v_slice)
-            elif self._activation == "tanh":
-                sign = tf.tanh(10 * (grad2 - v_slice))
-            else:
-                raise NotImplementedError(
-                    "Activation function can be sign or tanh")
-            v_scaled_g_values = v_slice + (1 - beta2_t) * sign * grad2
-            v_t = self._resource_scatter_update(v, indices, v_scaled_g_values)
-            v_sqrt = tf.sqrt(v_scaled_g_values)
-
-            # Yogi effective LR
-            per_coord_lr = lr / (v_sqrt + epsilon_t)
-
-            # Variable update
-            # Step 1: Gradient descent
-            var_slice = tf.gather(var, indices)
-            new_var = var_slice - per_coord_lr * grad
-            # Step 2: Prox operator
-            if self._l1_regularization_strength > 0:
-                new_var = _solve(1 + l2_t * per_coord_lr, -
-                                 new_var, l1_t * per_coord_lr)
-            elif self._l2_regularization_strength > 0:
-                new_var = new_var / (1 + l2_t * per_coord_lr)
-            # Step 3: Update
-            var_update = self._resource_scatter_update(var, indices, new_var)
-            update_vs.append(var_update)
-            update_vs.append(v_t)
-
+        if self.beta1 > 0.0:
+            m = self._m[self._index_dict[var_key]]
+            m.assign(beta1 * m + (1 - beta1) * dense_grad)
+            update = m
         else:
-            # m_t = beta1 * m + (1 - beta1) * g_t
-            m = self.get_slot(var, "m")
-            m_scaled_g_values = grad * (1 - beta1_t)
-            m_t = m.assign(m * beta1_t, use_locking=self._use_locking)
-            with tf.control_dependencies([m_t]):
-                m_slice = tf.gather(m, indices) + m_scaled_g_values
-                m_t = self._resource_scatter_update(m, indices, m_slice)
+            update = dense_grad
 
-            # v_t = v + sign(g_t^2-v)(g_t^2)
-            v = self.get_slot(var, "v")
-            grad2 = grad * grad
-            v_slice = tf.gather(v, indices)
-            if self._activation == "sign":
-                sign = tf.sign(grad2 - tf.gather(v, indices))
-            elif self._activation == "tanh":
-                sign = tf.tanh(10 * (grad2 - tf.gather(v, indices)))
-            else:
-                raise NotImplementedError(
-                    "Activation function can be sign or tanh")
-            v_scaled_g_values = v_slice + (1 - beta2_t) * sign * grad2
-            v_t = self._resource_scatter_update(v, indices, v_scaled_g_values)
-            v_sqrt = tf.sqrt(v_scaled_g_values)
-
-            # Yogi effective LR
-            per_coord_lr = lr / (v_sqrt + epsilon_t)
-
-            # Variable update
-            # Step 1: Gradient descent
-            var_slice = tf.gather(var, indices)
-            new_var = var_slice - per_coord_lr * m_slice
-            # Step 2: Prox operator
-            if self._l1_regularization_strength > 0:
-                new_var = _solve(1 + l2_t * per_coord_lr, -
-                                 new_var, l1_t * per_coord_lr)
-            elif self._l2_regularization_strength > 0:
-                new_var = new_var / (1 + l2_t * per_coord_lr)
-            # Step 3: Update
-            var_update = self._resource_scatter_update(var, indices, new_var)
-            update_vs.append(var_update)
-            update_vs.append(m_t)
-            update_vs.append(v_t)
-
-        # Create an op that groups all the above operations
-        return tf.group(*update_vs)
+        new_var = variable - per_coord_lr * update
+        if self.l1_regularization_strength > 0:
+            new_var = _solve(1 + l2 * per_coord_lr, -new_var, l1 * per_coord_lr)
+        elif self.l2_regularization_strength > 0:
+            new_var = new_var / (1 + l2 * per_coord_lr)
+        variable.assign(new_var)
 
     def get_config(self):
         config = super().get_config()
         config.update(
             {
-                "learning_rate": self._serialize_hyperparameter("learning_rate"),
-                "decay": self._serialize_hyperparameter("decay"),
-                "beta1": self._serialize_hyperparameter("beta_1"),
-                "beta2": self._serialize_hyperparameter("beta_2"),
-                "epsilon": self._serialize_hyperparameter("epsilon"),
-                "l1_regularization_strength": self._serialize_hyperparameter(
-                    "l1_regularization_strength"
-                ),
-                "l2_regularization_strength": self._serialize_hyperparameter(
-                    "l2_regularization_strength"
-                ),
-                "activation": self._activation,
-                "initial_accumulator_value": self._initial_accumulator_value,
+                "learning_rate": self._serialize_hyperparameter(self._learning_rate),
+                "beta1": self.beta1,
+                "beta2": self.beta2,
+                "epsilon": self.epsilon,
+                "l1_regularization_strength": self.l1_regularization_strength,
+                "l2_regularization_strength": self.l2_regularization_strength,
+                "initial_accumulator_value": self.initial_accumulator_value,
+                "activation": self.activation,
             }
         )
         return config
 
 
-#@tf.keras.utils.register_keras_serializable(package="Addons")
-
-
 class RectifiedAdam2(tf.keras.optimizers.Optimizer):
-    """Variant of the Adam optimizer whose adaptive learning rate is rectified
-    so as to have a consistent variance.
-    It implements the Rectified Adam (a.k.a. RAdam) proposed by
-    Liyuan Liu et al. in [On The Variance Of The Adaptive Learning Rate
-    And Beyond](https://arxiv.org/pdf/1908.03265v1.pdf).
-    Example of usage:
-    ```python
-    opt = tfa.optimizers.RectifiedAdam(lr=1e-3)
-    ```
-    Note: `amsgrad` is not described in the original paper. Use it with
-          caution.
-    RAdam is not a placement of the heuristic warmup, the settings should be
-    kept if warmup has already been employed and tuned in the baseline method.
-    You can enable warmup by setting `total_steps` and `warmup_proportion`:
-    ```python
-    opt = tfa.optimizers.RectifiedAdam(
-        lr=1e-3,
-        total_steps=10000,
-        warmup_proportion=0.1,
-        min_lr=1e-5,
-    )
-    ```
-    In the above example, the learning rate will increase linearly
-    from 0 to `lr` in 1000 steps, then decrease linearly from `lr` to `min_lr`
-    in 9000 steps.
-    Lookahead, proposed by Michael R. Zhang et.al in the paper
-    [Lookahead Optimizer: k steps forward, 1 step back]
-    (https://arxiv.org/abs/1907.08610v1), can be integrated with RAdam,
-    which is announced by Less Wright and the new combined optimizer can also
-    be called "Ranger". The mechanism can be enabled by using the lookahead
-    wrapper. For example:
-    ```python
-    radam = tfa.optimizers.RectifiedAdam()
-    ranger = tfa.optimizers.Lookahead(radam, sync_period=6, slow_step_size=0.5)
-    ```
+    """Rectified Adam (RAdam), with optional warmup.
+
+    Liyuan Liu et al., "On The Variance Of The Adaptive Learning Rate And
+    Beyond" (https://arxiv.org/pdf/1908.03265v1.pdf).
+
+    Input
+    ----------
+        learning_rate: A float or a schedule.
+        beta_1, beta_2: exponential decay rates for the 1st/2nd moments.
+        epsilon: small constant for numerical stability.
+        weight_decay: decoupled weight decay factor.
+        amsgrad: whether to use the AMSGrad variant.
+        sma_threshold: threshold on the simple moving average length below
+                       which the update falls back to plain SGD-with-momentum.
+        total_steps: enables linear warmup + linear decay when > 0.
+        warmup_proportion: fraction of `total_steps` spent warming up.
+        min_lr: floor for the learning rate once decay is enabled.
     """
 
-    @typechecked
     def __init__(
         self,
-        learning_rate: Union[FloatTensorLike, Callable, Dict] = 0.001,
+        learning_rate: Union[FloatTensorLike, Callable] = 0.001,
         beta_1: FloatTensorLike = 0.9,
         beta_2: FloatTensorLike = 0.999,
         epsilon: FloatTensorLike = 1e-7,
-        weight_decay: Union[FloatTensorLike, Callable, Dict] = 0.0,
+        weight_decay: FloatTensorLike = 0.0,
         amsgrad: bool = False,
         sma_threshold: FloatTensorLike = 5.0,
         total_steps: int = 0,
@@ -487,579 +201,280 @@ class RectifiedAdam2(tf.keras.optimizers.Optimizer):
         name: str = "RectifiedAdam",
         **kwargs,
     ):
-        r"""Construct a new RAdam optimizer.
-        Args:
-            learning_rate: A `Tensor` or a floating point value, or a schedule
-                that is a `tf.keras.optimizers.schedules.LearningRateSchedule`.
-                The learning rate.
-            beta_1: A float value or a constant float tensor.
-                The exponential decay rate for the 1st moment estimates.
-            beta_2: A float value or a constant float tensor.
-                The exponential decay rate for the 2nd moment estimates.
-            epsilon: A small constant for numerical stability.
-            weight_decay: A `Tensor` or a floating point value, or a schedule
-                that is a `tf.keras.optimizers.schedules.LearningRateSchedule`.
-                Weight decay for each parameter.
-            amsgrad: boolean. Whether to apply AMSGrad variant of this
-                algorithm from the paper "On the Convergence of Adam and
-                beyond".
-            sma_threshold. A float value.
-                The threshold for simple mean average.
-            total_steps: An integer value. Total number of training steps.
-                Enable warmup by setting a positive value.
-            warmup_proportion: A floating point value.
-                The proportion of increasing steps.
-            min_lr: A floating point value. Minimum learning rate after warmup.
-            name: Optional name for the operations created when applying
-                gradients. Defaults to "RectifiedAdam".
-            **kwargs: keyword arguments. Allowed to be {`clipnorm`,
-                `clipvalue`, `lr`, `decay`}. `clipnorm` is clip gradients
-                by norm; `clipvalue` is clip gradients by value, `decay` is
-                included for backward compatibility to allow time inverse
-                decay of learning rate. `lr` is included for backward
-                compatibility, recommended to use `learning_rate` instead.
-        """
-        super().__init__(name, **kwargs)
-
-        if isinstance(learning_rate, Dict):
-            learning_rate = tf.keras.optimizers.schedules.deserialize(
-                learning_rate)
-
-        if isinstance(weight_decay, Dict):
-            weight_decay = tf.keras.optimizers.schedules.deserialize(
-                weight_decay)
-
-        self._set_hyper("learning_rate", kwargs.get("lr", learning_rate))
-        self._set_hyper("beta_1", beta_1)
-        self._set_hyper("beta_2", beta_2)
-        self._set_hyper("decay", self._initial_decay)
-        self._set_hyper("weight_decay", weight_decay)
-        self._set_hyper("sma_threshold", sma_threshold)
-        self._set_hyper("total_steps", float(total_steps))
-        self._set_hyper("warmup_proportion", warmup_proportion)
-        self._set_hyper("min_lr", min_lr)
-        self.epsilon = epsilon or tf.keras.backend.epsilon()
+        super().__init__(name=name, **kwargs)
+        self._learning_rate = self._build_learning_rate(learning_rate)
+        self.beta_1 = beta_1
+        self.beta_2 = beta_2
+        self.epsilon = epsilon
+        self.weight_decay = weight_decay
         self.amsgrad = amsgrad
-        self._has_weight_decay = weight_decay != 0.0
-        self._initial_total_steps = total_steps
+        self.sma_threshold = sma_threshold
+        self.total_steps = total_steps
+        self.warmup_proportion = warmup_proportion
+        self.min_lr = min_lr
 
-    def _create_slots(self, var_list):
+    def build(self, var_list):
+        if getattr(self, "_built", False):
+            return
+        super().build(var_list)
+        self._built = True
+        self._m = []
+        self._v = []
+        self._vhat = []
         for var in var_list:
-            self.add_slot(var, "m")
-        for var in var_list:
-            self.add_slot(var, "v")
-        if self.amsgrad:
-            for var in var_list:
-                self.add_slot(var, "vhat")
+            self._m.append(self.add_variable_from_reference(model_variable=var, variable_name="m"))
+            self._v.append(self.add_variable_from_reference(model_variable=var, variable_name="v"))
+            if self.amsgrad:
+                self._vhat.append(
+                    self.add_variable_from_reference(model_variable=var, variable_name="vhat")
+                )
 
-    def set_weights(self, weights):
-        params = self.weights
-        num_vars = int((len(params) - 1) / 2)
-        if len(weights) == 3 * num_vars + 1:
-            weights = weights[: len(params)]
-        super().set_weights(weights)
+    def update_step(self, gradient, variable):
+        var_dtype = variable.dtype
+        lr = tf.cast(self.learning_rate, var_dtype)
+        beta_1 = tf.cast(self.beta_1, var_dtype)
+        beta_2 = tf.cast(self.beta_2, var_dtype)
+        epsilon = tf.cast(self.epsilon, var_dtype)
+        weight_decay = tf.cast(self.weight_decay, var_dtype)
 
-    def _decayed_wd(self, var_dtype):
-        wd_t = self._get_hyper("weight_decay", var_dtype)
-        if isinstance(wd_t, tf.keras.optimizers.schedules.LearningRateSchedule):
-            wd_t = tf.cast(wd_t(self.iterations), var_dtype)
-        return wd_t
-
-    def _prepare_local(self, var_device, var_dtype, apply_state):
-        super()._prepare_local(var_device, var_dtype, apply_state)
-        lr_t = self._decayed_lr(var_dtype)
-        wd_t = self._decayed_wd(var_dtype)
-        beta_1_t = self._get_hyper("beta_1", var_dtype)
-        beta_2_t = self._get_hyper("beta_2", var_dtype)
         local_step = tf.cast(self.iterations + 1, var_dtype)
-        beta_1_power = tf.pow(beta_1_t, local_step)
-        beta_2_power = tf.pow(beta_2_t, local_step)
-        one_minus_beta_1_t = 1.0 - beta_1_t
-        recip_one_minus_beta_1_power = 1.0 / (1.0 - beta_1_power)
-        one_minus_beta_2_t = 1.0 - beta_2_t
-        recip_one_minus_beta_2_power = 1.0 / (1.0 - beta_2_power)
-        sma_inf = 2.0 / one_minus_beta_2_t - 1.0
-        sma_t = sma_inf - 2.0 * local_step * beta_2_power * recip_one_minus_beta_2_power
-        r_t = tf.sqrt(
-            (sma_t - 4.0)
-            / (sma_inf - 4.0)
-            * (sma_t - 2.0)
-            / (sma_inf - 2.0)
-            * sma_inf
-            / sma_t
-        )
-        sma_threshold = self._get_hyper("sma_threshold", var_dtype)
-        sma_t_ge_sma_threshold = sma_t >= sma_threshold
-        if self._initial_total_steps > 0:
-            total_steps = self._get_hyper("total_steps", var_dtype)
-            warmup_steps = total_steps * \
-                self._get_hyper("warmup_proportion", var_dtype)
-            min_lr = self._get_hyper("min_lr", var_dtype)
+        beta_1_power = tf.pow(beta_1, local_step)
+        beta_2_power = tf.pow(beta_2, local_step)
+
+        if self.total_steps > 0:
+            total_steps = tf.cast(self.total_steps, var_dtype)
+            warmup_steps = total_steps * tf.cast(self.warmup_proportion, var_dtype)
+            min_lr = tf.cast(self.min_lr, var_dtype)
             decay_steps = tf.maximum(total_steps - warmup_steps, 1)
-            decay_rate = (min_lr - lr_t) / decay_steps
-            lr_t = tf.where(
+            decay_rate = (min_lr - lr) / decay_steps
+            lr = tf.where(
                 local_step <= warmup_steps,
-                lr_t * (local_step / warmup_steps),
-                lr_t + decay_rate *
-                tf.minimum(local_step - warmup_steps, decay_steps),
+                lr * (local_step / warmup_steps),
+                lr + decay_rate * tf.minimum(local_step - warmup_steps, decay_steps),
             )
-        apply_state[(var_device, var_dtype)].update(
-            dict(
-                lr_t=lr_t,
-                wd_t=wd_t,
-                beta_1_t=beta_1_t,
-                beta_2_t=beta_2_t,
-                epsilon_t=tf.convert_to_tensor(self.epsilon, var_dtype),
-                local_step=local_step,
-                beta_1_power=beta_1_power,
-                beta_2_power=beta_2_power,
-                sma_inf=sma_inf,
-                sma_t=sma_t,
-                one_minus_beta_1_t=one_minus_beta_1_t,
-                recip_one_minus_beta_1_power=recip_one_minus_beta_1_power,
-                one_minus_beta_2_t=one_minus_beta_2_t,
-                recip_one_minus_beta_2_power=recip_one_minus_beta_2_power,
-                r_t=r_t,
-                sma_t_ge_sma_threshold=sma_t_ge_sma_threshold,
-            )
+
+        dense_grad = (
+            tf.convert_to_tensor(gradient)
+            if isinstance(gradient, tf.IndexedSlices)
+            else gradient
         )
 
-    def _resource_apply_dense(self, grad, var, apply_state=None):
-        var_device, var_dtype = var.device, var.dtype.base_dtype
-        coef = (apply_state or {}).get(
-            (var_device, var_dtype)
-        ) or self._fallback_apply_state(var_device, var_dtype)
-        m = self.get_slot(var, "m")
-        v = self.get_slot(var, "v")
+        var_key = self._var_key(variable)
+        idx = self._index_dict[var_key]
+        m = self._m[idx]
+        v = self._v[idx]
 
-        m_t = m.assign(
-            coef["beta_1_t"] * m + coef["one_minus_beta_1_t"] * grad,
-            use_locking=self._use_locking,
-        )
-        m_corr_t = m_t * coef["recip_one_minus_beta_1_power"]
+        m.assign(beta_1 * m + (1 - beta_1) * dense_grad)
+        v.assign(beta_2 * v + (1 - beta_2) * tf.square(dense_grad))
 
-        v_t = v.assign(
-            coef["beta_2_t"] * v +
-            coef["one_minus_beta_2_t"] * tf.square(grad),
-            use_locking=self._use_locking,
-        )
+        m_corr_t = m / (1 - beta_1_power)
+
         if self.amsgrad:
-            vhat = self.get_slot(var, "vhat")
-            vhat_t = vhat.assign(tf.maximum(vhat, v_t),
-                                 use_locking=self._use_locking)
-            v_corr_t = tf.sqrt(vhat_t * coef["recip_one_minus_beta_2_power"])
+            vhat = self._vhat[idx]
+            vhat.assign(tf.maximum(vhat, v))
+            v_corr_t = tf.sqrt(vhat / (1 - beta_2_power))
         else:
-            vhat_t = None
-            v_corr_t = tf.sqrt(v_t * coef["recip_one_minus_beta_2_power"])
+            v_corr_t = tf.sqrt(v / (1 - beta_2_power))
+
+        sma_inf = 2.0 / (1 - beta_2) - 1.0
+        sma_t = sma_inf - 2.0 * local_step * beta_2_power / (1 - beta_2_power)
+
+        r_t = tf.sqrt(
+            tf.maximum((sma_t - 4.0) * (sma_t - 2.0) * sma_inf, 0.0)
+            / tf.maximum((sma_inf - 4.0) * (sma_inf - 2.0) * sma_t, epsilon)
+        )
 
         var_t = tf.where(
-            coef["sma_t_ge_sma_threshold"],
-            coef["r_t"] * m_corr_t / (v_corr_t + coef["epsilon_t"]),
+            sma_t >= self.sma_threshold,
+            r_t * m_corr_t / (v_corr_t + epsilon),
             m_corr_t,
         )
 
-        if self._has_weight_decay:
-            var_t += coef["wd_t"] * var
+        if self.weight_decay > 0:
+            var_t += weight_decay * variable
 
-        var_update = var.assign_sub(
-            coef["lr_t"] * var_t, use_locking=self._use_locking)
-
-        updates = [var_update, m_t, v_t]
-        if self.amsgrad:
-            updates.append(vhat_t)
-        return tf.group(*updates)
-
-    def _resource_apply_sparse(self, grad, var, indices, apply_state=None):
-        var_device, var_dtype = var.device, var.dtype.base_dtype
-        coef = (apply_state or {}).get(
-            (var_device, var_dtype)
-        ) or self._fallback_apply_state(var_device, var_dtype)
-
-        m = self.get_slot(var, "m")
-        m_scaled_g_values = grad * coef["one_minus_beta_1_t"]
-        m_t = m.assign(m * coef["beta_1_t"], use_locking=self._use_locking)
-        with tf.control_dependencies([m_t]):
-            m_t = self._resource_scatter_add(m, indices, m_scaled_g_values)
-        m_corr_t = m_t * coef["recip_one_minus_beta_1_power"]
-
-        v = self.get_slot(var, "v")
-        v_scaled_g_values = (grad * grad) * coef["one_minus_beta_2_t"]
-        v_t = v.assign(v * coef["beta_2_t"], use_locking=self._use_locking)
-        with tf.control_dependencies([v_t]):
-            v_t = self._resource_scatter_add(v, indices, v_scaled_g_values)
-
-        if self.amsgrad:
-            vhat = self.get_slot(var, "vhat")
-            vhat_t = vhat.assign(tf.maximum(vhat, v_t),
-                                 use_locking=self._use_locking)
-            v_corr_t = tf.sqrt(vhat_t * coef["recip_one_minus_beta_2_power"])
-        else:
-            vhat_t = None
-            v_corr_t = tf.sqrt(v_t * coef["recip_one_minus_beta_2_power"])
-
-        var_t = tf.where(
-            coef["sma_t_ge_sma_threshold"],
-            coef["r_t"] * m_corr_t / (v_corr_t + coef["epsilon_t"]),
-            m_corr_t,
-        )
-
-        if self._has_weight_decay:
-            var_t += coef["wd_t"] * var
-
-        with tf.control_dependencies([var_t]):
-            var_update = self._resource_scatter_add(
-                var, indices, tf.gather(-coef["lr_t"] * var_t, indices)
-            )
-
-        updates = [var_update, m_t, v_t]
-        if self.amsgrad:
-            updates.append(vhat_t)
-        return tf.group(*updates)
+        variable.assign_sub(lr * var_t)
 
     def get_config(self):
         config = super().get_config()
         config.update(
             {
-                "learning_rate": self._serialize_hyperparameter("learning_rate"),
-                "beta_1": self._serialize_hyperparameter("beta_1"),
-                "beta_2": self._serialize_hyperparameter("beta_2"),
-                "decay": self._serialize_hyperparameter("decay"),
-                "weight_decay": self._serialize_hyperparameter("weight_decay"),
-                "sma_threshold": self._serialize_hyperparameter("sma_threshold"),
+                "learning_rate": self._serialize_hyperparameter(self._learning_rate),
+                "beta_1": self.beta_1,
+                "beta_2": self.beta_2,
                 "epsilon": self.epsilon,
+                "weight_decay": self.weight_decay,
                 "amsgrad": self.amsgrad,
-                "total_steps": int(self._serialize_hyperparameter("total_steps")),
-                "warmup_proportion": self._serialize_hyperparameter(
-                    "warmup_proportion"
-                ),
-                "min_lr": self._serialize_hyperparameter("min_lr"),
+                "sma_threshold": self.sma_threshold,
+                "total_steps": self.total_steps,
+                "warmup_proportion": self.warmup_proportion,
+                "min_lr": self.min_lr,
             }
         )
+        return config
 
 
-@tf_export(v1=["train.AdaBeliefOptimizer"])
-class AdaBeliefOptimizer(optimizer.Optimizer):
-    """Optimizer that implements the Adam algorithm.
-    References:
-    Adam - A Method for Stochastic Optimization:
-      [Kingma et al., 2015](https://arxiv.org/abs/1412.6980)
-      ([pdf](https://arxiv.org/pdf/1412.6980.pdf))
+class AdaBeliefOptimizer(tf.keras.optimizers.Optimizer):
+    """Optimizer that implements the AdaBelief algorithm.
+
+    Zhuang et al., "AdaBelief Optimizer: Adapting Stepsizes by the Belief in
+    Observed Gradients" (https://arxiv.org/abs/2010.07468).
+
+    AdaBelief tracks the variance of `gradient - momentum` (the "belief" in
+    the observed gradient) rather than the variance of the gradient itself,
+    which Adam/AdaBelief's sibling optimizers do.
+
+    Input
+    ----------
+        learning_rate: A float or a schedule.
+        beta1, beta2: exponential decay rates for the 1st/2nd moments.
+        epsilon: small constant for numerical stability. The default 1e-8 is
+                 not always a good choice; e.g. 1.0 or 0.1 works better for
+                 some ImageNet training runs.
+        amsgrad: whether to use the AMSGrad variant.
+        name: optional name for the operations created when applying gradients.
     """
 
-    def __init__(self,
-                 learning_rate=0.001,
-                 beta1=0.9,
-                 beta2=0.999,
-                 epsilon=1e-8,
-                 use_locking=False,
-                 name="AdaBelief", amsgrad=False):
-        r"""Construct a new Adam optimizer.
-        Initialization:
-        $$m_0 := 0 \text{(Initialize initial 1st moment vector)}$$
-        $$v_0 := 0 \text{(Initialize initial 2nd moment vector)}$$
-        $$t := 0 \text{(Initialize timestep)}$$
-        The update rule for `variable` with gradient `g` uses an optimization
-        described at the end of section 2 of the paper:
-        $$t := t + 1$$
-        $$\text{lr}_t := \mathrm{learning_rate} *
-          \sqrt{1 - \beta_2^t} / (1 - \beta_1^t)$$
-        $$m_t := \beta_1 * m_{t-1} + (1 - \beta_1) * g$$
-        $$v_t := \beta_2 * v_{t-1} + (1 - \beta_2) * g * g$$
-        $$\text{variable} := \text{variable} -
-          \text{lr}_t * m_t / (\sqrt{v_t} + \epsilon)$$
-        The default value of 1e-8 for epsilon might not be a good default in
-        general. For example, when training an Inception network on ImageNet a
-        current good choice is 1.0 or 0.1. Note that since AdamOptimizer uses the
-        formulation just before Section 2.1 of the Kingma and Ba paper rather than
-        the formulation in Algorithm 1, the "epsilon" referred to here is "epsilon
-        hat" in the paper.
-        The sparse implementation of this algorithm (used when the gradient is an
-        IndexedSlices object, typically because of `tf.gather` or an embedding
-        lookup in the forward pass) does apply momentum to variable slices even if
-        they were not used in the forward pass (meaning they have a gradient equal
-        to zero). Momentum decay (beta1) is also applied to the entire momentum
-        accumulator. This means that the sparse behavior is equivalent to the dense
-        behavior (in contrast to some momentum implementations which ignore momentum
-        unless a variable slice was actually used).
-        Args:
-          learning_rate: A Tensor or a floating point value.  The learning rate.
-          beta1: A float value or a constant float tensor. The exponential decay
-            rate for the 1st moment estimates.
-          beta2: A float value or a constant float tensor. The exponential decay
-            rate for the 2nd moment estimates.
-          epsilon: A small constant for numerical stability. This epsilon is
-            "epsilon hat" in the Kingma and Ba paper (in the formula just before
-            Section 2.1), not the epsilon in Algorithm 1 of the paper.
-          use_locking: If True use locks for update operations.
-          name: Optional name for the operations created when applying gradients.
-            Defaults to "Adam".
-        @compatibility(eager)
-        When eager execution is enabled, `learning_rate`, `beta1`, `beta2`, and
-        `epsilon` can each be a callable that takes no arguments and returns the
-        actual value to use. This can be useful for changing these values across
-        different invocations of optimizer functions.
-        @end_compatibility
-        """
-        super(AdaBeliefOptimizer, self).__init__(use_locking, name)
-        self._lr = learning_rate
-        self._beta1 = beta1
-        self._beta2 = beta2
-        self._epsilon = epsilon
+    def __init__(
+        self,
+        learning_rate: Union[FloatTensorLike, Callable] = 0.001,
+        beta1: FloatTensorLike = 0.9,
+        beta2: FloatTensorLike = 0.999,
+        epsilon: FloatTensorLike = 1e-8,
+        amsgrad: bool = False,
+        name: str = "AdaBelief",
+        **kwargs,
+    ):
+        super().__init__(name=name, **kwargs)
+        self._learning_rate = self._build_learning_rate(learning_rate)
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.epsilon = epsilon
         self.amsgrad = amsgrad
 
-        # Tensor versions of the constructor arguments, created in _prepare().
-        self._lr_t = None
-        self._beta1_t = None
-        self._beta2_t = None
-        self._epsilon_t = None
+    def build(self, var_list):
+        if getattr(self, "_built", False):
+            return
+        super().build(var_list)
+        self._built = True
+        self._m = []
+        self._v = []
+        self._vhat = []
+        for var in var_list:
+            self._m.append(self.add_variable_from_reference(model_variable=var, variable_name="m"))
+            self._v.append(self.add_variable_from_reference(model_variable=var, variable_name="v"))
+            if self.amsgrad:
+                self._vhat.append(
+                    self.add_variable_from_reference(model_variable=var, variable_name="vhat")
+                )
 
-    def _get_beta_accumulators(self):
-        with ops.init_scope():
-            if context.executing_eagerly():
-                graph = None
-            else:
-                graph = ops.get_default_graph()
-            return (self._get_non_slot_variable("beta1_power", graph=graph),
-                    self._get_non_slot_variable("beta2_power", graph=graph))
+    def update_step(self, gradient, variable):
+        var_dtype = variable.dtype
+        lr = tf.cast(self.learning_rate, var_dtype)
+        beta1 = tf.cast(self.beta1, var_dtype)
+        beta2 = tf.cast(self.beta2, var_dtype)
+        epsilon = tf.cast(self.epsilon, var_dtype)
 
-    def _create_slots(self, var_list):
-        # Create the beta1 and beta2 accumulators on the same device as the first
-        # variable. Sort the var_list to make sure this device is consistent across
-        # workers (these need to go on the same PS, otherwise some updates are
-        # silently ignored).
-        first_var = min(var_list, key=lambda x: x.name)
-        self._create_non_slot_variable(
-            initial_value=self._beta1, name="beta1_power", colocate_with=first_var)
-        self._create_non_slot_variable(
-            initial_value=self._beta2, name="beta2_power", colocate_with=first_var)
+        local_step = tf.cast(self.iterations + 1, var_dtype)
+        beta1_power = tf.pow(beta1, local_step)
+        beta2_power = tf.pow(beta2, local_step)
+        step_size = lr * tf.sqrt(1 - beta2_power) / (1 - beta1_power)
 
-        # Create slots for the first and second moments.
-        for v in var_list:
-            self._zeros_slot(v, "m", self._name)
-            self._zeros_slot(v, "v", self._name)
-            self._zeros_slot(v, "vhat", self._name)
+        dense_grad = (
+            tf.convert_to_tensor(gradient)
+            if isinstance(gradient, tf.IndexedSlices)
+            else gradient
+        )
 
-    def _prepare(self):
-        lr = self._lr
-        beta1 = self._beta1
-        beta2 = self._beta2
-        epsilon = self._epsilon
+        var_key = self._var_key(variable)
+        idx = self._index_dict[var_key]
+        m = self._m[idx]
+        v = self._v[idx]
 
-        self._lr_t = ops.convert_to_tensor(lr, name="learning_rate")
-        self._beta1_t = ops.convert_to_tensor(beta1, name="beta1")
-        self._beta2_t = ops.convert_to_tensor(beta2, name="beta2")
-        self._epsilon_t = ops.convert_to_tensor(epsilon, name="epsilon")
+        m.assign(beta1 * m + (1 - beta1) * dense_grad)
+        v.assign(beta2 * v + (1 - beta2) * tf.square(dense_grad - m) + epsilon)
 
-    def _apply_dense(self, grad, var):
-        graph = None if context.executing_eagerly() else ops.get_default_graph()
-        beta1_power = math_ops.cast(self._get_non_slot_variable(
-            "beta1_power", graph=graph), var.dtype.base_dtype)
-        beta2_power = math_ops.cast(self._get_non_slot_variable(
-            "beta2_power", graph=graph), var.dtype.base_dtype)
-        lr_t = math_ops.cast(self._lr_t, var.dtype.base_dtype)
-
-        beta1_t = math_ops.cast(self._beta1_t, var.dtype.base_dtype)
-        beta2_t = math_ops.cast(self._beta2_t, var.dtype.base_dtype)
-        epsilon_t = math_ops.cast(self._epsilon_t, var.dtype.base_dtype)
-
-        step_size = (lr_t * math_ops.sqrt(1 - beta2_power) / (1 - beta1_power))
-
-        # m_t = beta1 * m + (1 - beta1) * g_t
-        m = self.get_slot(var, "m")
-        m_scaled_g_values = grad * (1 - beta1_t)
-        m_t = state_ops.assign(
-            m, beta1_t * m + m_scaled_g_values, use_locking=self._use_locking)
-
-        # v_t = beta2 * v + (1 - beta2) * (g_t * g_t)
-        v = self.get_slot(var, "v")
-        v_scaled_g_values = (grad - m_t) * (grad - m_t) * (1 - beta2_t)
-        v_t = state_ops.assign(
-            v, beta2_t * v + v_scaled_g_values + epsilon_t, use_locking=self._use_locking)
-
-        # amsgrad
-        vhat = self.get_slot(var, "vhat")
         if self.amsgrad:
-            vhat_t = state_ops.assign(vhat, math_ops.maximum(v_t, vhat))
-            v_sqrt = math_ops.sqrt(vhat_t)
+            vhat = self._vhat[idx]
+            vhat.assign(tf.maximum(vhat, v))
+            v_sqrt = tf.sqrt(vhat)
         else:
-            vhat_t = state_ops.assign(vhat, vhat)
-            v_sqrt = math_ops.sqrt(v_t)
+            v_sqrt = tf.sqrt(v)
 
-        # Compute the bounds
-        step_size = step_size / (v_sqrt + epsilon_t)
-        bounded_lr = m_t * step_size
+        variable.assign_sub(step_size * m / (v_sqrt + epsilon))
 
-        var_update = state_ops.assign_sub(
-            var, bounded_lr, use_locking=self._use_locking)
-        return control_flow_ops.group(*[var_update, m_t, v_t, vhat_t])
-
-    def _resource_apply_dense(self, grad, var):
-        graph = None if context.executing_eagerly() else ops.get_default_graph()
-        beta1_power = math_ops.cast(self._get_non_slot_variable(
-            "beta1_power", graph=graph), grad.dtype.base_dtype)
-        beta2_power = math_ops.cast(self._get_non_slot_variable(
-            "beta2_power", graph=graph), grad.dtype.base_dtype)
-        lr_t = math_ops.cast(self._lr_t, grad.dtype.base_dtype)
-        beta1_t = math_ops.cast(self._beta1_t, grad.dtype.base_dtype)
-        beta2_t = math_ops.cast(self._beta2_t, grad.dtype.base_dtype)
-        epsilon_t = math_ops.cast(self._epsilon_t, grad.dtype.base_dtype)
-
-        step_size = (lr_t * math_ops.sqrt(1 - beta2_power) / (1 - beta1_power))
-
-        # m_t = beta1 * m + (1 - beta1) * g_t
-        m = self.get_slot(var, "m")
-        m_scaled_g_values = grad * (1 - beta1_t)
-        m_t = state_ops.assign(
-            m, beta1_t * m + m_scaled_g_values, use_locking=self._use_locking)
-
-        # v_t = beta2 * v + (1 - beta2) * (g_t * g_t)
-        v = self.get_slot(var, "v")
-        v_scaled_g_values = (grad - m_t) * (grad - m_t) * (1 - beta2_t)
-        v_t = state_ops.assign(
-            v, beta2_t * v + v_scaled_g_values + epsilon_t, use_locking=self._use_locking)
-
-        # amsgrad
-        vhat = self.get_slot(var, "vhat")
-        if self.amsgrad:
-            vhat_t = state_ops.assign(vhat, math_ops.maximum(v_t, vhat))
-            v_sqrt = math_ops.sqrt(vhat_t)
-        else:
-            vhat_t = state_ops.assign(vhat, vhat)
-            v_sqrt = math_ops.sqrt(v_t)
-
-        # Compute the bounds
-        step_size = step_size / (v_sqrt + epsilon_t)
-        bounded_lr = m_t * step_size
-
-        var_update = state_ops.assign_sub(
-            var, bounded_lr, use_locking=self._use_locking)
-
-        return control_flow_ops.group(*[var_update, m_t, v_t, vhat_t])
-
-    def _apply_sparse_shared(self, grad, var, indices, scatter_add):
-        beta1_power, beta2_power = self._get_beta_accumulators()
-        beta1_power = math_ops.cast(beta1_power, var.dtype.base_dtype)
-        beta2_power = math_ops.cast(beta2_power, var.dtype.base_dtype)
-        lr_t = math_ops.cast(self._lr_t, var.dtype.base_dtype)
-        beta1_t = math_ops.cast(self._beta1_t, var.dtype.base_dtype)
-        beta2_t = math_ops.cast(self._beta2_t, var.dtype.base_dtype)
-        epsilon_t = math_ops.cast(self._epsilon_t, var.dtype.base_dtype)
-        lr = (lr_t * math_ops.sqrt(1 - beta2_power) / (1 - beta1_power))
-        # m_t = beta1 * m + (1 - beta1) * g_t
-        m = self.get_slot(var, "m")
-        m_scaled_g_values = grad * (1 - beta1_t)
-        m_t = state_ops.assign(m, m * beta1_t, use_locking=self._use_locking)
-        with ops.control_dependencies([m_t]):
-            m_t = scatter_add(m, indices, m_scaled_g_values)
-        # v_t = beta2 * v + (1 - beta2) * (g_t * g_t)
-        v = self.get_slot(var, "v")
-        v_scaled_g_values = (grad - m_t) * (grad - m_t) * (1 - beta2_t)
-        v_t = state_ops.assign(v, v * beta2_t, use_locking=self._use_locking)
-        with ops.control_dependencies([v_t]):
-            v_t = scatter_add(v, indices, v_scaled_g_values + epsilon_t)
-
-        # amsgrad
-        vhat = self.get_slot(var, "vhat")
-        if self.amsgrad:
-            vhat_t = state_ops.assign(vhat, math_ops.maximum(v_t, vhat))
-            v_sqrt = math_ops.sqrt(vhat_t)
-        else:
-            vhat_t = state_ops.assign(vhat, vhat)
-            v_sqrt = math_ops.sqrt(v_t)
-
-        var_update = state_ops.assign_sub(
-            var, lr * m_t / (v_sqrt + epsilon_t), use_locking=self._use_locking)
-        return control_flow_ops.group(*[var_update, m_t, v_t, vhat_t])
-
-    def _apply_sparse(self, grad, var):
-        return self._apply_sparse_shared(
-            grad.values,
-            var,
-            grad.indices,
-            lambda x, i, v: state_ops.scatter_add(  # pylint: disable=g-long-lambda
-                x,
-                i,
-                v,
-                use_locking=self._use_locking))
-
-    def _resource_scatter_add(self, x, i, v):
-        with ops.control_dependencies(
-                [resource_variable_ops.resource_scatter_add(x.handle, i, v)]):
-            return x.value()
-
-    def _resource_apply_sparse(self, grad, var, indices):
-        return self._apply_sparse_shared(grad, var, indices,
-                                         self._resource_scatter_add)
-
-    def _finish(self, update_ops, name_scope):
-        # Update the power accumulators.
-        with ops.control_dependencies(update_ops):
-            beta1_power, beta2_power = self._get_beta_accumulators()
-            with ops.colocate_with(beta1_power):
-                update_beta1 = beta1_power.assign(
-                    beta1_power * self._beta1_t, use_locking=self._use_locking)
-                update_beta2 = beta2_power.assign(
-                    beta2_power * self._beta2_t, use_locking=self._use_locking)
-        return control_flow_ops.group(
-            *update_ops + [update_beta1, update_beta2], name=name_scope)
+    def get_config(self):
+        config = super().get_config()
+        config.update(
+            {
+                "learning_rate": self._serialize_hyperparameter(self._learning_rate),
+                "beta1": self.beta1,
+                "beta2": self.beta2,
+                "epsilon": self.epsilon,
+                "amsgrad": self.amsgrad,
+            }
+        )
+        return config
 
 
-class AdaHessian(optimizer_v2.OptimizerV2):
+class AdaHessian(tf.keras.optimizers.Optimizer):
+    """Optimizer that implements AdaHessian, a second-order (Hessian-diagonal
+    aware) optimizer.
 
-    _HAS_AGGREGATE_GRAD = True
+    Yao et al., "ADAHESSIAN: An Adaptive Second Order Optimizer for Machine
+    Learning" (https://arxiv.org/abs/2006.00719).
 
-    def __init__(self,
-                 learning_rate=0.1,
-                 beta_1=0.9,
-                 beta_2=0.999,
-                 epsilon=1e-4,
-                 weight_decay=0.,
-                 hessian_power=1.0,
-                 name='AdaHessian',
-                 average_size_1d=None,
-                 average_size_2d=None,
-                 average_size_3d=-1,
-                 average_size_4d=-1,
-                 **kwargs):
-        """Construct a new AdaHessian optimizer.
-        Args:
-            learning_rate: A `Tensor`, floating point value, or a schedule that is a
-            `tf.keras.optimizers.schedules.LearningRateSchedule`, or a callable that
-            takes no arguments and returns the actual value to use, The learning
-            rate. Defaults to 0.1.
-            beta_1: A float value or a constant float tensor, or a callable that takes
-            no arguments and returns the actual value to use. The exponential decay
-            rate for the 1st moment estimates. Defaults to 0.9.
-            beta_2: A float value or a constant float tensor, or a callable that takes
-            no arguments and returns the actual value to use, The exponential decay
-            rate for the 2nd moment estimates. Defaults to 0.999.
-            epsilon: A small constant for numerical stability. This epsilon is
-            "epsilon hat" in the Kingma and Ba paper (in the formula just before
-            Section 2.1), not the epsilon in Algorithm 1 of the paper. Defaults to
-            1e-7.
-            weight_decay: We are using AdamW's weight decay scheme. Defaults to 0.
-            name: Optional name for the operations created when applying gradients.
-            Defaults to "Adam".
-            hessian_power: Hessian power to control the optimizer more similar to first/second 
-            order method (default: 1). You can also try 0.5. For some tasks we found this 
-            to result in better performance.
-            **kwargs: keyword arguments. Allowed to be {`clipnorm`, `clipvalue`, `lr`,
-            `decay`}. `clipnorm` is clip gradients by norm; `clipvalue` is clip
-            gradients by value, `decay` is included for backward compatibility to
-            allow time inverse decay of learning rate. `lr` is included for backward
-            compatibility, recommended to use `learning_rate` instead.
-            # average_size_{1,2,3,4}d: 
-                        None: use no spatial averaging
-                        -1: use suggested spatial averaging (recommended for conv kernels)
-                        >= 1: use customized size
-        """
+    Unlike the other optimizers in this module, AdaHessian needs a
+    Hutchinson-trace estimate of the Hessian diagonal, which requires a
+    second backward pass through a nested `tf.GradientTape`. It therefore
+    **cannot** be used as a drop-in `model.compile(optimizer=...)` /
+    `model.fit()` optimizer — call `minimize(loss_fn, var_list)` from a
+    custom training step instead (see example below).
 
-        super(AdaHessian, self).__init__(name, **kwargs)
-        self._set_hyper('learning_rate', kwargs.get('lr', learning_rate))
-        self._set_hyper('decay', self._initial_decay)
-        self._set_hyper('beta_1', beta_1)
-        self._set_hyper('beta_2', beta_2)
-        self.epsilon = epsilon or backend_config.epsilon()
+    Example
+    ----------
+        opt = AdaHessian(learning_rate=0.15)
+        for x, y in dataset:
+            def loss_fn():
+                return compiled_loss(y, model(x, training=True))
+            opt.minimize(loss_fn, model.trainable_variables)
+
+    Input
+    ----------
+        learning_rate: A float or a schedule.
+        beta_1, beta_2: exponential decay rates for the 1st moment / Hessian
+                        diagonal 2nd-moment estimates.
+        epsilon: small constant for numerical stability.
+        weight_decay: decoupled weight decay factor (AdamW-style).
+        hessian_power: exponent applied to the Hessian diagonal estimate;
+                       1.0 is standard, 0.5 sometimes performs better.
+        average_size_1d/2d/3d/4d: spatial averaging of the Hessian diagonal
+            estimate for parameters of that rank. `None` disables averaging
+            for that rank; `-1` uses AdaHessian's suggested default (average
+            over all-but-the-last-2-dims for conv kernels); a positive int
+            sets a custom block size.
+    """
+
+    def __init__(
+        self,
+        learning_rate: Union[FloatTensorLike, Callable] = 0.15,
+        beta_1: FloatTensorLike = 0.9,
+        beta_2: FloatTensorLike = 0.999,
+        epsilon: FloatTensorLike = 1e-4,
+        weight_decay: FloatTensorLike = 0.0,
+        hessian_power: FloatTensorLike = 1.0,
+        average_size_1d=None,
+        average_size_2d=None,
+        average_size_3d=-1,
+        average_size_4d=-1,
+        name: str = "AdaHessian",
+        **kwargs,
+    ):
+        super().__init__(name=name, **kwargs)
+        self._learning_rate = self._build_learning_rate(learning_rate)
+        self.beta_1 = beta_1
+        self.beta_2 = beta_2
+        self.epsilon = epsilon
         self.weight_decay = weight_decay
         self.hessian_power = hessian_power
         self.average_size_1d = average_size_1d
@@ -1067,336 +482,351 @@ class AdaHessian(optimizer_v2.OptimizerV2):
         self.average_size_3d = average_size_3d
         self.average_size_4d = average_size_4d
 
-    def _create_slots(self, var_list):
-        # Create slots for the first and second moments.
-        # Separate for-loops to respect the ordering of slot variables from v1.
+    def build(self, var_list):
+        if getattr(self, "_built", False):
+            return
+        super().build(var_list)
+        self._built = True
+        self._m = []
+        self._v = []
         for var in var_list:
-            self.add_slot(var, 'm')
-        for var in var_list:
-            self.add_slot(var, 'v')
+            self._m.append(self.add_variable_from_reference(model_variable=var, variable_name="m"))
+            self._v.append(self.add_variable_from_reference(model_variable=var, variable_name="v"))
 
-    def _prepare_local(self, var_device, var_dtype, apply_state):
-        super(AdaHessian, self)._prepare_local(
-            var_device, var_dtype, apply_state)
+    def _hessian_diag_estimate(self, tape, loss, var_list):
+        """Hutchinson's stochastic estimator of the Hessian diagonal.
 
-        local_step = math_ops.cast(self.iterations + 1, var_dtype)
-        beta_1_t = array_ops.identity(self._get_hyper('beta_1', var_dtype))
-        beta_2_t = array_ops.identity(self._get_hyper('beta_2', var_dtype))
-        beta_1_power = math_ops.pow(beta_1_t, local_step)
-        beta_2_power = math_ops.pow(beta_2_t, local_step)
-        lr = (
-            apply_state[(var_device, var_dtype)]['lr_t'] *
-            (math_ops.sqrt(1 - beta_2_power) / (1 - beta_1_power)))
-        apply_state[(var_device, var_dtype)].update(
-            dict(
-                lr=lr,
-                epsilon=ops.convert_to_tensor_v2(self.epsilon, var_dtype),
-                beta_1_t=beta_1_t,
-                beta_1_power=beta_1_power,
-                one_minus_beta_1_t=1 - beta_1_t,
-                beta_2_t=beta_2_t,
-                beta_2_power=beta_2_power,
-                one_minus_beta_2_t=1 - beta_2_t))
-
-    def set_weights(self, weights):
-        params = self.weights
-        # If the weights are generated by Keras V1 optimizer, it includes vhats
-        # even without amsgrad, i.e, V1 optimizer has 3x + 1 variables, while V2
-        # optimizer has 2x + 1 variables. Filter vhats out for compatibility.
-        num_vars = int((len(params) - 1) / 2)
-        if len(weights) == 3 * num_vars + 1:
-            weights = weights[:len(params)]
-        super(AdaHessian, self).set_weights(weights)
-
-    def get_gradients_hessian(self, loss, params):
-        """Returns gradients and Hessian of `loss` with respect to `params`.
-        Arguments:
-            loss: Loss tensor.
-            params: List of variables.
-        Returns:
-            List of gradient and Hessian tensors.
-        Raises:
-            ValueError: In case any gradient cannot be computed (e.g. if gradient
-            function not implemented).
+        Requires a `persistent=True` outer `tf.GradientTape` that has NOT yet
+        been used to compute `tape.gradient(loss, var_list)` — this method
+        computes both the gradients and the Hessian-diagonal estimate for
+        the caller, since both need the same inner tape.
         """
-        params = nest.flatten(params)
-        with backend.get_graph().as_default(), backend.name_scope(self._name +
-                                                                  "/gradients"):
-            grads = gradients.gradients(loss, params)
-            for grad, param in zip(grads, params):
-                if grad is None:
-                    raise ValueError("Variable {} has `None` for gradient. "
-                                     "Please make sure that all of your ops have a "
-                                     "gradient defined (i.e. are differentiable). "
-                                     "Common ops without gradient: "
-                                     "K.argmax, K.round, K.eval.".format(param))
+        with tf.GradientTape() as inner_tape:
+            inner_tape.watch(var_list)
+            loss_value = loss()
+        grads = inner_tape.gradient(loss_value, var_list)
 
-            # WARNING: for now we do not support gradient clip
-            # grads = self._clip_gradients(grads)
+        rademacher = [
+            tf.sign(tf.random.uniform(tf.shape(g), -1.0, 1.0)) for g in grads
+        ]
+        grad_dot_v = tf.add_n(
+            [tf.reduce_sum(g * v) for g, v in zip(grads, rademacher)]
+        )
+        hvp = tape.gradient(grad_dot_v, var_list)
+        hessian_diag = [tf.abs(hv * v) for hv, v in zip(hvp, rademacher)]
+        return loss_value, grads, hessian_diag
 
-            v = [np.random.uniform(0, 1, size=p.shape) for p in params]
-            for vi in v:
-                vi[vi < 0.5] = -1
-                vi[vi >= 0.5] = 1
-            v = [tf.convert_to_tensor(vi, dtype=tf.dtypes.float32) for vi in v]
+    def _spatial_average(self, hess, rank):
+        resize = {
+            1: self.average_size_1d,
+            2: self.average_size_2d,
+            3: self.average_size_3d,
+            4: self.average_size_4d,
+        }.get(rank)
 
-            vprod = tf.reduce_sum([tf.reduce_sum(vi * grad)
-                                  for vi, grad in zip(v, grads)])
+        if resize is None:
+            return hess
+        if resize == -1:
+            if rank in (1, 2):
+                return hess
+            axes = list(range(rank - 1))
+            hess_avg = tf.reduce_mean(hess, axes, keepdims=True)
+            return tf.broadcast_to(hess_avg, tf.shape(hess))
+        if resize <= 0:
+            raise ValueError("average_size must be None, -1, or a positive int")
+        flat = tf.reshape(hess, [resize, -1])
+        avg = tf.reduce_mean(flat, axis=0)
+        return tf.reshape(tf.tile(avg, [resize]), tf.shape(hess))
 
-            Hv = gradients.gradients(vprod, params)
+    def _update_step_hessian(self, grad, hess, variable):
+        var_dtype = variable.dtype
+        lr = tf.cast(self.learning_rate, var_dtype)
+        beta_1 = tf.cast(self.beta_1, var_dtype)
+        beta_2 = tf.cast(self.beta_2, var_dtype)
+        epsilon = tf.cast(self.epsilon, var_dtype)
 
-            Hd = [tf.abs(Hvi * vi) for Hvi, vi in zip(Hv, v)]
+        var_key = self._var_key(variable)
+        idx = self._index_dict[var_key]
+        m = self._m[idx]
+        v = self._v[idx]
 
-        return grads, Hd
+        m.assign_add((grad - m) * (1 - beta_1))
 
-    def _filter_grads_hessian(self, grads_hessian_and_vars):
-        """Filter out iterable with grad equal to None."""
-        grads_hessian_and_vars = tuple(grads_hessian_and_vars)
-        if not grads_hessian_and_vars:
-            return grads_hessian_and_vars
-        filtered = []
-        vars_with_empty_grads = []
-        for grad, hessian, var in grads_hessian_and_vars:
+        hess_avg = self._spatial_average(hess, len(variable.shape))
+        v.assign_add((tf.square(hess_avg) - v) * (1 - beta_2))
+
+        local_step = tf.cast(self.iterations + 1, var_dtype)
+        bias_correct_1 = 1 - tf.pow(beta_1, local_step)
+        bias_correct_2 = 1 - tf.pow(beta_2, local_step)
+
+        if self.weight_decay > 0:
+            variable.assign_sub(lr * tf.cast(self.weight_decay, var_dtype) * variable)
+
+        denom = tf.pow(tf.sqrt(v / bias_correct_2), self.hessian_power) + epsilon
+        variable.assign_sub(lr * m / bias_correct_1 / denom)
+
+    def minimize(self, loss, var_list):
+        """Compute gradients + Hessian-diagonal estimate for `loss` and apply
+        one AdaHessian update step to every variable in `var_list`.
+
+        Input
+        ----------
+            loss: a zero-argument callable returning the scalar loss tensor.
+            var_list: list of `tf.Variable` to update.
+
+        Output
+        ----------
+            The scalar loss value computed for this step.
+        """
+        var_list = list(var_list)
+        with tf.GradientTape(persistent=True) as tape:
+            loss_value, grads, hessian_diag = self._hessian_diag_estimate(
+                tape, loss, var_list
+            )
+        del tape
+
+        self.build(var_list)
+        for grad, hess, var in zip(grads, hessian_diag, var_list):
             if grad is None:
-                vars_with_empty_grads.append(var)
-            else:
-                filtered.append((grad, hessian, var))
-        filtered = tuple(filtered)
-
-        if not filtered:
-            raise ValueError("No gradients provided for any variable: %s." %
-                             ([v.name for _, v in grads_and_vars],))
-        if vars_with_empty_grads:
-            logging.warning(
-                ("Gradients do not exist for variables %s when minimizing the loss."),
-                ([v.name for v in vars_with_empty_grads]))
-        return filtered
-
-    def apply_gradients_hessian(self,
-                                grads_hessian_and_vars,
-                                name=None,
-                                experimental_aggregate_gradients=True):
-        grads_hessian_and_vars = self._filter_grads_hessian(
-            grads_hessian_and_vars)
-        var_list = [v for (_, _, v) in grads_hessian_and_vars]
-
-        with backend.name_scope(self._name):
-            # Create iteration if necessary.
-            with ops.init_scope():
-                self._create_all_weights(var_list)
-
-        if not grads_hessian_and_vars:
-            # Distribution strategy does not support reducing an empty list of
-            # gradients
-            return control_flow_ops.no_op()
-
-        if distribute_ctx.in_cross_replica_context():
-            raise RuntimeError(
-                "`apply_gradients() cannot be called in cross-replica context. "
-                "Use `tf.distribute.Strategy.run` to enter replica "
-                "context.")
-
-        strategy = distribute_ctx.get_strategy()
-        if (not experimental_aggregate_gradients and strategy and isinstance(
-            strategy.extended,
-                parameter_server_strategy.ParameterServerStrategyExtended)):
-            raise NotImplementedError(
-                "`experimental_aggregate_gradients=False is not supported for "
-                "ParameterServerStrategy and CentralStorageStrategy")
-
-        apply_state = self._prepare(var_list)
-        if experimental_aggregate_gradients:
-            reduced_grads, reduced_hessian = self._aggregate_gradients_hessian(
-                grads_hessian_and_vars)
-            var_list = [v for _, _, v in grads_hessian_and_vars]
-            grads_hessian_and_vars = list(
-                zip(reduced_grads, reduced_hessian, var_list))
-
-        return distribute_ctx.get_replica_context().merge_call(
-            functools.partial(self._distributed_apply,
-                              apply_state=apply_state),
-            args=(grads_hessian_and_vars,),
-            kwargs={
-                "name": name,
-            })
-
-    def _aggregate_gradients_hessian(self, grads_hessian_and_vars):
-        """Returns all-reduced gradients.
-        Args:
-        grads_and_vars: List of (gradient, hessian, variable) pairs.
-        Returns:
-        Two lists of all-reduced gradients and Hessian.
-        """
-        grads_hessian_and_vars = list(grads_hessian_and_vars)
-        filtered_grads_hessian_and_vars = self._filter_grads_hessian(
-            grads_hessian_and_vars)
-
-        # split the list so that we can use the all_recude_fn
-        filtered_grads_and_vars = tuple(
-            [(g, v) for (g, h, v) in filtered_grads_hessian_and_vars])
-        filtered_hessian_and_vars = tuple(
-            [(h, v) for (g, h, v) in filtered_grads_hessian_and_vars])
-
-        def all_reduce_fn(distribution, grads_hessian_and_vars):
-            # WARNING: this ReduceOp.SUM can only support two entries, for now we have three.
-            # So far now, we do it for two steps to make life easier.
-            return distribution.extended.batch_reduce_to(
-                ds_reduce_util.ReduceOp.SUM, grads_hessian_and_vars)
-
-        if filtered_grads_hessian_and_vars:
-            reduced_part1 = distribute_ctx.get_replica_context().merge_call(
-                all_reduce_fn, args=(filtered_grads_and_vars,))
-            reduced_part2 = distribute_ctx.get_replica_context().merge_call(
-                all_reduce_fn, args=(filtered_hessian_and_vars,))
-        else:
-            reduced = []
-
-        # Copy 'reduced' but add None gradients back in
-        reduced_with_nones_grads = []
-        reduced_with_nones_hessian = []
-
-        reduced_pos = 0
-        for g, h, _ in grads_hessian_and_vars:
-            if g is None:
-                reduced_with_nones_grads.append(None)
-                reduced_with_nones_hessian.append(None)
-            else:
-                reduced_with_nones_grads.append(reduced_part1[reduced_pos])
-                reduced_with_nones_hessian.append(reduced_part2[reduced_pos])
-                reduced_pos += 1
-
-        return reduced_with_nones_grads, reduced_with_nones_hessian
-
-    @def_function.function(experimental_compile=True)
-    def _resource_apply_dense(self, grad, hess, var, apply_state=None):
-        var_device, var_dtype = var.device, var.dtype.base_dtype
-        coefficients = ((apply_state or {}).get((var_device, var_dtype)) or
-                        self._fallback_apply_state(var_device, var_dtype))
-
-        m = self.get_slot(var, 'm')
-        v = self.get_slot(var, 'v')
-
-        m.assign_add((grad - m) * (1 - coefficients['beta_1_t']))
-        # this part need to be changed for spatial averaging
-
-        if len(v.shape) == 1:
-            resize = self.average_size_1d
-        elif len(v.shape) == 2:
-            resize = self.average_size_2d
-        elif len(v.shape) == 3:
-            resize = self.average_size_3d
-        elif len(v.shape) == 4:
-            resize = self.average_size_4d
-        else:
-            raise Exception(
-                'You need to define the spatial average size by yourself!')
-
-        if resize == None:
-            v.assign_add((math_ops.square(hess) - v) *
-                         (1 - coefficients['beta_2_t']))
-        elif resize == -1:
-            if len(v.shape) == 1:
-                v.assign_add((math_ops.square(hess) - v) *
-                             (1 - coefficients['beta_2_t']))
-            elif len(v.shape) == 2:
-                hess_average = tf.reduce_mean(hess, [0], keepdims=True)
-                v.assign_add((math_ops.square(hess_average) - v)
-                             * (1 - coefficients['beta_2_t']))
-            elif len(v.shape) == 3:
-                hess_average = tf.reduce_mean(hess, [0], keepdims=True)
-                v.assign_add((math_ops.square(hess_average) - v)
-                             * (1 - coefficients['beta_2_t']))
-            elif len(v.shape) == 4:
-                hess_average = tf.reduce_mean(hess, [0, 1], keepdims=True)
-                v.assign_add((math_ops.square(hess_average) - v)
-                             * (1 - coefficients['beta_2_t']))
-        else:
-            if resize <= 0:
-                raise Exception(
-                    'You need to define the spatial average size >= 1!')
-            hess_average = tf.reshape(hess, [resize, -1])
-            hess_average = tf.reduce_mean(hess_average, [0])
-            hess_average = tf.repeat(hess_average, resize)
-            hess_average = tf.reshape(hess_average, v.shape)
-            v.assign_add((math_ops.square(hess_average) - v)
-                         * (1 - coefficients['beta_2_t']))
-
-        bias_correct1 = 1 - coefficients['beta_1_power']
-        bias_correct2 = 1 - coefficients['beta_2_power']
-
-        if self.weight_decay != 0:
-            var.assign_sub(coefficients['lr_t'] * self.weight_decay * var)
-
-        # denom = np.power(math_ops.sqrt(v / bias_correct2), self.hessian_power) + coefficients['epsilon']
-        denom = tf.math.pow(math_ops.sqrt(v / bias_correct2),
-                            self.hessian_power) + coefficients['epsilon']
-
-        var.assign_sub(coefficients['lr_t'] * m / bias_correct1 / denom)
-
-    @def_function.function(experimental_compile=True)
-    def _resource_apply_sparse(self, grad, var, indices, apply_state=None):
-        raise Exception('For now, we do not support sparse update yet.')
+                continue
+            self._update_step_hessian(grad, hess, var)
+        self.iterations.assign_add(1)
+        return loss_value
 
     def get_config(self):
-        config = super(AdaHessian, self).get_config()
-        config.update({
-            'learning_rate': self._serialize_hyperparameter('learning_rate'),
-            'decay': self._serialize_hyperparameter('decay'),
-            'beta_1': self._serialize_hyperparameter('beta_1'),
-            'beta_2': self._serialize_hyperparameter('beta_2'),
-            'epsilon': self.epsilon,
-            'weight_decay': self.weight_decay
-        })
+        config = super().get_config()
+        config.update(
+            {
+                "learning_rate": self._serialize_hyperparameter(self._learning_rate),
+                "beta_1": self.beta_1,
+                "beta_2": self.beta_2,
+                "epsilon": self.epsilon,
+                "weight_decay": self.weight_decay,
+                "hessian_power": self.hessian_power,
+            }
+        )
         return config
 
-    def _distributed_apply(self, distribution, grads_hessian_and_vars, name, apply_state):
-        """`apply_gradients` using a `DistributionStrategy`."""
 
-        def apply_grad_to_update_var(var, grad, hess):
-            """Apply gradient to variable."""
-            if isinstance(var, ops.Tensor):
-                raise NotImplementedError("Trying to update a Tensor ", var)
+class Lion(tf.keras.optimizers.Optimizer):
+    """Optimizer that implements Lion (EvoLved Sign Momentum).
 
-            apply_kwargs = {}
+    Chen, X. et al., 2023. "Symbolic Discovery of Optimization Algorithms"
+    (https://arxiv.org/abs/2302.06675). Discovered via program search rather
+    than hand-derived, Lion tracks only *one* momentum buffer per variable
+    (half of what the Adam-family optimizers above track), and its update is
+    the *sign* of an interpolation between the current gradient and that
+    momentum buffer, rather than a magnitude-scaled step — memory-cheap and
+    competitive with (or exceeding) AdamW in the paper's own benchmarks, a
+    reasonable default for edge-model training loops where optimizer-state
+    memory matters.
 
-            if "apply_state" in self._dense_apply_args:
-                apply_kwargs["apply_state"] = apply_state
-            update_op = self._resource_apply_dense(
-                grad, hess, var, **apply_kwargs)
+    Input
+    ----------
+        learning_rate: A float or a schedule. Lion's effective step size is
+                       roughly an order of magnitude larger than AdamW's for
+                       a comparable update magnitude (its update is a raw
+                       sign, not scaled by gradient magnitude) — the paper
+                       recommends starting from an AdamW learning rate
+                       divided by ~10 (or scaling `weight_decay` up ~10x
+                       instead) as a first guess, not reusing an AdamW
+                       learning rate unchanged.
+        beta_1: interpolation coefficient between the momentum buffer and
+                the current gradient used to form the *sign* update (0.9 in
+                the paper).
+        beta_2: the momentum buffer's own decay rate (0.99 in the paper) —
+                note this decays *slower* than `beta_1`'s interpolation,
+                the reverse of Adam's `beta_1 < beta_2`... `beta_2`
+                convention (Adam's `beta_2` is also the slower-decaying
+                one, so the naming lines up — it's the numeric defaults
+                that differ, 0.9/0.99 here vs. Adam's usual 0.9/0.999).
+        weight_decay: decoupled weight decay (AdamW-style), applied
+                      alongside the sign update, not folded into the
+                      gradient itself.
+        name: optional name for the operations created when applying gradients.
+    """
 
-            if var.constraint is not None:
-                with ops.control_dependencies([update_op]):
-                    return var.assign(var.constraint(var))
-            else:
-                return update_op
+    def __init__(
+        self,
+        learning_rate: Union[FloatTensorLike, Callable] = 1e-4,
+        beta_1: FloatTensorLike = 0.9,
+        beta_2: FloatTensorLike = 0.99,
+        weight_decay: FloatTensorLike = 0.0,
+        name: str = "Lion",
+        **kwargs,
+    ):
+        super().__init__(name=name, **kwargs)
+        self._learning_rate = self._build_learning_rate(learning_rate)
+        self.beta_1 = beta_1
+        self.beta_2 = beta_2
+        self.weight_decay = weight_decay
 
-        eagerly_outside_functions = ops.executing_eagerly_outside_functions()
-        update_ops = []
-        with ops.name_scope(name or self._name, skip_on_eager=True):
-            for grad, hess, var in grads_hessian_and_vars:
+    def build(self, var_list):
+        if getattr(self, "_built", False):
+            return
+        super().build(var_list)
+        self._built = True
+        self._momentums = []
+        for var in var_list:
+            self._momentums.append(
+                self.add_variable_from_reference(model_variable=var, variable_name="m")
+            )
 
-                def _assume_mirrored(grad, hess):
-                    if isinstance(grad, ds_values.PerReplica):
-                        return ds_values.Mirrored(grad.values), ds_values.Mirrored(hess.values)
-                    return grad, hess
+    def update_step(self, gradient, variable):
+        var_dtype = variable.dtype
+        lr = tf.cast(self.learning_rate, var_dtype)
+        beta_1 = tf.cast(self.beta_1, var_dtype)
+        beta_2 = tf.cast(self.beta_2, var_dtype)
+        weight_decay = tf.cast(self.weight_decay, var_dtype)
 
-                grad, hess = nest.map_structure(_assume_mirrored, grad, hess)
-                # Colocate the update with variables to avoid unnecessary communication
-                # delays. See b/136304694.
-                with distribution.extended.colocate_vars_with(var):
-                    with ops.name_scope("update" if eagerly_outside_functions else
-                                        "update_" + var.op.name, skip_on_eager=True):
-                        update_ops.extend(distribution.extended.update(
-                            var, apply_grad_to_update_var, args=(grad, hess), group=False))
+        gradient = (
+            tf.convert_to_tensor(gradient) if isinstance(gradient, tf.IndexedSlices) else gradient
+        )
 
-            any_symbolic = any(isinstance(i, ops.Operation) or
-                               tf_utils.is_symbolic_tensor(i) for i in update_ops)
-            if not context.executing_eagerly() or any_symbolic:
-                # If the current context is graph mode or any of the update ops are
-                # symbolic then the step update should be carried out under a graph
-                # context. (eager updates execute immediately)
-                with ops._get_graph_from_inputs(update_ops).as_default():  # pylint: disable=protected-access
-                    with ops.control_dependencies(update_ops):
-                        return self._iterations.assign_add(1, read_value=False)
+        var_key = self._var_key(variable)
+        idx = self._index_dict[var_key]
+        m = self._momentums[idx]
 
-            return self._iterations.assign_add(1)
+        update = tf.sign(beta_1 * m + (1.0 - beta_1) * gradient)
+        variable.assign_sub(lr * (update + weight_decay * variable))
+        m.assign(beta_2 * m + (1.0 - beta_2) * gradient)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update(
+            {
+                "learning_rate": self._serialize_hyperparameter(self._learning_rate),
+                "beta_1": self.beta_1,
+                "beta_2": self.beta_2,
+                "weight_decay": self.weight_decay,
+            }
+        )
+        return config
+
+
+class SAM:
+    """Sharpness-Aware Minimization (SAM), wrapping any base optimizer.
+
+    Foret, P. et al., 2021. "Sharpness-Aware Minimization for Efficiently
+    Improving Generalization" (https://arxiv.org/abs/2010.01412). Improves
+    cross-domain generalization by seeking parameters whose entire
+    neighborhood — not just the point itself — has low loss, a genuinely
+    different mechanism from a learning-rate or regularization change, so it
+    composes with any base optimizer (`Yogi`/`RectifiedAdam2`/
+    `AdaBeliefOptimizer`/`AdaHessian`/`Lion` above, or a plain `tf.keras`
+    optimizer) rather than replacing it — matching plan.md §4.2's own
+    framing, "a thin gradient-ascent-then-descent wrapper around any base
+    optimizer."
+
+    Unlike every optimizer class in this module, SAM cannot be expressed as
+    a single `apply_gradients(grads, vars)` call from one gradient
+    computation — it needs the loss/gradient evaluated *twice* per step:
+    once at the current weights (to find the ascent direction), once at a
+    perturbed point (whose gradient is what actually gets descended on).
+    This is therefore not a `tf.keras.optimizers.Optimizer` subclass (that
+    API's contract is exactly one gradient in, one update out per call) —
+    it exposes the two SAM steps directly (`first_step`/`second_step`) for a
+    custom training loop, plus a `minimize(loss_fn, var_list)` convenience
+    method that performs the full two-pass dance in one call for the common
+    case.
+
+    Input
+    ----------
+        base_optimizer: any `tf.keras.optimizers.Optimizer` instance — SAM's
+                         actual descent step (`second_step`) delegates to
+                         this optimizer's own `apply_gradients`.
+        rho: the neighborhood size (L2-ball radius) SAM searches within for
+             the worst-case ascent direction — 0.05, the paper's own default
+             across most of its experiments.
+        epsilon: numerical-stability constant added to the gradient-norm
+                 denominator when computing the ascent step size.
+
+    Usage
+    ----------
+        sam = SAM(tf.keras.optimizers.Adam(1e-3), rho=0.05)
+        for x, y in dataset:
+            def loss_fn():
+                return loss_object(y, model(x, training=True))
+            sam.minimize(loss_fn, model.trainable_variables)
+    """
+
+    def __init__(self, base_optimizer, rho: FloatTensorLike = 0.05, epsilon: FloatTensorLike = 1e-12):
+        self.base_optimizer = base_optimizer
+        self.rho = rho
+        self.epsilon = epsilon
+        self._e_ws = None  # perturbations applied in `first_step`, undone in `second_step`
+
+    def first_step(self, grads, var_list):
+        """Ascent step: perturb every variable toward the worst-case point
+        within the `rho`-ball of the current gradient direction. Call
+        `second_step` with the gradients evaluated *at the perturbed point*
+        to complete one SAM update.
+        """
+        grads = list(grads)
+        var_list = list(var_list)
+
+        grad_norm = tf.sqrt(
+            tf.add_n([tf.reduce_sum(tf.square(g)) for g in grads if g is not None])
+        )
+        scale = self.rho / (grad_norm + self.epsilon)
+
+        self._e_ws = []
+        for grad, var in zip(grads, var_list):
+            if grad is None:
+                self._e_ws.append(None)
+                continue
+            e_w = grad * scale
+            var.assign_add(e_w)
+            self._e_ws.append(e_w)
+
+    def second_step(self, grads, var_list):
+        """Descent step: undo `first_step`'s perturbation, then apply the
+        gradients evaluated at the perturbed point (`grads`) to the
+        *original* weights via the wrapped `base_optimizer`.
+        """
+        if self._e_ws is None:
+            raise RuntimeError("second_step called before first_step")
+
+        var_list = list(var_list)
+        for e_w, var in zip(self._e_ws, var_list):
+            if e_w is not None:
+                var.assign_sub(e_w)
+        self._e_ws = None
+
+        pairs = [(g, v) for g, v in zip(grads, var_list) if g is not None]
+        self.base_optimizer.apply_gradients(pairs)
+
+    def minimize(self, loss_fn, var_list):
+        """Convenience wrapper performing the full two-pass SAM update:
+        gradient at the current point -> `first_step` -> gradient at the
+        perturbed point -> `second_step`.
+
+        Input
+        ----------
+            loss_fn: a zero-argument callable returning the scalar loss.
+            var_list: list of `tf.Variable` to update.
+
+        Output
+        ----------
+            The scalar loss value computed at the *perturbed* point (the
+            one whose gradient was actually descended on) — matching the
+            reference SAM implementation's own convention for what "the
+            step's loss" means.
+        """
+        var_list = list(var_list)
+
+        with tf.GradientTape() as tape:
+            loss_value = loss_fn()
+        grads = tape.gradient(loss_value, var_list)
+        self.first_step(grads, var_list)
+
+        with tf.GradientTape() as tape:
+            loss_value = loss_fn()
+        grads = tape.gradient(loss_value, var_list)
+        self.second_step(grads, var_list)
+
+        return loss_value
+
+    @property
+    def iterations(self):
+        return self.base_optimizer.iterations

@@ -12,6 +12,7 @@ Welcome to swiss_army_keras's documentation!
 
    intro
    examples
+   api
 
 Indices and tables
 ==================

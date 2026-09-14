@@ -12,7 +12,16 @@ from swiss_army_keras.quantization_utils import Quantizer
 from tensorflow.python.util.tf_export import keras_export
 
 
-from keras.models import Model
+# NOT `from keras.models import Model` (the standalone Keras 3 package) -
+# every model this library builds is a legacy-Keras-2 `tf.keras.models.Model`
+# instance (`TF_USE_LEGACY_KERAS=1`, forced in `swiss_army_keras/__init__.py`),
+# a *different* class hierarchy than standalone Keras 3's `Model`. The bare
+# `keras` import made `isinstance(i, Model)` below always False for every
+# model this library actually builds, silently breaking `freeze_layers`/
+# `unfreeze_layers`'s recursion into nested backbone sub-models (in addition
+# to the import itself being unresolvable without the standalone `keras`
+# package installed at all) - see plan.md §10/§13 Phase 8.
+from tensorflow.keras.models import Model
 
 
 def freeze_layers(model, tlist=[]):
@@ -171,6 +180,20 @@ class TrainingDriver():
             logging.warning('Unfreezing Model')
 
             self.model = unfreeze_model(self.model)
+
+            # The optimizer was already built (its internal per-variable slots
+            # created) against the frozen phase's smaller trainable-variable
+            # list, by the first `fit()` call above. Unfreezing adds many more
+            # trainable variables (the whole backbone); re-`compile`-ing with
+            # the same already-built optimizer instance does NOT rebuild it,
+            # so the second `fit()` crashes the first time it touches one of
+            # the newly-unfrozen variables: `KeyError: The optimizer cannot
+            # recognize variable ...`. Resetting `_built` and rebuilding
+            # against the model's current (full) trainable variables is the
+            # fix Keras' own error message points to (plan.md sec.10/sec.13
+            # Phase 8).
+            self.optimizer._built = False
+            self.optimizer.build(self.model.trainable_variables)
 
             self.model.compile(loss=self.loss,
                                optimizer=self.optimizer,

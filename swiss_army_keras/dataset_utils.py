@@ -23,13 +23,13 @@ from tqdm import tqdm
 
 from multiprocessing import Process, cpu_count
 
+import threading
+
 from IronDomo import IDPBroker, IDPAsyncClient, IDPWorker
 
 import logging
 
 import dill
-
-import threading
 
 from PIL import Image
 
@@ -102,6 +102,19 @@ class WorkerProcess(Process):
             dset = request[0].decode()
             img = np.frombuffer(request[1], dtype=np.uint8).reshape(
                 (self.width, self.height, 3))
+            # `idx` tags which in-flight request this is, set by the client
+            # (see `aug_function_parallel`) and echoed back unchanged here.
+            # The client sends a whole batch's worth of requests before
+            # receiving any replies, and replies can come back out of order
+            # (different workers finish at different times) - without a tag
+            # to match a reply to its request, the client has to assume
+            # replies arrive in send order, which is not guaranteed and both
+            # silently mismatches image/label pairs and (rarely, under a
+            # vendored ZMQ router identity-matching race) corrupts a reply's
+            # buffer length, crashing `np.frombuffer(...)` downstream with
+            # `ValueError: setting an array element with a sequence` (seen
+            # crashing real notebook runs; plan.md sec.10/sec.13 Phase 8).
+            idx = request[3]
 
             if self.mode == 'segmentation':
 
@@ -111,10 +124,10 @@ class WorkerProcess(Process):
                     data = {'image': img, 'mask': lbl}
 
                     aug_data = self.augmentations[dset](**data)
-                    return [aug_data['image'].data, aug_data['mask'].data]
+                    return [aug_data['image'].data, aug_data['mask'].data, idx]
                 except Exception as e:
                     logging.error(f'Augmentation error: {e}')
-                    return [img.data, lbl.data]
+                    return [img.data, lbl.data, idx]
             elif self.mode == 'classification':
 
                 data = {'image': img}
@@ -122,10 +135,10 @@ class WorkerProcess(Process):
 
                 try:
                     aug_data = self.augmentations[dset](**data)
-                    return [aug_data['image'].data, label]
+                    return [aug_data['image'].data, label, idx]
                 except Exception as e:
                     logging.error(f'Augmentation error: {e}')
-                    return [img.data, label]
+                    return [img.data, label, idx]
 
     def __init__(self, count, augmentations_serialized, width, height, output_width, output_height, clear_url='tcp://127.0.0.1:4445', service='augmentation', mode='segmentation'):
         self.count = count
@@ -247,8 +260,65 @@ class SegmentationAlbumentationsDataLoader:
 
         self.client = IDPAsyncClient.IronDomoAsyncClient(
             self.socket_clear, False, identity="DatasetLoader")
+        # `self.client` is one ZMQ DEALER socket shared by the train/val/test
+        # `tf.data` pipelines built from this loader. Each pipeline keeps its
+        # own background prefetch thread alive for the lifetime of the
+        # iterator (not just while actively consumed), so e.g. train's
+        # prefetch thread can still be mid-round-trip when validation starts
+        # pulling from val's pipeline on another thread - both call
+        # `aug_function_parallel` concurrently against the same socket, which
+        # is not safe for concurrent send/recv from multiple threads. That
+        # interleaving corrupted replies (wrong buffer picked up by the wrong
+        # thread), crashing `np.frombuffer(...)` downstream with `ValueError:
+        # setting an array element with a sequence` (plan.md §10/§13 Phase 8).
+        # Serializing each full batch round-trip fixes it.
+        self._client_lock = threading.Lock()
 
         self.ignore_errors = ignore_errors
+
+        self._warm_up_workers()
+
+    def _warm_up_workers(self, attempts=15, delay=1.0):
+        """The broker + worker pool spawned above takes a moment to finish
+        starting; the very first real requests can race a worker/broker that
+        hasn't finished connecting yet, coming back with a corrupted-length
+        reply (`ValueError: setting an array element with a sequence` deep in
+        `aug_function_parallel`) - rare but reproducible, seen crashing real
+        notebook runs (plan.md sec.10/sec.13 Phase 8). A single probe request
+        isn't enough: the broker round-robins across the whole worker pool, so
+        one lucky reply from an already-ready worker doesn't prove the other
+        (still-starting) workers are ready too. Probe the whole pool at once
+        each attempt (one request per worker), before this loader is ever
+        handed to a `tf.data` pipeline, retrying every worker with a fresh
+        client connection until a full round is clean.
+        """
+        num_workers = max(1, int(cpu_count() / 2))
+        dummy_img = np.zeros((self.width, self.height, 3), dtype=np.uint8)
+        dummy_mask = np.zeros(
+            (self.output_width, self.output_height), dtype=np.uint8)
+        for attempt in range(attempts):
+            try:
+                for i in range(num_workers):
+                    idx_buf = np.array([i], dtype=np.int32)
+                    self.client.send(b'augmentation', [
+                                     b'val', dummy_img.data, dummy_mask.data, idx_buf.data])
+                for _ in range(num_workers):
+                    reply = self.client.recv()
+                    if reply is None or len(reply) < 3:
+                        raise RuntimeError(
+                            'worker pool not ready yet (no/short reply)')
+                    got_img = np.frombuffer(reply[0], dtype=np.uint8)
+                    got_mask = np.frombuffer(reply[1], dtype=np.uint8)
+                    got_idx = np.frombuffer(reply[2], dtype=np.int32)
+                    if got_img.size != dummy_img.size or got_mask.size != dummy_mask.size or got_idx.size != 1:
+                        raise RuntimeError(
+                            'worker pool not ready yet (malformed reply)')
+                return
+            except Exception:
+                self.client.reconnect_to_broker()
+                time.sleep(delay)
+        raise RuntimeError(
+            'Data loader worker pool did not become ready in time')
 
     def __getstate__(self):
         self_dict = self.__dict__.copy()
@@ -301,24 +371,56 @@ class SegmentationAlbumentationsDataLoader:
 
     def aug_function_parallel(self, images, masks, dset):
 
-        for i in range(images.shape[0]):
+        n = images.shape[0]
+        img_size = self.width * self.height * 3
+        mask_size = self.output_width * self.output_height
 
-            
+        with self._client_lock:
+            for i in range(n):
+                idx_buf = np.array([i], dtype=np.int32)
+                self.client.send(b'augmentation', [
+                                 dset,  images[i].data, masks[i].data, idx_buf.data])
 
-            self.client.send(b'augmentation', [
-                             dset,  images[i].data, masks[i].data])
+            aug_img = np.empty_like(images)
+            aug_msk = np.empty_like(masks)
 
-        aug_img = np.empty_like(images)
-        aug_msk = np.empty_like(masks)
+            # Replies aren't guaranteed to arrive in send order (different
+            # workers finish at different times), and can rarely come back
+            # corrupted (see the note in `WorkerProcess.Workload.do`). Each
+            # reply carries back the index of the request it answers, so
+            # match replies to slots by that index instead of by arrival
+            # order, and validate every reply's shape before trusting it -
+            # silently retrying a malformed/misdirected one instead of
+            # crashing the whole training run.
+            pending = set(range(n))
+            budget = n * 4
+            while pending and budget > 0:
+                budget -= 1
+                aug_data = self.client.recv()
+                if aug_data is None or len(aug_data) < 3:
+                    continue
+                try:
+                    idx_arr = np.frombuffer(aug_data[2], dtype=np.int32)
+                    if idx_arr.size != 1:
+                        continue
+                    idx = int(idx_arr[0])
+                    if idx not in pending:
+                        continue
+                    got_img = np.frombuffer(aug_data[0], dtype=np.uint8)
+                    got_msk = np.frombuffer(aug_data[1], dtype=np.uint8)
+                    if got_img.size != img_size or got_msk.size != mask_size:
+                        continue
+                except Exception:
+                    continue
+                aug_img[idx] = got_img.reshape(self.width, self.height, 3)
+                aug_msk[idx] = got_msk.reshape(
+                    self.output_width, self.output_height)
+                pending.discard(idx)
 
-        for i in range(images.shape[0]):
-
-            aug_data = self.client.recv()
-
-            aug_img[i] = np.frombuffer(aug_data[0], dtype=np.uint8).reshape(
-                self.width, self.height, 3)  # aug_data["image"]
-            aug_msk[i] = np.frombuffer(aug_data[1], dtype=np.uint8).reshape(
-                self.output_width, self.output_height)  # aug_data["image"]
+            if pending:
+                raise RuntimeError(
+                    f'aug_function_parallel: {len(pending)} sample(s) never '
+                    f'got a valid reply: {sorted(pending)}')
 
         return aug_img, aug_msk.astype(np.uint8)
 
@@ -612,8 +714,64 @@ class ClassificationAlbumentationsDataLoader:
 
         self.client = IDPAsyncClient.IronDomoAsyncClient(
             self.socket_clear, False, identity="DatasetLoader")
+        # `self.client` is one ZMQ DEALER socket shared by the train/val/test
+        # `tf.data` pipelines built from this loader. Each pipeline keeps its
+        # own background prefetch thread alive for the lifetime of the
+        # iterator (not just while actively consumed), so e.g. train's
+        # prefetch thread can still be mid-round-trip when validation starts
+        # pulling from val's pipeline on another thread - both call
+        # `aug_function_parallel` concurrently against the same socket, which
+        # is not safe for concurrent send/recv from multiple threads. That
+        # interleaving corrupted replies (wrong buffer picked up by the wrong
+        # thread), crashing `np.frombuffer(...)` downstream with `ValueError:
+        # setting an array element with a sequence` (plan.md §10/§13 Phase 8).
+        # Serializing each full batch round-trip fixes it.
+        self._client_lock = threading.Lock()
 
         self.ignore_errors = ignore_errors
+
+        self._warm_up_workers()
+
+    def _warm_up_workers(self, attempts=15, delay=1.0):
+        """The broker + worker pool spawned above takes a moment to finish
+        starting; the very first real requests can race a worker/broker that
+        hasn't finished connecting yet, coming back with a corrupted-length
+        reply (`ValueError: setting an array element with a sequence` deep in
+        `aug_function_parallel`) - rare but reproducible, seen crashing real
+        notebook runs (plan.md sec.10/sec.13 Phase 8). A single probe request
+        isn't enough: the broker round-robins across the whole worker pool, so
+        one lucky reply from an already-ready worker doesn't prove the other
+        (still-starting) workers are ready too. Probe the whole pool at once
+        each attempt (one request per worker), before this loader is ever
+        handed to a `tf.data` pipeline, retrying every worker with a fresh
+        client connection until a full round is clean.
+        """
+        num_workers = max(1, int(cpu_count() / 2))
+        dummy_img = np.zeros((self.width, self.height, 3), dtype=np.uint8)
+        dummy_label = np.zeros(1, dtype=np.int32)
+        for attempt in range(attempts):
+            try:
+                for i in range(num_workers):
+                    idx_buf = np.array([i], dtype=np.int32)
+                    self.client.send(b'augmentation', [
+                                     b'val', dummy_img.data, dummy_label.data, idx_buf.data])
+                for _ in range(num_workers):
+                    reply = self.client.recv()
+                    if reply is None or len(reply) < 3:
+                        raise RuntimeError(
+                            'worker pool not ready yet (no/short reply)')
+                    got_img = np.frombuffer(reply[0], dtype=np.uint8)
+                    got_label = np.frombuffer(reply[1], dtype=np.int32)
+                    got_idx = np.frombuffer(reply[2], dtype=np.int32)
+                    if got_img.size != dummy_img.size or got_label.size != 1 or got_idx.size != 1:
+                        raise RuntimeError(
+                            'worker pool not ready yet (malformed reply)')
+                return
+            except Exception:
+                self.client.reconnect_to_broker()
+                time.sleep(delay)
+        raise RuntimeError(
+            'Data loader worker pool did not become ready in time')
 
     def __getstate__(self):
         self_dict = self.__dict__.copy()
@@ -650,20 +808,68 @@ class ClassificationAlbumentationsDataLoader:
 
     def aug_function_parallel(self, images, labels, dset):
 
-        for i in range(images.shape[0]):
-            self.client.send(b'augmentation', [
-                             dset, images[i].data, labels[i].data])
+        # `labels[i]` is a 0-dimensional numpy scalar (labels is shape
+        # (batch,)); its `.data` memoryview has shape () and does not
+        # behave like a normal fixed-length buffer across the
+        # multiprocess/ZMQ round-trip (it doesn't even support `len()`
+        # directly) - slicing to a proper 1-d, 1-element array first gives
+        # a well-defined 4-byte buffer (plan.md sec.10/sec.13 Phase 8).
+        n = images.shape[0]
+        img_size = self.width * self.height * 3
 
-        aug_img = np.empty_like(images)
-        aug_label = np.empty_like(labels)
+        with self._client_lock:
+            for i in range(n):
+                idx_buf = np.array([i], dtype=np.int32)
+                self.client.send(b'augmentation', [
+                                 dset, images[i].data, labels[i:i+1].data, idx_buf.data])
 
-        for i in range(images.shape[0]):
+            aug_img = np.empty_like(images)
+            aug_label = np.empty_like(labels)
 
-            aug_data = self.client.recv()
+            # Replies aren't guaranteed to arrive in send order (different
+            # workers finish at different times), and can rarely come back
+            # corrupted (see the note in `WorkerProcess.Workload.do`). Each
+            # reply carries back the index of the request it answers, so
+            # match replies to slots by that index instead of by arrival
+            # order, and validate every reply's shape before trusting it -
+            # silently retrying a malformed/misdirected one instead of
+            # crashing the whole training run.
+            pending = set(range(n))
+            budget = n * 4
+            while pending and budget > 0:
+                budget -= 1
+                aug_data = self.client.recv()
+                if aug_data is None or len(aug_data) < 3:
+                    continue
+                try:
+                    idx_arr = np.frombuffer(aug_data[2], dtype=np.int32)
+                    if idx_arr.size != 1:
+                        continue
+                    idx = int(idx_arr[0])
+                    if idx not in pending:
+                        continue
+                    got_img = np.frombuffer(aug_data[0], dtype=np.uint8)
+                    got_label = np.frombuffer(aug_data[1], dtype=np.int32)
+                    if got_img.size != img_size or got_label.size != 1:
+                        continue
+                except Exception:
+                    continue
+                aug_img[idx] = got_img.reshape(self.width, self.height, 3)
+                # `got_label` is shape (1,) (one int32 read back from a
+                # 4-byte buffer); `aug_label[idx]` is a scalar (0-d) slot.
+                # Assigning a shape-(1,) array directly into a 0-d slot
+                # raises `ValueError: setting an array element with a
+                # sequence` in this numpy version, which is what was
+                # actually crashing every notebook run - not corruption on
+                # the wire (plan.md sec.10/sec.13 Phase 8). Extract the
+                # scalar explicitly instead of relying on broadcasting.
+                aug_label[idx] = got_label.item()
+                pending.discard(idx)
 
-            aug_img[i] = np.frombuffer(aug_data[0], dtype=np.uint8).reshape(
-                self.width, self.height, 3)  # aug_data["image"]
-            aug_label[i] = np.frombuffer(aug_data[1], dtype=np.int32)
+            if pending:
+                raise RuntimeError(
+                    f'aug_function_parallel: {len(pending)} sample(s) never '
+                    f'got a valid reply: {sorted(pending)}')
 
         return aug_img, aug_label
 

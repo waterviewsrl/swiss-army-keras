@@ -1,6 +1,11 @@
 
 from __future__ import absolute_import
 
+import math
+
+import tensorflow as tf
+import tensorflow_model_optimization as tfmot
+
 from swiss_army_keras.activations import GELU, Snake
 from tensorflow import expand_dims
 from tensorflow.compat.v1 import image
@@ -9,7 +14,78 @@ from tensorflow.keras.layers import Conv2D, DepthwiseConv2D, Lambda
 from tensorflow.keras.layers import BatchNormalization, Activation, concatenate, multiply, add
 from tensorflow.keras.layers import ReLU, LeakyReLU, PReLU, ELU, Softmax
 
-def decode_layer(X, channel, pool_size, unpool, kernel_size=3, 
+
+def qat_annotate_layer(layer):
+    '''Wrap `layer` for QAT (in place of a bare
+    `tfmot.quantization.keras.quantize_annotate_layer` call), forcing float32
+    compute on it regardless of any ambient mixed-precision policy (e.g.
+    `tf.keras.mixed_precision.set_global_policy('mixed_float16')`, set by a
+    caller to speed up backbone training on a Tensor-Core GPU - backbones are
+    never QAT-annotated, see `backbone_zoo`, so they benefit from such a
+    policy freely).
+
+    `tfmot`'s fake-quantization op (`FakeQuantWithMinMaxVars`, used by every
+    QAT-wrapped layer's output quantizer) hard-requires float32 inputs -
+    `TypeError: Input 'inputs' of 'FakeQuantWithMinMaxVars' Op has type
+    float16 that does not match expected type of float32` - confirmed
+    empirically by actually building a decoder under a `mixed_float16`
+    policy, not documented anywhere in `tfmot` itself. Every decoder/head
+    builder function in this repo unconditionally ends with `quantize_apply`
+    on its `quantize_annotate_layer`-wrapped layers (no opt-out), so without
+    this, setting a global mixed-precision policy anywhere in a process
+    would break every one of them.
+
+    Two dtype-policy overrides are needed, not one: forcing the raw `layer`
+    itself is not enough, since the `QuantizeAnnotate` wrapper this returns
+    calls `self.layer.call(...)` directly (bypassing the normal
+    `Layer.__call__` auto-cast machinery), so the *wrapper's own* policy is
+    what actually determines the dtype its output gets cast to before
+    reaching the inner layer. A third override, for the separate
+    `QuantizeWrapperV2` that `quantize_apply()` constructs later (at model-
+    build time, not here), is handled once globally by
+    `_force_quantize_wrapper_dtype_float32()` below, since that wrapper is
+    built internally by `tfmot`, not by this function.
+    '''
+    layer._set_dtype_policy(tf.keras.mixed_precision.Policy('float32'))
+    wrapped = tfmot.quantization.keras.quantize_annotate_layer(layer)
+    wrapped._set_dtype_policy(tf.keras.mixed_precision.Policy('float32'))
+    return wrapped
+
+
+def _force_quantize_wrapper_dtype_float32():
+    '''Patch `tfmot`'s `QuantizeWrapper` (base class of `QuantizeWrapperV2`,
+    which `quantize_apply()` constructs internally for every
+    `quantize_annotate_layer`-wrapped layer when a model is finished being
+    built) and `QuantizeLayer` (a separate, plain-`Layer` class `tfmot` adds
+    to quantize a model's raw *input* tensor, seen so far only on `ddrnet` -
+    its first op reads the input directly, unlike this repo's other
+    decoders) so every instance of either is forced to float32 compute, the
+    same way `qat_annotate_layer` above forces its own two wrappers - see
+    that function's docstring for why. Applied once, at import time of this
+    module (imported, directly or via a `from .layer_utils import *`, by
+    every decoder/head file that uses QAT), rather than per-layer, since
+    `quantize_apply()` builds these objects itself; there is no per-call-site
+    hook for this repo's code to intervene at.
+    '''
+    from tensorflow_model_optimization.python.core.quantization.keras.quantize_wrapper import QuantizeWrapper
+    from tensorflow_model_optimization.python.core.quantization.keras.quantize_layer import QuantizeLayer
+
+    for cls in (QuantizeWrapper, QuantizeLayer):
+        if getattr(cls, '_sak_float32_patched', False):
+            continue
+        _orig_init = cls.__init__
+
+        def _patched_init(self, *args, _orig_init=_orig_init, **kwargs):
+            _orig_init(self, *args, **kwargs)
+            self._set_dtype_policy(tf.keras.mixed_precision.Policy('float32'))
+        cls.__init__ = _patched_init
+        cls._sak_float32_patched = True
+
+
+_force_quantize_wrapper_dtype_float32()
+
+
+def decode_layer(X, channel, pool_size, unpool, kernel_size=3,
                  activation='ReLU', batch_norm=False, name='decode'):
     '''
     An overall decode layer, based on either upsampling or trans conv.
@@ -420,4 +496,214 @@ def CONV_output(X, n_labels, kernel_size=1, activation='Softmax', name='conv_out
 
 
 def dummy_preprocessing(x):
+    return x
+
+
+# ========================= #
+# Lightweight attention/pooling layers (plan.md §9.1) - shared building
+# blocks for the classifier heads in `_model_classifier.py`, wired in via
+# each head's `pre_pool_attention=None|'gem'|'eca'|'coordatt'` argument
+# rather than forking a near-duplicate classifier function per combination.
+
+
+@tf.keras.utils.register_keras_serializable(package='swiss_army_keras')
+class GeMPooling2D(tf.keras.layers.Layer):
+    '''Generalized-Mean (GeM) pooling — `(mean(clip(x, eps)^p))^(1/p)` over
+    the spatial dims, with a single learnable exponent `p` shared across all
+    channels. `p=1` reduces to average pooling, `p -> inf` approaches max
+    pooling — GeM lets training find the right point between those two
+    (and beyond, since `p` isn't constrained to `[1, inf)`), which
+    consistently outperforms committing to either one outright on
+    fine-grained/attribute classification tasks, for one extra scalar
+    parameter.
+
+    A drop-in replacement for `GlobalAveragePooling2D`/`GlobalMaxPool2D`
+    (input `(B, H, W, C)`, output `(B, C)`) — not a "pre-pool attention"
+    gate the way `ECABlock`/`CoordAttLite` below are, since it replaces the
+    pooling reduction itself rather than reweighting the feature map before
+    an existing pooling op; grouped with them under one
+    `pre_pool_attention` hook regardless, per plan.md §9.1's own framing.
+
+    ----------
+    Radenović, F., Tolias, G. and Chum, O., 2018. Fine-tuning CNN image
+    retrieval with no human annotation. IEEE TPAMI.
+
+    Input
+    ----------
+        p_init: initial value of the learnable exponent `p` (3.0, a common
+                starting point in the literature — closer to max-pooling
+                than average-pooling, since image-retrieval/fine-grained
+                tasks tend to benefit from emphasizing salient regions).
+        epsilon: clip floor before raising to the power `p`, avoiding
+                 `0^p` (undefined for `p <= 0`) or exploding gradients from
+                 a near-zero base raised to a large power.
+        trainable_p: if `False`, `p` stays fixed at `p_init` instead of
+                     being learned — a fixed-`p` GeM pool, sometimes used
+                     when the extra parameter isn't wanted.
+    '''
+
+    def __init__(self, p_init=3.0, epsilon=1e-6, trainable_p=True, **kwargs):
+        super().__init__(**kwargs)
+        self.p_init = p_init
+        self.epsilon = epsilon
+        self.trainable_p = trainable_p
+
+    def build(self, input_shape):
+        self.p = self.add_weight(
+            name='p', shape=(), dtype=self.dtype,
+            initializer=tf.keras.initializers.Constant(self.p_init),
+            trainable=self.trainable_p,
+        )
+        super().build(input_shape)
+
+    def call(self, x):
+        x = tf.clip_by_value(x, self.epsilon, tf.float32.max)
+        x = tf.pow(x, self.p)
+        x = tf.reduce_mean(x, axis=[1, 2])
+        return tf.pow(x, 1.0 / self.p)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({'p_init': self.p_init, 'epsilon': self.epsilon, 'trainable_p': self.trainable_p})
+        return config
+
+
+@tf.keras.utils.register_keras_serializable(package='swiss_army_keras')
+class ECABlock(tf.keras.layers.Layer):
+    '''Efficient Channel Attention (ECA) — a single 1-D conv (no
+    dimensionality reduction, unlike SE's two-FC bottleneck) over the
+    globally-pooled per-channel descriptor, sigmoid-gated back onto the
+    input. Orders of magnitude fewer parameters than SE for a comparable
+    accuracy gain, since it never projects the channel descriptor down to
+    a bottleneck and back.
+
+    ----------
+    Wang, Q., Wu, B., Zhu, P., Li, P., Zuo, W. and Hu, Q., 2020. ECA-Net:
+    Efficient channel attention for deep convolutional neural networks.
+    In CVPR.
+
+    Input
+    ----------
+        kernel_size: the 1-D conv's kernel size (the *only* free parameter
+                     ECA introduces). `None` (default) picks it adaptively
+                     from the input's channel count via the paper's own
+                     formula (`k = |log2(C)/gamma + b/gamma|`, rounded to
+                     the nearest odd integer, floored at 3) — a fixed
+                     kernel size can also be passed directly.
+        gamma, b: coefficients of the adaptive kernel-size formula above;
+                  only used when `kernel_size=None`. `2`/`1`, the paper's
+                  own defaults.
+    '''
+
+    def __init__(self, kernel_size=None, gamma=2, b=1, **kwargs):
+        super().__init__(**kwargs)
+        self.kernel_size = kernel_size
+        self.gamma = gamma
+        self.b = b
+
+    def build(self, input_shape):
+        channels = int(input_shape[-1])
+        if self.kernel_size is not None:
+            k = self.kernel_size
+        else:
+            t = int(abs((math.log(channels, 2) / self.gamma) + (self.b / self.gamma)))
+            k = t if t % 2 else t + 1
+            k = max(k, 3)
+        self._resolved_kernel_size = k
+        self.conv = tf.keras.layers.Conv1D(1, k, padding='same', use_bias=False, name='eca_conv1d')
+        super().build(input_shape)
+
+    def call(self, x):
+        y = tf.reduce_mean(x, axis=[1, 2])          # (B, C)
+        y = tf.expand_dims(y, axis=-1)               # (B, C, 1)
+        y = self.conv(y)                             # (B, C, 1)
+        y = tf.squeeze(y, axis=-1)                    # (B, C)
+        y = tf.nn.sigmoid(y)
+        y = y[:, tf.newaxis, tf.newaxis, :]           # (B, 1, 1, C)
+        return x * y
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({'kernel_size': self.kernel_size, 'gamma': self.gamma, 'b': self.b})
+        return config
+
+
+@tf.keras.utils.register_keras_serializable(package='swiss_army_keras')
+class CoordAttLite(tf.keras.layers.Layer):
+    '''Coordinate Attention (lite variant) — unlike GAP-based channel
+    attention (SE/ECA above), which pools away *all* spatial information
+    before computing its gate, CoordAtt keeps positional information by
+    pooling along the height and width axes *separately* first (giving one
+    per-row and one per-column descriptor), fusing them through a shared
+    1x1 conv, then splitting back into an independent per-row and
+    per-column attention map. Matters whenever *where* in the frame carries
+    signal, not just *what's* in it — plain channel attention discards that
+    signal entirely by construction.
+
+    "Lite" here: the shared fusion nonlinearity is a plain `relu` rather
+    than the original paper's own `h-swish` (no standard Keras
+    layer for it, and this keeps the block dependency-free) — a documented
+    simplification, not a different algorithm.
+
+    ----------
+    Hou, Q., Zhou, D. and Feng, J., 2021. Coordinate attention for
+    efficient mobile network design. In CVPR.
+
+    Input
+    ----------
+        reduction: channel-reduction ratio for the shared fusion conv's
+                   bottleneck width (`max(8, channels // reduction)`) — 32,
+                   the paper's own default.
+    '''
+
+    def __init__(self, reduction=32, **kwargs):
+        super().__init__(**kwargs)
+        self.reduction = reduction
+
+    def build(self, input_shape):
+        self.height = int(input_shape[1])
+        self.width = int(input_shape[2])
+        channels = int(input_shape[-1])
+        mid_channels = max(8, channels // self.reduction)
+
+        self.conv_reduce = tf.keras.layers.Conv2D(mid_channels, 1, use_bias=False, name='coordatt_reduce')
+        self.bn = tf.keras.layers.BatchNormalization(name='coordatt_bn')
+        self.conv_h = tf.keras.layers.Conv2D(channels, 1, use_bias=True, name='coordatt_h')
+        self.conv_w = tf.keras.layers.Conv2D(channels, 1, use_bias=True, name='coordatt_w')
+        super().build(input_shape)
+
+    def call(self, x):
+        pool_h = tf.reduce_mean(x, axis=2, keepdims=True)              # (B, H, 1, C)
+        pool_w = tf.reduce_mean(x, axis=1, keepdims=True)               # (B, 1, W, C)
+        pool_w = tf.transpose(pool_w, [0, 2, 1, 3])                     # (B, W, 1, C)
+
+        y = tf.concat([pool_h, pool_w], axis=1)                         # (B, H+W, 1, C)
+        y = self.conv_reduce(y)
+        y = self.bn(y)
+        y = tf.nn.relu(y)
+
+        y_h, y_w = tf.split(y, [self.height, self.width], axis=1)
+        y_w = tf.transpose(y_w, [0, 2, 1, 3])                            # (B, 1, W, C)
+
+        attn_h = tf.nn.sigmoid(self.conv_h(y_h))                        # (B, H, 1, C)
+        attn_w = tf.nn.sigmoid(self.conv_w(y_w))                        # (B, 1, W, C)
+
+        return x * attn_h * attn_w
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({'reduction': self.reduction})
+        return config
+
+
+def apply_pre_pool_attention(x, pre_pool_attention=None, name='pre_pool_attention'):
+    '''Dispatch helper for the `pre_pool_attention=None|'eca'|'coordatt'`
+    hook (`_model_classifier.py`'s classifier heads) — `'gem'` is handled
+    separately by the caller (it replaces the pooling op itself, see
+    `GeMPooling2D`'s docstring for why), so it's a no-op here.
+    '''
+    if pre_pool_attention == 'eca':
+        return ECABlock(name=f'{name}_eca')(x)
+    if pre_pool_attention == 'coordatt':
+        return CoordAttLite(name=f'{name}_coordatt')(x)
     return x

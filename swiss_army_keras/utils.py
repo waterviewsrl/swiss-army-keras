@@ -2,6 +2,7 @@
 import numpy as np
 
 from PIL import Image
+from tensorflow import keras
 
 
 def dummy_loader(model_path):

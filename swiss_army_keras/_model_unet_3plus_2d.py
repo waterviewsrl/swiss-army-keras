@@ -1,8 +1,6 @@
 
 from __future__ import absolute_import
 
-from sklearn import preprocessing
-
 from swiss_army_keras.layer_utils import *
 from swiss_army_keras.activations import GELU, Snake
 from swiss_army_keras._backbone_zoo import backbone_zoo, bach_norm_checker

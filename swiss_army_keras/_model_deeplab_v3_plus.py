@@ -1,8 +1,5 @@
 
 from __future__ import absolute_import
-from multiprocessing.spawn import prepare
-
-from sklearn import preprocessing
 
 from swiss_army_keras.layer_utils import *
 from swiss_army_keras.activations import GELU, Snake
@@ -22,9 +19,6 @@ import tensorflow as tf
 import tensorflow_model_optimization as tfmot
 
 
-shallow_resize_map = {0: 1, 1: 2, 2: 4, 3: 8, 4: 16, 5: 32}
-
-
 def convolution_block(
     block_input,
     num_filters=256,
@@ -33,7 +27,7 @@ def convolution_block(
     padding="same",
     use_bias=False,
 ):
-    x = tfmot.quantization.keras.quantize_annotate_layer(Conv2D(
+    x = qat_annotate_layer(Conv2D(
         num_filters,
         kernel_size=kernel_size,
         dilation_rate=dilation_rate,
@@ -41,8 +35,8 @@ def convolution_block(
         use_bias=use_bias,
         kernel_initializer=HeNormal(),
     ))(block_input)
-    x = tfmot.quantization.keras.quantize_annotate_layer(BatchNormalization())(x)
-    return tfmot.quantization.keras.quantize_annotate_layer(Activation(relu))(x)
+    x = qat_annotate_layer(BatchNormalization())(x)
+    return qat_annotate_layer(Activation(relu))(x)
 
 
 def depth_convolution_block(
@@ -58,24 +52,24 @@ def depth_convolution_block(
     namesuffix=''
 ):
 
-    x = tfmot.quantization.keras.quantize_annotate_layer(DepthwiseConv2D((kernel_size, kernel_size), strides=(stride, stride), dilation_rate=(dilation_rate, dilation_rate),
+    x = qat_annotate_layer(DepthwiseConv2D((kernel_size, kernel_size), strides=(stride, stride), dilation_rate=(dilation_rate, dilation_rate),
                         padding=depth_padding, use_bias=False, name=f'depthwise_{dilation_rate}_{namesuffix}'))(block_input)
-    x = tfmot.quantization.keras.quantize_annotate_layer(BatchNormalization(
+    x = qat_annotate_layer(BatchNormalization(
         name=f'depthwise_BN__{dilation_rate}_{namesuffix}', epsilon=epsilon))(x)
-    x = tfmot.quantization.keras.quantize_annotate_layer(Activation(relu))(x)
-    x = tfmot.quantization.keras.quantize_annotate_layer(Conv2D(num_filters, (1, 1), padding='same',
+    x = qat_annotate_layer(Activation(relu))(x)
+    x = qat_annotate_layer(Conv2D(num_filters, (1, 1), padding='same',
                use_bias=False, name=f'pointwise_{dilation_rate}_{namesuffix}'))(x)
-    x = tfmot.quantization.keras.quantize_annotate_layer(BatchNormalization(
+    x = qat_annotate_layer(BatchNormalization(
         name=f'pointwise_BN_{dilation_rate}_{namesuffix}', epsilon=epsilon))(x)
-    x = tfmot.quantization.keras.quantize_annotate_layer(Activation(relu))(x)
+    x = qat_annotate_layer(Activation(relu))(x)
     return x
 
 
 def DilatedSpatialPyramidPooling(dspp_input, atrous_rates, num_filters):
     dims = dspp_input.shape
-    x = tfmot.quantization.keras.quantize_annotate_layer(AveragePooling2D(pool_size=(dims[-3], dims[-2])))(dspp_input)
+    x = qat_annotate_layer(AveragePooling2D(pool_size=(dims[-3], dims[-2])))(dspp_input)
     x = convolution_block(x, kernel_size=1, use_bias=True)
-    out_pool = tfmot.quantization.keras.quantize_annotate_layer(UpSampling2D(
+    out_pool = qat_annotate_layer(UpSampling2D(
         size=(dims[-3] // x.shape[1], dims[-2] // x.shape[2]), interpolation="bilinear",
     ))(x)
 
@@ -91,7 +85,7 @@ def DilatedSpatialPyramidPooling(dspp_input, atrous_rates, num_filters):
 
     x = Concatenate(axis=-1)(outputs)
     output = convolution_block(x, kernel_size=1, num_filters=num_filters)
-    output = tfmot.quantization.keras.quantize_annotate_layer(Dropout(0.1))(output)
+    output = qat_annotate_layer(Dropout(0.1))(output)
     return output
 
 
@@ -244,34 +238,60 @@ def deeplab_v3_plus(input_tensor, n_labels, filter_num_down=[64, 128, 256, 512, 
     x = DilatedSpatialPyramidPooling(
         x, atrous_rates, num_filters=num_filters_deep)
 
-    input_a = tfmot.quantization.keras.quantize_annotate_layer(UpSampling2D(
-        size=(input_tensor.shape[1] // shallow_resize_map[shallow_layer] // x.shape[1],
-              input_tensor.shape[2] // shallow_resize_map[shallow_layer] // x.shape[2]),
-        interpolation="bilinear",
-    ))(x)
     if multiscale_factor != 0:
         input_b = X_encoder_shallow
     else:
         input_b = X_encoder[shallow_layer-1]
 
+    # Upsample the deep branch to match the shallow branch's *actual* spatial
+    # size, read directly off `input_b`, rather than deriving it from
+    # `shallow_resize_map[shallow_layer]` — that map hardcodes a 2**shallow_layer
+    # downsampling factor that only holds for the `backbone=<name>` path
+    # (backbone_zoo's returned feature list has one pooling "baked into" its
+    # first entry). The no-backbone encoder above builds `X_encoder[0]` with
+    # *zero* poolings applied, so `X_encoder[shallow_layer-1]` there is
+    # downsampled by 2**(shallow_layer-1), one factor of 2 less than the map
+    # assumes — which made this `Concatenate` fail with a shape mismatch for
+    # any `backbone=None` call (see plan.md §10/§13 Phase 3). Reading the
+    # target size from `input_b` directly is correct for both encoder paths,
+    # and any future encoder, without needing a lookup table at all.
+    input_a = qat_annotate_layer(UpSampling2D(
+        size=(input_b.shape[1] // x.shape[1],
+              input_b.shape[2] // x.shape[2]),
+        interpolation="bilinear",
+    ))(x)
+
     input_b = convolution_block(
         input_b, num_filters=num_filters_shallow, kernel_size=1)
 
-    x = Concatenate(axis=-1)([input_a, input_b])
+    # Both left un-annotated here in the past, unlike `deeplab_v3_plus_lite`'s
+    # otherwise-identical pattern below - not a deliberate divergence (no
+    # "not tfmot-safe" finding backs it, the way the `Multiply`/`Add`/
+    # standalone-`BatchNormalization` exclusions elsewhere in this repo are
+    # documented), just drift between the two decoders. Wrapping both here
+    # for QAT-annotation parity fixes a real, separate bug it was hiding:
+    # under a global mixed-precision policy (`Policy('mixed_float16')`, e.g.
+    # to speed up backbone training - backbones are never QAT-annotated, see
+    # `backbone_zoo`, so this doesn't help the un-annotated layers below),
+    # `model_output`'s dtype fell out as float16 (Keras's own guidance is
+    # that a model's final output layer should stay float32 for numerical
+    # stability) - `qat_annotate_layer` forces float32 regardless of the
+    # ambient policy (see its docstring), fixing this incidentally.
+    x = qat_annotate_layer(Concatenate(axis=-1))([input_a, input_b])
     x = depth_convolution_block(x, namesuffix='shallow1')
     x = depth_convolution_block(x, namesuffix='shallow2')
-    x = tfmot.quantization.keras.quantize_annotate_layer(UpSampling2D(
+    x = qat_annotate_layer(UpSampling2D(
         size=(input_tensor.shape[1] // x.shape[1],
               input_tensor.shape[2] // x.shape[2]),
         interpolation="bilinear",
     ))(x)
-    model_output = Conv2D(n_labels, kernel_size=(1, 1), padding="same")(x)
+    model_output = qat_annotate_layer(Conv2D(n_labels, kernel_size=(1, 1), padding="same"))(x)
 
     m = Model([input_tensor, ], [model_output, ])
 
     with tfmot.quantization.keras.quantize_scope():
         m = tfmot.quantization.keras.quantize_apply(m)
-    
+
     m.preprocessing = preprocessing
 
     return m
@@ -426,20 +446,26 @@ def deeplab_v3_plus_lite(input_tensor, n_labels, filter_num_down=[64, 128, 256, 
     x = DilatedSpatialPyramidPooling(
         x, atrous_rates, num_filters=num_filters_deep)
 
-    input_a = tfmot.quantization.keras.quantize_annotate_layer(UpSampling2D(
-        size=(input_tensor.shape[1] // shallow_resize_map[shallow_layer] // x.shape[1],
-              input_tensor.shape[2] // shallow_resize_map[shallow_layer] // x.shape[2]),
-        interpolation="bilinear",
-    ))(x)
     if multiscale_factor != 0:
         input_b = X_encoder_shallow
     else:
         input_b = X_encoder[shallow_layer-1]
 
+    # See the identical fix (and full explanation) in `deeplab_v3_plus` above
+    # — `shallow_resize_map[shallow_layer]` assumed a downsampling factor
+    # that only holds for the `backbone=<name>` path; reading the shallow
+    # branch's actual spatial size directly off `input_b` is correct for the
+    # no-backbone path too.
+    input_a = qat_annotate_layer(UpSampling2D(
+        size=(input_b.shape[1] // x.shape[1],
+              input_b.shape[2] // x.shape[2]),
+        interpolation="bilinear",
+    ))(x)
+
     input_b = convolution_block(
         input_b, num_filters=num_filters_shallow, kernel_size=1)
 
-    x = tfmot.quantization.keras.quantize_annotate_layer(Concatenate(axis=-1))([input_a, input_b])
+    x = qat_annotate_layer(Concatenate(axis=-1))([input_a, input_b])
     x = depth_convolution_block(x, namesuffix='shallow1')
     x = depth_convolution_block(x, namesuffix='shallow2')
     """x = UpSampling2D(
@@ -447,7 +473,7 @@ def deeplab_v3_plus_lite(input_tensor, n_labels, filter_num_down=[64, 128, 256, 
               input_tensor.shape[2] // x.shape[2]),
         interpolation="bilinear",
     )(x)"""
-    model_output = tfmot.quantization.keras.quantize_annotate_layer(Conv2D(n_labels, kernel_size=(1, 1), padding="same"))(x)
+    model_output = qat_annotate_layer(Conv2D(n_labels, kernel_size=(1, 1), padding="same"))(x)
 
     m = Model([input_tensor, ], [model_output, ])
 
