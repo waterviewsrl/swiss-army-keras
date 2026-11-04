@@ -58,6 +58,78 @@ def test_weights_imagenet_not_implemented():
         RepViT_M0_9(include_top=False, weights='imagenet', input_tensor=tf.keras.Input((64, 64, 3)))
 
 
+def test_weights_local_path_loads(tmp_path):
+    """`weights=<path>` (e.g. a checkpoint produced by
+    `scripts/port_repvit_weights.py`, plan.md §12.1) should load real
+    weights into a freshly-built model - checked here structurally (do the
+    saved and reloaded weights actually match?), not numerically against a
+    PyTorch reference, since that needs `torch`/`timm` + network access
+    that shouldn't be a normal test-suite dependency (plan.md §12: those
+    are one-time conversion-only tools, never a runtime dependency).
+    """
+    inp = tf.keras.Input((64, 64, 3))
+    source_model = RepViT_M0_9(include_top=False, weights=None, input_tensor=inp)
+    weights_path = tmp_path / "repvit_m0_9.weights.h5"
+    source_model.save_weights(str(weights_path))
+
+    inp2 = tf.keras.Input((64, 64, 3))
+    loaded_model = RepViT_M0_9(include_top=False, weights=str(weights_path), input_tensor=inp2)
+
+    for source_layer, loaded_layer in zip(source_model.layers, loaded_model.layers):
+        for source_w, loaded_w in zip(source_layer.get_weights(), loaded_layer.get_weights()):
+            np.testing.assert_array_equal(source_w, loaded_w)
+
+
+def test_weights_local_path_skips_mismatch_with_include_top(tmp_path):
+    """A backbone-only (`include_top=False`) checkpoint should still load
+    cleanly into an `include_top=True` model (`skip_mismatch=True`) - the
+    extra classifier-head layers just keep their random init, rather than
+    this raising on the layer-count mismatch.
+    """
+    inp = tf.keras.Input((64, 64, 3))
+    source_model = RepViT_M0_9(include_top=False, weights=None, input_tensor=inp)
+    weights_path = tmp_path / "repvit_m0_9.weights.h5"
+    source_model.save_weights(str(weights_path))
+
+    inp2 = tf.keras.Input((64, 64, 3))
+    loaded_model = RepViT_M0_9(include_top=True, weights=str(weights_path), input_tensor=inp2, classes=5)
+    assert loaded_model.output_shape == (None, 5)
+
+
+def test_strided_convs_use_explicit_symmetric_padding():
+    """Regression test for a real numerical-parity bug found while porting
+    real ImageNet weights (plan.md §12.1): `padding='same'` + `strides=2`
+    does not match PyTorch's explicit symmetric padding on an even-sized
+    feature map (confirmed with an isolated single-conv repro: ~0.85 mean
+    absolute output difference from this alone) - fixed with an explicit
+    `ZeroPadding2D(1)` + `padding='valid'` on every stride-2 conv (the
+    stem's two convs, `repvit_downsample`'s depthwise conv). Checked here
+    structurally (the padding config), not numerically against PyTorch,
+    since that needs `torch`/`timm` + network access this test suite
+    shouldn't depend on - see `scripts/port_repvit_weights.py`'s own
+    numerical verification for that.
+    """
+    inp = tf.keras.Input((64, 64, 3))
+    model = RepViT_M0_9(include_top=False, weights=None, input_tensor=inp)
+
+    strided_conv_names = [
+        "RepViT_M0_9_stem_conv1", "RepViT_M0_9_stem_conv2",
+        "RepViT_M0_9_stage2_downsample_dw3x3",
+    ]
+    for conv_name in strided_conv_names:
+        layer = model.get_layer(conv_name)
+        assert layer.padding == "valid", f"{conv_name} should use explicit padding, not 'same'"
+        assert layer.strides == (2, 2)
+
+    pad_layer_names = [
+        "RepViT_M0_9_stem_conv1_pad", "RepViT_M0_9_stem_conv2_pad",
+        "RepViT_M0_9_stage2_downsample_dw3x3_pad",
+    ]
+    for pad_name in pad_layer_names:
+        pad_layer = model.get_layer(pad_name)
+        assert pad_layer.padding == ((1, 1), (1, 1))
+
+
 def test_requires_input_tensor_or_input_shape():
     with pytest.raises(ValueError):
         RepViT_M0_9(include_top=False, weights=None)

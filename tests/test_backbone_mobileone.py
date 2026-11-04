@@ -82,6 +82,28 @@ def test_weights_imagenet_not_implemented():
         MobileOne_S0(include_top=False, weights='imagenet', input_tensor=tf.keras.Input((INPUT_SIZE, INPUT_SIZE, 3)))
 
 
+def test_weights_local_path_loads(tmp_path):
+    """`weights=<path>` (e.g. a checkpoint produced by
+    `scripts/port_mobileone_weights.py`, plan.md §12.4) should load real
+    weights into a freshly-built model - checked structurally (do saved and
+    reloaded weights match?), not numerically against PyTorch, since that
+    needs `torch`/`timm` + network access this test suite shouldn't depend
+    on (plan.md §12: one-time conversion-only tools, never a runtime
+    dependency).
+    """
+    inp = tf.keras.Input((INPUT_SIZE, INPUT_SIZE, 3))
+    source_model = MobileOne_S0(include_top=False, weights=None, input_tensor=inp)
+    weights_path = tmp_path / "mobileone_s0.weights.h5"
+    source_model.save_weights(str(weights_path))
+
+    inp2 = tf.keras.Input((INPUT_SIZE, INPUT_SIZE, 3))
+    loaded_model = MobileOne_S0(include_top=False, weights=str(weights_path), input_tensor=inp2)
+
+    for source_layer, loaded_layer in zip(source_model.layers, loaded_model.layers):
+        for source_w, loaded_w in zip(source_layer.get_weights(), loaded_layer.get_weights()):
+            np.testing.assert_array_equal(source_w, loaded_w)
+
+
 def test_requires_input_tensor_or_input_shape():
     with pytest.raises(ValueError):
         MobileOne_S0(include_top=False, weights=None)

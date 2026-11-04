@@ -88,7 +88,7 @@ def lr_aspp(input_tensor, n_labels, filter_num_down=[64, 128, 256, 512, 1024],
             deep_layer=5, shallow_layer=2, num_filters=128, num_filters_shallow=48,
             stack_num_down=2, activation='ReLU', batch_norm=False, pool=True,
             backbone=None, weights='imagenet', freeze_backbone=True, freeze_batch_norm=True,
-            name='lr_aspp'):
+            name='lr_aspp', iqa_head=False):
     '''LR-ASPP (Lite Reduced ASPP) segmentation decoder, from the
     MobileNetV3 paper (Howard et al., 2019).
 
@@ -117,13 +117,25 @@ def lr_aspp(input_tensor, n_labels, filter_num_down=[64, 128, 256, 512, 1024],
         freeze_backbone: `True` to freeze the backbone's weights.
         freeze_batch_norm: `True` to also freeze the backbone's BN layers.
         name: prefix of the created Keras model and its layers.
+        iqa_head (plan.md §13.7): `False` (default) — unchanged behavior,
+            a single `(H, W, n_labels)` output, exactly as before. `True` —
+            adds a small `swiss_army_keras.layer_utils.iqa_regression_head`
+            side branch tapped off `deep_feature` (this decoder's own
+            deepest encoder tap, before the LR-ASPP module consumes it),
+            trained simultaneously with the main segmentation task on the
+            same shared backbone (e.g. via
+            `swiss_army_keras.iqa_utils.add_teacher_iqa_labels`) — the
+            exported model carries both heads off one shared encoder.
+            Appends its `[0, 1]` score as a second output:
+            `[logit_map, iqa_score]`.
 
     Output
     ----------
         A `tf.keras.Model` with a `.preprocessing` attribute (the backbone's
         expected input preprocessing function, or `dummy_preprocessing` for
         `backbone=None`), producing an `(H, W, n_labels)` logit map at the
-        input's spatial resolution.
+        input's spatial resolution (plus, if `iqa_head=True`, a second
+        `(batch, 1)` quality-score output).
     '''
 
     depth_ = len(filter_num_down)
@@ -174,7 +186,12 @@ def lr_aspp(input_tensor, n_labels, filter_num_down=[64, 128, 256, 512, 1024],
     model_output = qat_annotate_layer(
         Conv2D(n_labels, kernel_size=1, padding='same', name='{}_head'.format(name)))(x)
 
-    m = Model([input_tensor, ], [model_output, ])
+    outputs = [model_output, ]
+    if iqa_head:
+        iqa_score = iqa_regression_head(deep_feature, name='{}_iqa'.format(name))
+        outputs.append(iqa_score)
+
+    m = Model([input_tensor, ], outputs)
 
     with tfmot.quantization.keras.quantize_scope():
         m = tfmot.quantization.keras.quantize_apply(m)

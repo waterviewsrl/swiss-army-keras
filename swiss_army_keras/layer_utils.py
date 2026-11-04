@@ -9,10 +9,11 @@ import tensorflow_model_optimization as tfmot
 from swiss_army_keras.activations import GELU, Snake
 from tensorflow import expand_dims
 from tensorflow.compat.v1 import image
-from tensorflow.keras.layers import MaxPooling2D, AveragePooling2D, UpSampling2D, Conv2DTranspose, GlobalAveragePooling2D
+from tensorflow.keras.layers import Input, MaxPooling2D, AveragePooling2D, UpSampling2D, Conv2DTranspose, GlobalAveragePooling2D
 from tensorflow.keras.layers import Conv2D, DepthwiseConv2D, Lambda
 from tensorflow.keras.layers import BatchNormalization, Activation, concatenate, multiply, add
 from tensorflow.keras.layers import ReLU, LeakyReLU, PReLU, ELU, Softmax
+from tensorflow.keras.models import Model
 
 
 def qat_annotate_layer(layer):
@@ -707,3 +708,249 @@ def apply_pre_pool_attention(x, pre_pool_attention=None, name='pre_pool_attentio
     if pre_pool_attention == 'coordatt':
         return CoordAttLite(name=f'{name}_coordatt')(x)
     return x
+
+
+def iqa_regression_head(base_model_tap, size=64, pooling='gem', name='iqa'):
+    '''A small, cheap regression tail for a shared-backbone Image Quality
+    Assessment (IQA) side-head (plan.md §13.7, Phase 11) — trained
+    simultaneously with a task head on the same backbone, against a
+    teacher-distilled pseudo-label (`swiss_army_keras.iqa_utils.
+    add_teacher_iqa_labels`), so a single exported graph carries both the
+    main task output and a cheap per-inference quality/confidence signal.
+
+    Deliberately much smaller than a task head's own trunk (`size=64`
+    default vs. `classifier()`'s own `size=1024`) — this branch only
+    regresses one scalar, not `n_classes`/`n_labels`-many outputs.
+
+    Input
+    ----------
+        base_model_tap: the backbone feature tensor to tap - an
+                        *intermediate* tensor (e.g. `classifier()`'s own
+                        `base_model`, before its own pooling/Dense tail
+                        runs), not a model's final output. Callers thread
+                        this in themselves; this function has no opinion
+                        on which backbone tap to use.
+        size: the single hidden `Dense` layer's width (`64`).
+        pooling: `'gem'` (default, `GeMPooling2D`) or `'avg'`
+                 (`GlobalAveragePooling2D`).
+        name: prefix of the created Keras layers.
+
+    Output
+    ----------
+        A `(batch, 1)` sigmoid-bounded `[0, 1]` quality score tensor - not
+        a NIMA-style score distribution (the FP/FN-filtering use case this
+        was built for only needs a threshold-able scalar).
+    '''
+    if pooling == 'gem':
+        pool = GeMPooling2D(name=f'{name}_gem')(base_model_tap)
+    else:
+        pool = qat_annotate_layer(GlobalAveragePooling2D())(base_model_tap)
+
+    x = qat_annotate_layer(tf.keras.layers.Dense(size, activation='relu', name=f'{name}_dense'))(pool)
+    return qat_annotate_layer(tf.keras.layers.Dense(1, activation='sigmoid', name=f'{name}_score'))(x)
+
+
+# ========================= #
+# Edge-deployment extras (plan.md §13.1/§13.2, Phase 10) - in-graph uint8
+# input handling and a training-free OOD/low-confidence signal (Energy
+# Score), both built as post-hoc wrappers around an already-built model
+# rather than parameters threaded through every model-builder function.
+# This works because every builder in this repo (`classifier`, `lr_aspp`,
+# `fcos_lite_detection`, etc.) already takes an externally-built
+# `input_tensor` rather than constructing its own `Input(...)` - the same
+# "outer model calls an already-`quantize_apply`'d inner model, adds
+# float32-only processing around it, no re-quantization needed" pattern
+# `_model_detection.py`'s `fcos_lite_detection`/`gfl_lite_detection`
+# already use at the *output* side (`decode_boxes`/NMS after the base
+# model), applied here at the *input* side (`uint8_input_wrapper`) and
+# reused unmodified at the output side too (`add_energy_score_output`).
+
+
+def uint8_input_wrapper(model, channels_first=False, name=None):
+    '''Wraps an already-built model (any task this repo produces -
+    classifier, segmentation decoder, detector) with a new raw `uint8`
+    `(H, W, 3)` input, moving dtype cast, normalization, and (optionally) a
+    channels-last -> channels-first layout transpose entirely into the
+    graph - motivated by a concrete Axis ACAP constraint: when a TFLite
+    model's input dtype is set to `uint8`, Axis's own docs say the input's
+    quantization currently has to be handled *manually* by the calling
+    application code; baking it into the model removes that step entirely.
+
+    Reuses `model.preprocessing` (the same per-backbone mean/std function
+    already attached by `backbone_zoo`, e.g. `mobileone_preprocess_input`)
+    rather than taking new `mean`/`std` parameters - every
+    `*_preprocess_input` function in this repo is plain elementwise
+    arithmetic (`x/255.0`, `(x-mean)/std`), which already works unchanged
+    on a symbolic tensor exactly as well as on a numpy array, so no new
+    normalization logic is needed here; the numeric contract stays defined
+    in exactly one place (`BackboneSpec`), not duplicated at this call site.
+
+    **Stays outside `quantize_apply` entirely - the cast/normalize/
+    transpose are plain functional ops, never QAT-annotated**, the same
+    "small math stays un-annotated" precedent `_model_detection.py`'s own
+    `decode_boxes` already establishes.
+    Concretely: since this preprocessing never gets quantized in the first
+    place, the ARTPEC-8 DLPU's per-tensor-only quantization constraint
+    (Axis ACAP) doesn't apply to it at all - no need to fold the per-channel
+    mean/std into the backbone's first conv to work around it.
+
+    Needs no changes to, and does **not** re-run `quantize_apply` on, the
+    wrapped model - it's called as a single sub-model layer on the
+    preprocessed tensor, exactly like `fcos_lite_detection`/
+    `gfl_lite_detection` already call their own already-quantized base
+    model on a tensor built outside its own graph.
+
+    Input
+    ----------
+        model: an already-built `tf.keras.Model` with a `.preprocessing`
+               attribute (every builder in this repo sets one) and a
+               static `input_shape` - `(H, W, 3)` if `channels_first=False`
+               (every backbone in this repo today), or `(3, H, W)` if
+               `channels_first=True` (`model` itself must already be built
+               that way for this to be usable - this wrapper transposes
+               *into* that layout, it doesn't change what `model` itself
+               expects).
+        channels_first: if `True`, transposes the preprocessed float32
+                        tensor from `(B, H, W, 3)` to `(B, 3, H, W)` before
+                        calling `model` - for a future encoder built to
+                        expect that layout (`data_format='channels_first'`).
+                        No backbone in this repo needs this today (every
+                        one is channels-last) - a forward-looking
+                        capability, not a fix for an existing one. The
+                        wrapper's own outward-facing input is always
+                        `uint8 (H, W, 3)` regardless of this flag -
+                        matching this project's own stated contract
+                        ("images should be provided as WxHx3") even when
+                        the wrapped model itself needs a different layout
+                        internally.
+        name: prefix for the new input tensor and the returned model.
+
+    Output
+    ----------
+        A new `tf.keras.Model`, `uint8 (H, W, 3) -> model`'s original
+        outputs unchanged - its own `.preprocessing` is set to
+        `dummy_preprocessing`, since normalization is now baked into the
+        graph and a caller must **not** reapply it externally. If `model`
+        itself was built with a *static* batch dimension (e.g.
+        `fcos_lite_detection`'s own opt-in `Input(batch_shape=(N, H, W,
+        3))` path, `_model_detection.py`'s own `_nms_dispatch`), the
+        wrapped model's own outward input keeps that same static batch
+        size - **a real, confirmed bug fix, not new behavior**: this used
+        to always build a *dynamic*-batch outward `Input` regardless of
+        what `model` itself required, which TFLite's converter silently
+        defaults to `batch=1` for - producing a `.tflite` whose outward
+        interface claimed batch=1 while the model wrapped inside it
+        actually required a larger fixed batch, a shape mismatch only
+        surfacing at inference time (`ValueError: Cannot set tensor:
+        Dimension mismatch`), not at conversion time. Found while
+        verifying `fcos_lite_detection`'s own new static-batch NMS path.
+    '''
+    batch_size = model.input_shape[0]
+    if channels_first:
+        channels, height, width = model.input_shape[1:]
+    else:
+        height, width, channels = model.input_shape[1:]
+
+    if batch_size is not None:
+        uint8_input = Input(
+            batch_shape=(batch_size, height, width, channels), dtype='uint8', name=f'{name}_uint8_input')
+    else:
+        uint8_input = Input(shape=(height, width, channels), dtype='uint8', name=f'{name}_uint8_input')
+
+    x = tf.cast(uint8_input, tf.float32)
+    # Preprocessing (per-channel mean/std) broadcasts against the *last*
+    # axis, so it must run on the still-channels-last tensor - transposing
+    # first would apply the wrong axis's mean/std to each channel.
+    x = model.preprocessing(x)
+    if channels_first:
+        x = tf.transpose(x, [0, 3, 1, 2])
+
+    outputs = model(x)
+
+    wrapped = Model(uint8_input, outputs, name=name or f'{model.name}_uint8')
+    wrapped.preprocessing = dummy_preprocessing
+    return wrapped
+
+
+def energy_score(logits, temperature=1.0, class_axis=-1):
+    '''Energy Score (Liu, Wang, Owens, Li, "Energy-based Out-of-distribution
+    Detection", NeurIPS 2020, arXiv:2010.03759) -
+    `E(x) = -T * log(sum_i(exp(f_i(x) / T)))` over raw per-class logits
+    (not post-softmax/sigmoid probabilities, which normalize away the
+    absolute scale this formula needs). Low energy means the model is
+    confidently familiar with an input's statistics; high energy means it's
+    guessing - a training-free, zero-new-parameter OOD/low-confidence
+    signal computed directly from a model's own already-computed logits.
+
+    `tf.reduce_logsumexp` has no trainable state, so it needs no custom
+    `Layer`/`QuantizeConfig` - safe as a plain functional call, the same
+    class of op `_model_detection.py`'s `decode_boxes`/`gfl_integral_decode`
+    already use outside `quantize_apply`'s boundary.
+
+    Input
+    ----------
+        logits: raw (pre-activation) per-class logit tensor, any shape with
+                the class dimension at `class_axis` - a single `(B,
+                n_classes)` vector for a classifier, or a dense `(B, H, W,
+                n_classes)` map for a segmentation decoder's own per-pixel
+                logits.
+        temperature: `T` in the formula above (`1.0`, the paper's own
+                     common default).
+        class_axis: which axis holds the per-class logits (`-1`, matching
+                    every logit tensor this repo already produces).
+
+    Output
+    ----------
+        A tensor one rank lower than `logits` (the class axis reduced away)
+        - lower values indicate higher confidence/in-distribution.
+    '''
+    return -temperature * tf.reduce_logsumexp(logits / temperature, axis=class_axis)
+
+
+def add_energy_score_output(model, logit_output_indices=(0,), temperature=1.0, class_axis=-1, name=None):
+    '''Wraps an already-built model, appending one `energy_score` output
+    per index in `logit_output_indices` (each computed from that existing
+    output tensor, assumed to already be raw logits) to its output list -
+    zero new trainable weights, no change to any existing output.
+
+    Works **unmodified, today**, on: any segmentation decoder built by
+    this repo (`logit_output_indices=(0,)` - its one output already is the
+    raw per-pixel logit map, e.g. `lr_aspp`/`pp_liteseg`'s final `Conv2D`
+    has no fused activation); `fcos_lite_detection_base`/
+    `gfl_lite_detection_base`'s own outputs (e.g.
+    `logit_output_indices=(0, 3, 6)` for the 3 per-level classification-
+    logit tensors in their flat output list) - a dense, pre-NMS, per-level
+    energy signal. **Does not solve gathering an energy score onto
+    post-NMS survivors** (`tf.image.combined_non_max_suppression` returns
+    no selection indices to gather with) - this stays a pre-NMS,
+    base-model-level signal only, a deliberate scope boundary, not an
+    oversight. Does **not** work on `classifier()`'s default output (its
+    softmax is fused into one `Dense` layer call, so no logits tensor
+    exists anywhere in the graph) - pass `return_logits=True` to
+    `classifier()` first, then point `logit_output_indices` at its second
+    (`index 1`) output.
+
+    Input
+    ----------
+        model: an already-built `tf.keras.Model`.
+        logit_output_indices: indices into `model.outputs` treated as raw
+                              logit tensors, each energy-scored independently.
+        temperature, class_axis: passed through to `energy_score`.
+        name: prefix for the returned model.
+
+    Output
+    ----------
+        A new `tf.keras.Model`, `model`'s own input(s) -> `model`'s
+        original outputs, plus one `energy_score` tensor per entry in
+        `logit_output_indices`, appended in order. `.preprocessing` is
+        carried over unchanged from `model`.
+    '''
+    outputs = list(model.outputs)
+    energy_outputs = [
+        energy_score(outputs[i], temperature=temperature, class_axis=class_axis)
+        for i in logit_output_indices
+    ]
+
+    wrapped = Model(model.input, outputs + energy_outputs, name=name or f'{model.name}_energy')
+    wrapped.preprocessing = model.preprocessing
+    return wrapped

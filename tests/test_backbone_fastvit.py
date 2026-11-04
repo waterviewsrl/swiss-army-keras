@@ -86,6 +86,104 @@ def test_weights_imagenet_not_implemented():
         FastViT_T8(include_top=False, weights='imagenet', input_tensor=tf.keras.Input((64, 64, 3)))
 
 
+def test_weights_local_path_loads(tmp_path):
+    """`weights=<path>` (e.g. a checkpoint produced by
+    `scripts/port_fastvit_weights.py`, plan.md §12.2) should load real
+    weights into a freshly-built model - checked structurally (do saved and
+    reloaded weights match?), not numerically against PyTorch, since that
+    needs `torch`/`timm` + network access this test suite shouldn't depend
+    on (plan.md §12: one-time conversion-only tools, never a runtime
+    dependency).
+    """
+    inp = tf.keras.Input((64, 64, 3))
+    source_model = FastViT_T8(include_top=False, weights=None, input_tensor=inp)
+    weights_path = tmp_path / "fastvit_t8.weights.h5"
+    source_model.save_weights(str(weights_path))
+
+    inp2 = tf.keras.Input((64, 64, 3))
+    loaded_model = FastViT_T8(include_top=False, weights=str(weights_path), input_tensor=inp2)
+
+    for source_layer, loaded_layer in zip(source_model.layers, loaded_model.layers):
+        for source_w, loaded_w in zip(source_layer.get_weights(), loaded_layer.get_weights()):
+            np.testing.assert_array_equal(source_w, loaded_w)
+
+
+def test_rep_conv_block_kernel_size_one_has_no_1x1_branch():
+    """Regression test for a real architecture bug found while porting real
+    ImageNet weights (plan.md §12.2): the reference (`MobileOneBlock`) only
+    builds a second "1x1 scale" branch when `kernel_size > 1` - for
+    `kernel_size == 1` calls (the stem's 3rd conv, every downsample's
+    pointwise projection), this repo used to build one anyway, an extra,
+    nonexistent branch relative to the reference. Fixed by only building it
+    when `kernel_size > 1`.
+    """
+    inp = tf.keras.Input((64, 64, 3))
+    model = FastViT_T8(include_top=False, weights=None, input_tensor=inp)
+
+    # stem_3 is a kernel_size=1 rep_conv_block call (in==out, identity present).
+    layer_names = {layer.name for layer in model.layers}
+    assert "FastViT_T8_stem_3_kxk" in layer_names
+    assert "FastViT_T8_stem_3_identity_bn" in layer_names
+    assert "FastViT_T8_stem_3_1x1" not in layer_names
+    assert "FastViT_T8_stem_3_1x1_bn" not in layer_names
+
+    # every downsample's projection is likewise kernel_size=1.
+    assert "FastViT_T8_stage2_downsample_proj_kxk" in layer_names
+    assert "FastViT_T8_stage2_downsample_proj_1x1" not in layer_names
+
+
+def test_downsample_expands_channels_in_depthwise_step():
+    """Regression test for a real structural bug found while porting real
+    ImageNet weights (plan.md §12.2): the channel expansion at a stage
+    transition happens in the *first* (7x7/3x3-fused, grouped) step of the
+    reference's downsample module, not a channel-preserving depthwise
+    followed by a separate projecting pointwise (this repo had it
+    backwards). Checked here via the depthwise layers' actual
+    `depth_multiplier` (`out_channels // in_channels`, not 1) and the
+    projection conv's output channel count matching its *input* channel
+    count (channel-preserving, not projecting).
+    """
+    inp = tf.keras.Input((256, 256, 3))
+    model = FastViT_T8(include_top=False, weights=None, input_tensor=inp)
+
+    dw7 = model.get_layer("FastViT_T8_stage2_downsample_dw7")
+    assert dw7.depth_multiplier == 2  # stage1(48) -> stage2(96)
+
+    proj_kxk = model.get_layer("FastViT_T8_stage2_downsample_proj_kxk")
+    # channel-preserving: this conv's own kernel is (1,1,96,96), not (1,1,48,96).
+    assert proj_kxk.get_weights()[0].shape == (1, 1, 96, 96)
+
+
+def test_convffn_residual_targets_block_input_not_intermediate():
+    """Regression test for a real, significant bug found while porting real
+    ImageNet weights (plan.md §12.2): `fastvit_convffn`'s residual used to
+    add its FFN output back onto `mlp` (the intermediate depthwise-conv+BN
+    result), not `x` (the *whole block's* own input, before that conv) -
+    the reference (`RepMixerBlock`/`AttentionBlock`.forward:
+    `x = x + layer_scale(self.mlp(x))`, where `self.mlp` is the *entire*
+    conv->fc1->act->fc2 chain) confirms the residual belongs on the pre-conv
+    input. Discriminated here by zeroing the FFN branch's `fc2` weights (so
+    its contribution, after `LayerScale`, is exactly 0 regardless of
+    `LayerScale`'s own gamma) and checking the block's output then equals
+    its *input* exactly - which only holds if the residual targets `x`, not
+    the (transformed-by-a-real-conv-and-BN, hence numerically different)
+    `mlp` intermediate.
+    """
+    from swiss_army_keras._backbone_fastvit import fastvit_convffn
+
+    inp = tf.keras.Input((8, 8, 4))
+    out = fastvit_convffn(inp, mlp_ratio=2, name="t")
+    model = tf.keras.Model(inp, out)
+
+    fc2 = model.get_layer("t_fc2")
+    kernel, bias = fc2.get_weights()
+    fc2.set_weights([np.zeros_like(kernel), np.zeros_like(bias)])
+
+    x = np.random.rand(1, 8, 8, 4).astype("float32")
+    y = model.predict(x, verbose=0)
+    np.testing.assert_allclose(y, x, atol=1e-5)
+
+
 def test_requires_input_tensor_or_input_shape():
     with pytest.raises(ValueError):
         FastViT_T8(include_top=False, weights=None)

@@ -72,12 +72,27 @@ from swiss_army_keras.reparam_utils import (
 )
 
 
+# Plain tuples, not `tf.constant(...)` - see `_backbone_repvit.py`'s
+# identical constants for why a module-level eager tensor is a real bug
+# (forces TF's eager context to initialize at import time, breaking a
+# later `tf.config.experimental.set_memory_growth` call in user code).
+_FASTVIT_IMAGENET_MEAN = (0.485, 0.456, 0.406)
+_FASTVIT_IMAGENET_STD = (0.229, 0.224, 0.225)
+
+
 def fastvit_preprocess_input(x):
-    '''[-1, 1] rescaling (MobileNet-family convention) - a placeholder until
-    real pretrained weights are ported (plan.md §12/§12.1); see the
-    identical note on `repvit_preprocess_input` in `_backbone_repvit.py`.
+    '''Standard ImageNet normalization (`x/255` then per-channel
+    `(x-mean)/std`) - confirmed, via `timm.data.resolve_data_config`, as
+    what the real ported ImageNet weights
+    (`scripts/port_fastvit_weights.py`, plan.md §12.2) expect (the same
+    normalization RepViT's own real weights turned out to need - see
+    `repvit_preprocess_input`). Was a `[-1,1]`-rescaling placeholder before
+    those weights existed - harmless either way for `weights=None`
+    (random-init) usage, but now load-bearing for anyone using the real
+    weights.
     '''
-    return (x / 127.5) - 1.0
+    x = x / 255.0
+    return (x - _FASTVIT_IMAGENET_MEAN) / _FASTVIT_IMAGENET_STD
 
 
 @register_keras_serializable(package='swiss_army_keras')
@@ -112,7 +127,7 @@ class LayerScale(Layer):
         return config
 
 
-def rep_conv_block(x, out_channels, kernel_size=3, stride=1, groups=1, deploy=False, epsilon=1e-3, name=''):
+def rep_conv_block(x, out_channels, kernel_size=3, stride=1, groups=1, deploy=False, epsilon=1e-5, name=''):
     '''General MobileOne-style multi-branch reparameterizable conv: a
     `kernel_size`x`kernel_size` conv+BN branch, a 1x1 conv+BN branch (same
     `groups`/`stride`), and — only when `stride==1` and `in_channels ==
@@ -158,24 +173,57 @@ def rep_conv_block(x, out_channels, kernel_size=3, stride=1, groups=1, deploy=Fa
     kxk = make_conv(kernel_size, stride, False, f'{name}_kxk')(x)
     kxk = BatchNormalization(epsilon=epsilon, name=f'{name}_kxk_bn')(kxk)
 
-    onexone = make_conv(1, stride, False, f'{name}_1x1')(x)
-    onexone = BatchNormalization(epsilon=epsilon, name=f'{name}_1x1_bn')(onexone)
+    branches = [kxk]
+    # The reference (`MobileOneBlock`) only builds this second "1x1 scale"
+    # branch when `kernel_size > 1` (`if kernel_size > 1 and
+    # use_scale_branch`) - when `kernel_size == 1` it would be a second,
+    # independently-initialized copy of the *same* 1x1 conv as `kxk` above,
+    # not a genuinely different branch, and the reference never trains one.
+    # This was unconditional here before, silently adding an extra,
+    # nonexistent branch to every kernel_size=1 caller (the stem's 3rd conv,
+    # every `rep_downsample` projection) - found while porting real
+    # pretrained weights, which made the shapes/topology not match the
+    # reference at all for those calls (plan.md §12.2).
+    if kernel_size > 1:
+        onexone = make_conv(1, stride, False, f'{name}_1x1')(x)
+        onexone = BatchNormalization(epsilon=epsilon, name=f'{name}_1x1_bn')(onexone)
+        branches.append(onexone)
 
-    branches = [kxk, onexone]
     if use_identity:
         branches.append(BatchNormalization(epsilon=epsilon, name=f'{name}_identity_bn')(x))
 
     return Add(name=f'{name}_add')(branches) if len(branches) > 1 else branches[0]
 
 
-def rep_downsample(x, out_channels, deploy=False, epsilon=1e-3, name=''):
-    '''Inter-stage transition: a 2-branch (7x7 + 3x3, both depthwise,
-    stride-2) reparameterizable token mixer (channel-preserving), followed
-    by a `rep_conv_block(kernel_size=1, groups=1)` pointwise projection to
-    `out_channels` + GELU. Stage 1 has no downsample module (the stem
-    already reaches stage 1's resolution).
+def rep_downsample(x, out_channels, deploy=False, epsilon=1e-5, name=''):
+    '''Inter-stage transition: a 2-branch (7x7 + 3x3, both *grouped*
+    `groups=in_channels`, stride-2, expanding straight to `out_channels` -
+    NOT channel-preserving) reparameterizable token mixer, followed by a
+    channel-*preserving* `rep_conv_block(kernel_size=1, groups=1)` pointwise
+    block + GELU. Stage 1 has no downsample module (the stem already
+    reaches stage 1's resolution).
+
+    The channel expansion happening in the first (7x7/3x3) step, not the
+    second (pointwise) one, is confirmed against the reference
+    (`ReparamLargeKernelConv(in_chs, embed_dim, groups=in_chs, ...)` followed
+    by a channel-preserving `MobileOneBlock(embed_dim, embed_dim, 1, ...)`) -
+    this used to be the other way around here (channel-preserving depthwise
+    first, then a projecting pointwise second), a real structural bug found
+    while porting real pretrained weights (plan.md §12.2): `out_channels`
+    is always an exact multiple of `in_channels` in every real config (every
+    stage doubles channel count), so a `groups=in_channels`,
+    `out_channels=in_channels*depth_multiplier` grouped conv is exactly
+    Keras' `DepthwiseConv2D(depth_multiplier=out_channels//in_channels)` -
+    confirmed with an isolated numerical repro against the equivalent
+    PyTorch grouped conv (max abs diff ~5e-7, pure float32 noise) before
+    trusting this mapping, including the specific weight-transpose formula
+    needed (PyTorch's `(out_ch, 1, kH, kW)` must be *reshaped* to
+    `(in_ch, multiplier, kH, kW)` before transposing to Keras'
+    `(kH, kW, in_ch, multiplier)` - a plain transpose without that reshape
+    silently scrambles which output channels belong to which input channel).
     '''
     in_channels = x.shape[-1]
+    depth_multiplier = out_channels // in_channels
 
     # Explicit symmetric padding, not `padding='same'` - the 7x7 and 3x3
     # branches are summed (kernel-fused via `pad_kernel_to`, which assumes
@@ -184,13 +232,13 @@ def rep_downsample(x, out_channels, deploy=False, epsilon=1e-3, name=''):
     # (see the identical note on `rep_conv_block.make_conv` above).
     if deploy:
         mixed = ZeroPadding2D(3, name=f'{name}_dw_pad')(x)
-        mixed = DepthwiseConv2D(7, strides=2, padding='valid', use_bias=True, name=f'{name}_dw_fused')(mixed)
+        mixed = DepthwiseConv2D(7, strides=2, padding='valid', depth_multiplier=depth_multiplier, use_bias=True, name=f'{name}_dw_fused')(mixed)
     else:
         dw7 = ZeroPadding2D(3, name=f'{name}_dw7_pad')(x)
-        dw7 = DepthwiseConv2D(7, strides=2, padding='valid', use_bias=False, name=f'{name}_dw7')(dw7)
+        dw7 = DepthwiseConv2D(7, strides=2, padding='valid', depth_multiplier=depth_multiplier, use_bias=False, name=f'{name}_dw7')(dw7)
         dw7 = BatchNormalization(epsilon=epsilon, name=f'{name}_dw7_bn')(dw7)
         dw3 = ZeroPadding2D(1, name=f'{name}_dw3_pad')(x)
-        dw3 = DepthwiseConv2D(3, strides=2, padding='valid', use_bias=False, name=f'{name}_dw3')(dw3)
+        dw3 = DepthwiseConv2D(3, strides=2, padding='valid', depth_multiplier=depth_multiplier, use_bias=False, name=f'{name}_dw3')(dw3)
         dw3 = BatchNormalization(epsilon=epsilon, name=f'{name}_dw3_bn')(dw3)
         mixed = Add(name=f'{name}_dw_add')([dw7, dw3])
 
@@ -212,13 +260,13 @@ def rep_cpe(x, deploy=False, name=''):
     return Add(name=f'{name}_add')([dw, x])
 
 
-def fastvit_convffn(x, mlp_ratio, layer_scale_init=1e-5, epsilon=1e-3, name=''):
+def fastvit_convffn(x, mlp_ratio, layer_scale_init=1e-5, epsilon=1e-5, name=''):
     '''Shared FFN tail after every block type (RepMixer or attention): a
     plain depthwise 7x7 "positional" conv + BN (NOT multi-branch — ordinary
     conv-BN folding applies at deploy, no separate reparameterization),
     then a 2-layer 1x1-conv MLP (expand by `mlp_ratio`, GELU, contract),
-    layer-scaled, with its own residual (always present, at both train and
-    deploy time — never fused away).
+    layer-scaled, with its own residual around the *whole* thing (always
+    present, at both train and deploy time — never fused away).
     '''
     channels = x.shape[-1]
     mlp = DepthwiseConv2D(7, padding='same', use_bias=False, name=f'{name}_pos_dw')(x)
@@ -228,10 +276,19 @@ def fastvit_convffn(x, mlp_ratio, layer_scale_init=1e-5, epsilon=1e-3, name=''):
     y = GELU(name=f'{name}_act')(y)
     y = Conv2D(channels, 1, padding='same', name=f'{name}_fc2')(y)
     y = LayerScale(layer_scale_init, name=f'{name}_scale')(y)
-    return Add(name=f'{name}_residual')([y, mlp])
+    # Residual back to `x` (this function's own input, i.e. the *block's*
+    # input, before the positional depthwise conv) - not `mlp` (the
+    # depthwise-conv+BN intermediate). The reference (`RepMixerBlock`/
+    # `AttentionBlock`.forward: `x = x + layer_scale(self.mlp(x))`, where
+    # `self.mlp` is the *entire* conv->fc1->act->fc2 chain) confirms this -
+    # `mlp` was a real bug here, silently skipping the depthwise-conv+BN
+    # step itself from every residual in the whole network (RepMixer and
+    # attention blocks alike), found while porting real pretrained weights
+    # (plan.md §12.2).
+    return Add(name=f'{name}_residual')([y, x])
 
 
-def fastvit_repmixer_block(x, channels, mlp_ratio, layer_scale_init=1e-5, deploy=False, epsilon=1e-3, name=''):
+def fastvit_repmixer_block(x, channels, mlp_ratio, layer_scale_init=1e-5, deploy=False, epsilon=1e-5, name=''):
     '''One RepMixer block: reparameterizable token mixer + ConvFFN.
 
     Training-time token mixer (4 linear branches):
@@ -256,7 +313,7 @@ def fastvit_repmixer_block(x, channels, mlp_ratio, layer_scale_init=1e-5, deploy
     return fastvit_convffn(token_mixed, mlp_ratio, layer_scale_init, epsilon=epsilon, name=f'{name}_convffn')
 
 
-def fastvit_attention_block(x, num_heads, mlp_ratio, layer_scale_init=1e-5, epsilon=1e-3, name=''):
+def fastvit_attention_block(x, num_heads, mlp_ratio, layer_scale_init=1e-5, epsilon=1e-5, name=''):
     '''One attention block (stage 4 of SA12/SA24/SA36/MA36 only): BN ->
     global multi-head self-attention over the flattened spatial grid
     (head_dim=32 fixed, per the reference) -> layer-scale -> residual
@@ -274,7 +331,7 @@ def fastvit_attention_block(x, num_heads, mlp_ratio, layer_scale_init=1e-5, epsi
     return fastvit_convffn(mixed, mlp_ratio, layer_scale_init, epsilon=epsilon, name=f'{name}_convffn')
 
 
-def fastvit_stem(x, stem_width, deploy=False, epsilon=1e-3, name=''):
+def fastvit_stem(x, stem_width, deploy=False, epsilon=1e-5, name=''):
     '''3-conv patchify stem, all reparameterizable: regular 3x3 stride-2
     (3->stem_width) + GELU, depthwise 3x3 stride-2 + GELU, pointwise 1x1
     stride-1 + GELU. Total stride 4x, no exposed intermediate tap.
@@ -338,11 +395,17 @@ def _fastvit_network(input_tensor, stage_channels, stage_blocks, stage_types, ml
 
 def _build_fastvit(stage_channels, stage_blocks, stage_types, mlp_ratio, stem_width, layer_scale_init, model_name):
     def constructor(include_top=False, weights=None, input_tensor=None, input_shape=None, pooling=None, classes=1000, **kwargs):
-        if weights not in (None, 'none'):
+        if weights == 'imagenet':
             raise NotImplementedError(
-                "weights='{}' is not supported for {} yet - only weights=None (random "
-                "initialization) is implemented so far. Porting the keras_cv_attention_models "
-                "checkpoints is tracked separately (plan.md §12/§12.1).".format(weights, model_name)
+                "weights='imagenet' auto-download isn't available yet for {} - that needs "
+                "real, publicly-hosted weight files this package can fetch, which is a "
+                "separate, not-yet-done piece of work (plan.md §12). Real, verified "
+                "ImageNet-pretrained weights ARE available today, though: run "
+                "`scripts/port_fastvit_weights.py` (converts timm's pretrained checkpoint - "
+                "verified against the PyTorch reference, max abs output difference "
+                "<0.03 - plan.md §12.2) and pass the resulting `<model_name>.weights.h5` "
+                "file path directly as `weights=`, e.g. "
+                "weights='pretrained_weights/fastvit/{}.weights.h5'.".format(model_name, model_name)
             )
 
         if input_tensor is None:
@@ -356,6 +419,13 @@ def _build_fastvit(stage_channels, stage_blocks, stage_types, mlp_ratio, stem_wi
             num_classes=classes, name=model_name,
         )
         model = Model(inputs=input_tensor, outputs=output, name=model_name)
+
+        if weights not in (None, 'none'):
+            # Any other string is a local `.weights.h5` file path (e.g. from
+            # `scripts/port_fastvit_weights.py`) - built with
+            # `include_top=False`, so `skip_mismatch=True` lets it load
+            # cleanly into an `include_top=True` model too.
+            model.load_weights(weights, skip_mismatch=True)
         model._fastvit_config = dict(
             stage_channels=stage_channels, stage_blocks=stage_blocks, stage_types=stage_types,
             mlp_ratio=mlp_ratio, stem_width=stem_width, layer_scale_init=layer_scale_init, model_name=model_name,
@@ -420,19 +490,25 @@ def _fuse_rep_conv_block(model, prefix, deploy_layer_name_suffix='_fused'):
     '''Shared fusion logic for any `rep_conv_block` usage (stem, downsample
     projection, or - via `_fuse_repmixer_token_mixer` - inside a RepMixer
     token mixer): fuse the KxK+BN branch, the 1x1+BN branch (padded to
-    KxK), and, if present, the identity+BN branch, and sum them.
+    KxK, only present when the block's own kernel_size > 1 - see the note
+    on `rep_conv_block` itself), and, if present, the identity+BN branch,
+    and sum them.
     '''
     kxk_layer = model.get_layer(f'{prefix}_kxk')
     kxk_bn = model.get_layer(f'{prefix}_kxk_bn')
-    onexone_layer = model.get_layer(f'{prefix}_1x1')
-    onexone_bn = model.get_layer(f'{prefix}_1x1_bn')
 
     k_kxk, b_kxk = fuse_conv_bn_layers(kxk_layer, kxk_bn)
-    k_1x1, b_1x1 = fuse_conv_bn_layers(onexone_layer, onexone_bn)
     kernel_size = k_kxk.shape[0]
-    k_1x1_padded = pad_kernel_to(k_1x1, kernel_size) if kernel_size != k_1x1.shape[0] else k_1x1
 
-    branches = [(k_kxk, b_kxk), (k_1x1_padded, b_1x1)]
+    branches = [(k_kxk, b_kxk)]
+
+    onexone_name = f'{prefix}_1x1'
+    if any(l.name == onexone_name for l in model.layers):
+        onexone_layer = model.get_layer(onexone_name)
+        onexone_bn = model.get_layer(f'{prefix}_1x1_bn')
+        k_1x1, b_1x1 = fuse_conv_bn_layers(onexone_layer, onexone_bn)
+        k_1x1_padded = pad_kernel_to(k_1x1, kernel_size) if kernel_size != k_1x1.shape[0] else k_1x1
+        branches.append((k_1x1_padded, b_1x1))
 
     identity_bn_name = f'{prefix}_identity_bn'
     if any(l.name == identity_bn_name for l in model.layers):

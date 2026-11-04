@@ -50,6 +50,7 @@ from tensorflow.keras.layers import (
     GlobalMaxPooling2D,
     Input,
     Multiply,
+    ZeroPadding2D,
 )
 from tensorflow.keras.models import Model
 
@@ -57,14 +58,33 @@ from swiss_army_keras.activations import GELU
 from swiss_army_keras.reparam_utils import fuse_conv_bn, fuse_conv_bn_layers, identity_kernel, sum_branches
 
 
+# Plain tuples, not `tf.constant(...)`: a module-level eager tensor forces
+# TF's eager context to initialize at import time (any op, even building a
+# constant, calls `ctx.ensure_initialized()`) - which then makes a later
+# `tf.config.experimental.set_memory_growth(gpu, True)` call in user code
+# raise `RuntimeError: Physical devices cannot be modified after being
+# initialized`, since device config must happen before the context exists.
+# A plain tuple broadcasts into a tensor lazily, inside `x - MEAN`/`/ STD`
+# below, at call time - not at import time.
+_REPVIT_IMAGENET_MEAN = (0.485, 0.456, 0.406)
+_REPVIT_IMAGENET_STD = (0.229, 0.224, 0.225)
+
+
 def repvit_preprocess_input(x):
-    '''[-1, 1] rescaling (MobileNet-family convention) - a placeholder until
-    real pretrained weights are ported (plan.md §12/§12.1), at which point
-    this must match whatever normalization the source checkpoint actually
-    used. Harmless for `weights=None` (random-init) usage, since there is no
-    fixed normalization to match yet.
+    '''Standard ImageNet normalization (`x/255` then per-channel
+    `(x-mean)/std`, `mean=(0.485,0.456,0.406)`, `std=(0.229,0.224,0.225)`) -
+    confirmed as the actual normalization the real ported ImageNet weights
+    (`scripts/port_repvit_weights.py`, plan.md §12.1) expect, via
+    `timm.data.resolve_data_config`. Was a `[-1,1]`-rescaling placeholder
+    before those weights existed (see the identical, still-current note on
+    `mobileone_preprocess_input`/`fastvit_preprocess_input`, whose own
+    pretrained weights aren't ported yet) - harmless either way for
+    `weights=None` (random-init) usage, since there is no fixed
+    normalization to match in that case, but now load-bearing for anyone
+    using the real weights.
     '''
-    return (x / 127.5) - 1.0
+    x = x / 255.0
+    return (x - _REPVIT_IMAGENET_MEAN) / _REPVIT_IMAGENET_STD
 
 
 def _make_divisible(value, divisor=8, min_value=None):
@@ -90,7 +110,7 @@ def _squeeze_excite(x, channels, se_ratio=0.25, name=''):
     return Multiply(name=f'{name}_scale')([x, s])
 
 
-def repvit_block(x, channels, se_ratio=0.0, epsilon=1e-3, deploy=False, name=''):
+def repvit_block(x, channels, se_ratio=0.0, epsilon=1e-5, deploy=False, name=''):
     '''One RepViT block: RepVGGDW token mixer -> optional squeeze-excite ->
     FFN channel mixer (its own, separate residual). stride=1, cin=cout=
     channels throughout - stage transitions go through `repvit_downsample`
@@ -126,7 +146,7 @@ def repvit_block(x, channels, se_ratio=0.0, epsilon=1e-3, deploy=False, name='')
     return Add(name=f'{name}_ffn_add')([y, token_mixed])
 
 
-def repvit_downsample(x, channels_out, epsilon=1e-3, name=''):
+def repvit_downsample(x, channels_out, epsilon=1e-5, name=''):
     '''Stage-transition module: stride-2 depthwise + pointwise channel
     projection (no residual - spatial size and channel count both change),
     then one FFN block *with* a residual (valid once channels==channels_out
@@ -134,7 +154,15 @@ def repvit_downsample(x, channels_out, epsilon=1e-3, name=''):
     (the stem already brings the input to stage 1's resolution/4x). Has no
     multi-branch structure, so `reparameterize_repvit` leaves it untouched.
     '''
-    d = DepthwiseConv2D(3, strides=2, padding='same', use_bias=False, name=f'{name}_dw3x3')(x)
+    # `padding='same'` + `strides=2` on an even feature-map size does NOT
+    # match PyTorch's `padding=(kernel_size-1)//2` (symmetric) - Keras'
+    # SAME rule pads *asymmetrically* here (0 top/left, 1 bottom/right for a
+    # 3x3/stride-2 conv), a genuine, large numerical divergence confirmed by
+    # a minimal isolated repro against the reference PyTorch conv (plan.md
+    # §12.1) - explicit symmetric `ZeroPadding2D` + `padding='valid'`
+    # matches PyTorch exactly (verified: max abs diff 0.0 on the same repro).
+    d = ZeroPadding2D(1, name=f'{name}_dw3x3_pad')(x)
+    d = DepthwiseConv2D(3, strides=2, padding='valid', use_bias=False, name=f'{name}_dw3x3')(d)
     d = BatchNormalization(epsilon=epsilon, name=f'{name}_dw3x3_bn')(d)
     d = Conv2D(channels_out, 1, padding='same', use_bias=False, name=f'{name}_pw')(d)
     d = BatchNormalization(epsilon=epsilon, name=f'{name}_pw_bn')(d)
@@ -148,15 +176,20 @@ def repvit_downsample(x, channels_out, epsilon=1e-3, name=''):
     return Add(name=f'{name}_ffn_add')([y, d])
 
 
-def repvit_stem(x, stem_width, epsilon=1e-3, name=''):
+def repvit_stem(x, stem_width, epsilon=1e-5, name=''):
     '''Patchify stem: two stacked stride-2 3x3 convs -> 4x downsampling
     total, matching the reference implementation exactly (no exposed
     intermediate 2x tap - see module docstring).
+
+    Explicit `ZeroPadding2D` + `padding='valid'`, not `padding='same'` - see
+    the identical note in `repvit_downsample` for why (plan.md §12.1).
     '''
-    x = Conv2D(stem_width // 2, 3, strides=2, padding='same', use_bias=False, name=f'{name}_conv1')(x)
+    x = ZeroPadding2D(1, name=f'{name}_conv1_pad')(x)
+    x = Conv2D(stem_width // 2, 3, strides=2, padding='valid', use_bias=False, name=f'{name}_conv1')(x)
     x = BatchNormalization(epsilon=epsilon, name=f'{name}_conv1_bn')(x)
     x = GELU(name=f'{name}_conv1_act')(x)
-    x = Conv2D(stem_width, 3, strides=2, padding='same', use_bias=False, name=f'{name}_conv2')(x)
+    x = ZeroPadding2D(1, name=f'{name}_conv2_pad')(x)
+    x = Conv2D(stem_width, 3, strides=2, padding='valid', use_bias=False, name=f'{name}_conv2')(x)
     x = BatchNormalization(epsilon=epsilon, name=f'{name}_conv2_bn')(x)
     return x
 
@@ -195,7 +228,7 @@ def _repvit_network(input_tensor, stage_channels, stage_blocks, stem_width,
 
     if include_top:
         x = GlobalAveragePooling2D(name=f'{name}_head_gap')(stage_outputs[-1])
-        x = BatchNormalization(epsilon=1e-3, name=f'{name}_head_bn')(x)
+        x = BatchNormalization(epsilon=1e-5, name=f'{name}_head_bn')(x)
         x = Dropout(0.0, name=f'{name}_head_dropout')(x)
         x = Dense(num_classes, activation='softmax', name=f'{name}_head_dense')(x)
         return x
@@ -210,11 +243,17 @@ def _repvit_network(input_tensor, stage_channels, stage_blocks, stem_width,
 
 def _build_repvit(stage_channels, stage_blocks, stem_width, model_name):
     def constructor(include_top=False, weights=None, input_tensor=None, input_shape=None, pooling=None, classes=1000, **kwargs):
-        if weights not in (None, 'none'):
+        if weights == 'imagenet':
             raise NotImplementedError(
-                "weights='{}' is not supported for {} yet - only weights=None (random "
-                "initialization) is implemented so far. Porting the keras_cv_attention_models "
-                "checkpoints is tracked separately (plan.md §12/§12.1).".format(weights, model_name)
+                "weights='imagenet' auto-download isn't available yet for {} - that needs "
+                "real, publicly-hosted weight files this package can fetch, which is a "
+                "separate, not-yet-done piece of work (plan.md §12). Real, verified "
+                "ImageNet-pretrained weights ARE available today, though: run "
+                "`scripts/port_repvit_weights.py` (converts timm's pretrained checkpoint - "
+                "verified against the PyTorch reference, max abs output difference "
+                "<0.07 - plan.md §12.1) and pass the resulting `<model_name>.weights.h5` "
+                "file path directly as `weights=`, e.g. "
+                "weights='pretrained_weights/repvit/{}.weights.h5'.".format(model_name, model_name)
             )
 
         if input_tensor is None:
@@ -227,6 +266,14 @@ def _build_repvit(stage_channels, stage_blocks, stem_width, model_name):
             include_top=include_top, pooling=pooling, num_classes=classes, name=model_name,
         )
         model = Model(inputs=input_tensor, outputs=output, name=model_name)
+
+        if weights not in (None, 'none'):
+            # Any other string is treated as a local `.weights.h5` file path
+            # (e.g. produced by `scripts/port_repvit_weights.py`) - built
+            # with `include_top=False`, so `skip_mismatch=True` lets it load
+            # cleanly into an `include_top=True` model too (the extra head
+            # layers just keep their random init) without erroring.
+            model.load_weights(weights, skip_mismatch=True)
         # Stashed for `reparameterize_repvit`, which needs to rebuild the
         # same network in deploy mode - avoids making the caller pass the
         # config a second time.

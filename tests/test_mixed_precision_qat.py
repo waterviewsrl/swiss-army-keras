@@ -32,6 +32,7 @@ from swiss_army_keras.models import (
     ddrnet,
     distiller_classifier,
     fcos_lite_detection,
+    gfl_lite_detection,
 )
 
 INPUT_SIZE = 128
@@ -112,15 +113,45 @@ def test_distiller_classifier_with_repvit_backbone_under_mixed_precision():
 
 
 def test_fcos_lite_detection_builds_and_predicts_under_mixed_precision():
-    """Regression test: the regression branch's `ScaleLayer` (a plain,
-    non-QAT-annotated layer sitting between the QAT-annotated `reg_head_conv`
-    and `tf.image.combined_non_max_suppression`) used to silently pick up
-    the ambient float16 policy and cast the box predictions back down,
-    crashing NMS (`TypeError: ... has type float16 that does not match
-    expected type of float32`) - fixed by forcing it to float32 explicitly.
+    """Regression test, now covering two separate historical bugs in the
+    same spot:
+    (1) the regression branch's per-level scale (formerly a plain,
+    non-QAT-annotated `ScaleLayer` sitting between the QAT-annotated
+    `reg_head_conv` and NMS) used to silently pick up the ambient float16
+    policy and cast the box predictions back down, crashing NMS
+    (`TypeError: ... has type float16 that does not match expected type
+    of float32`). Now implemented as `_qat_channelwise_scale` (a
+    QAT-annotated `DepthwiseConv2D(1)`, replacing `ScaleLayer` for an
+    unrelated `tfmot`/`quantize_apply` incompatibility - see that
+    function's own docstring), which stays float32 via
+    `qat_annotate_layer`'s own patch with no separate override needed.
+    (2) `_nms_dispatch`'s own default (dynamic-batch) path uses
+    `_AssertBatchSizeOne` (a plain custom `Layer`, replacing
+    `tf.image.combined_non_max_suppression` - see `_nms_dispatch`'s own
+    docstring for why) - found, via this exact test, to have the *same
+    class* of bug `ScaleLayer` originally had: no explicit `dtype`, so it
+    silently cast its output to float16 under this policy. Fixed by
+    forcing `dtype='float32'` on `_AssertBatchSizeOne` itself (not just at
+    one call site), so `fcos_lite_instance_segmentation`'s own use of the
+    same layer is covered too.
     """
     inp = tf.keras.Input((INPUT_SIZE, INPUT_SIZE, 3))
     model = fcos_lite_detection(
+        inp, n_classes=N_LABELS, backbone="MobileOne-S1", weights=None,
+    )
+    nms_boxes, nms_scores, nms_classes, valid_detections = model.predict(
+        _random_batch(batch_size=1), verbose=0
+    )
+    _assert_finite_float32([nms_boxes, nms_scores, valid_detections.astype("float32")])
+
+
+def test_gfl_lite_detection_builds_and_predicts_under_mixed_precision():
+    """Same regression test as `fcos_lite_detection`'s own - `gfl_lite_
+    detection` shares the same `_nms_dispatch`/`_AssertBatchSizeOne` path,
+    previously untested under mixed precision at all.
+    """
+    inp = tf.keras.Input((INPUT_SIZE, INPUT_SIZE, 3))
+    model = gfl_lite_detection(
         inp, n_classes=N_LABELS, backbone="MobileOne-S1", weights=None,
     )
     nms_boxes, nms_scores, nms_classes, valid_detections = model.predict(

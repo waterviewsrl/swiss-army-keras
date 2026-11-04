@@ -2,9 +2,9 @@
 
 # author's testing scripts
 *TEST*
-pyproject.toml
-setup.cfg
-setup.py
+# pyproject.toml  (un-ignored: packaging metadata belongs in git)
+# setup.cfg
+# setup.py
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -136,3 +136,22 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# Converted pretrained-weight checkpoints (plan.md §12/§12.1/§12.2) -
+# large (20-90MB each), reproducible by re-running the relevant
+# scripts/port_*_weights.py, and not meant to live in git history; a real
+# distribution story for these is separate, not-yet-done work.
+/pretrained_weights/
+
+# Training/export artifacts written by TrainingDriver/Quantizer into the cwd
+# (repo root or docs/source/notebooks/ when run from a notebook) - never
+# meant for git.
+*.h5
+*.tflite
+*.weights.index
+*.weights.data-*
+checkpoint
+tblogs/
+/docs/source/notebooks/oxford_iiit/
+/docs/source/notebooks/flower_photos/
+*.pdf

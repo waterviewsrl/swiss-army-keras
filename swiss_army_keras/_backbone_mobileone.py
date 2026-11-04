@@ -26,11 +26,11 @@ stride-2 conv (2x), so a genuine 5-tap 2x/4x/8x/16x/32x pyramid exists —
 `tf.keras.applications`-style backbones' interface exactly, no `depth_max`
 clamping needed.
 
-Weights: no `weights='imagenet'` support in this pass — porting the
-official PyTorch checkpoints (or `timm`'s copies) is separate follow-up
-work (plan.md §12/§12.1: this is the family with no Keras reference at all,
-so both the architecture *and* the weight conversion have no shortcut).
-`weights=None` (random init) is fully supported.
+Weights: real ImageNet-pretrained weights for all 5 variants are ported
+from timm's checkpoints via `scripts/port_mobileone_weights.py` (plan.md
+§12.4) - pass the resulting `.weights.h5` file path as `weights=`.
+`weights='imagenet'` (auto-download) is not implemented yet; `weights=None`
+(random init) is fully supported.
 '''
 
 from __future__ import absolute_import
@@ -130,7 +130,7 @@ def _squeeze_excite(x, channels, rd_ratio=SE_REDUCTION_RATIO, name=''):
 
 
 def mobileone_block(x, out_channels, kernel_size, stride, depthwise, num_conv_branches=1,
-                    use_se=False, deploy=False, epsilon=1e-3, name=''):
+                    use_se=False, deploy=False, epsilon=1e-5, name=''):
     '''One `MobileOneBlock`: `num_conv_branches` parallel KxK conv+BN
     branches (all identical shape, independently trained - the paper's
     over-parameterization trick), + one 1x1 conv+BN "scale" branch (only
@@ -237,11 +237,16 @@ def _mobileone_network(input_tensor, width_multipliers, num_conv_branches, use_s
 
 def _build_mobileone(width_multipliers, num_conv_branches, use_se, model_name):
     def constructor(include_top=False, weights=None, input_tensor=None, input_shape=None, pooling=None, classes=1000, **kwargs):
-        if weights not in (None, 'none'):
+        if weights == 'imagenet':
             raise NotImplementedError(
-                "weights='{}' is not supported for {} yet - only weights=None (random "
-                "initialization) is implemented so far. Porting the official PyTorch/timm "
-                "checkpoints is tracked separately (plan.md §12/§12.1).".format(weights, model_name)
+                "weights='imagenet' auto-download isn't available yet for {} - that needs "
+                "real, publicly-hosted weight files this package can fetch, which is a "
+                "separate, not-yet-done piece of work (plan.md §12). Real, verified "
+                "ImageNet-pretrained weights ARE available today, though: run "
+                "`scripts/port_mobileone_weights.py` (converts timm's pretrained checkpoint - "
+                "verified against the PyTorch reference, plan.md §12.4) and pass the resulting "
+                "`<model_name>.weights.h5` file path directly as `weights=`, e.g. "
+                "weights='pretrained_weights/mobileone/{}.weights.h5'.".format(model_name, model_name)
             )
 
         if input_tensor is None:
@@ -254,6 +259,13 @@ def _build_mobileone(width_multipliers, num_conv_branches, use_se, model_name):
             include_top=include_top, pooling=pooling, num_classes=classes, name=model_name,
         )
         model = Model(inputs=input_tensor, outputs=output, name=model_name)
+
+        if weights not in (None, 'none'):
+            # Any other string is a local `.weights.h5` file path (e.g. from
+            # `scripts/port_mobileone_weights.py`) - built with
+            # `include_top=False`, so `skip_mismatch=True` lets it load
+            # cleanly into an `include_top=True` model too.
+            model.load_weights(weights, skip_mismatch=True)
         model._mobileone_config = dict(
             width_multipliers=width_multipliers, num_conv_branches=num_conv_branches,
             use_se=use_se, model_name=model_name,
@@ -281,12 +293,23 @@ MobileOne_S3 = _build_mobileone(**MOBILEONE_CONFIGS['MobileOne-S3'])
 MobileOne_S4 = _build_mobileone(**MOBILEONE_CONFIGS['MobileOne-S4'])
 
 
+# Plain tuples, not `tf.constant(...)` - see `_backbone_repvit.py`'s
+# identical constants for why a module-level eager tensor is a real bug
+# (forces TF's eager context to initialize at import time, breaking a
+# later `tf.config.experimental.set_memory_growth` call in user code).
+_MOBILEONE_IMAGENET_MEAN = (0.485, 0.456, 0.406)
+_MOBILEONE_IMAGENET_STD = (0.229, 0.224, 0.225)
+
+
 def mobileone_preprocess_input(x):
-    '''[-1, 1] rescaling (MobileNet-family convention) - a placeholder until
-    real pretrained weights are ported (plan.md §12/§12.1); see the
-    identical note on `repvit_preprocess_input`/`fastvit_preprocess_input`.
+    '''Real ImageNet normalization (`[0, 1]` scaling, then per-channel
+    mean/std) that `scripts/port_mobileone_weights.py`'s ported weights
+    expect - confirmed via `timm.data.resolve_data_config` for
+    `mobileone_s0` (plan.md §12.4), identical to RepViT's/FastViT's own
+    (`repvit_preprocess_input`/`fastvit_preprocess_input`).
     '''
-    return (x / 127.5) - 1.0
+    x = x / 255.0
+    return (x - _MOBILEONE_IMAGENET_MEAN) / _MOBILEONE_IMAGENET_STD
 
 
 def _fuse_mobileone_block(model, prefix, num_conv_branches, has_scale, has_identity, is_depthwise):

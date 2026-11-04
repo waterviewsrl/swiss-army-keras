@@ -20,5 +20,9 @@ from swiss_army_keras._model_deeplab_v3_plus import deeplab_v3_plus
 from swiss_army_keras._model_lr_aspp import lr_aspp
 from swiss_army_keras._model_pp_liteseg import pp_liteseg
 from swiss_army_keras._model_ddrnet import ddrnet
-from swiss_army_keras._model_detection import fcos_lite_detection_base
-from swiss_army_keras._model_classifier import classifier, wise_srnet_classifier, distiller_classifier, multilabel_classifier, ordinal_classifier
+from swiss_army_keras._model_pidnet import pidnet
+from swiss_army_keras._model_pp_mobileseg import pp_mobileseg
+from swiss_army_keras._model_detection import fcos_lite_detection_base, gfl_lite_detection_base
+from swiss_army_keras._model_detection import fcos_lite_instance_segmentation_base
+from swiss_army_keras._model_depth import lr_aspp_depth, fastdepth_head
+from swiss_army_keras._model_classifier import classifier, wise_srnet_classifier, distiller_classifier, multilabel_classifier, ordinal_classifier, pose_regression_head, reid_embedding_head

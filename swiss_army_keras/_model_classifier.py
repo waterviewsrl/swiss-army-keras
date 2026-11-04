@@ -5,12 +5,12 @@ import tensorflow as tf
 from tensorflow.keras.regularizers import l2
 
 from swiss_army_keras._backbone_zoo import backbone_zoo, bach_norm_checker
-from swiss_army_keras.layer_utils import GeMPooling2D, apply_pre_pool_attention, qat_annotate_layer
+from swiss_army_keras.layer_utils import GeMPooling2D, apply_pre_pool_attention, iqa_regression_head, qat_annotate_layer
 
 import tensorflow_model_optimization as tfmot
 
 
-def classifier(input_tensor, n_classes, backbone='MobileNetV3Large', weights='imagenet', freeze_backbone=True, freeze_batch_norm=True, name='classifier', deep_layer=5, pooling='avg', pre_pool_attention=None, size=1024, activation="swish", kernel_regularizer=l2(0.001), bias_regularizer=l2(0.001), dropout=0.3):
+def classifier(input_tensor, n_classes, backbone='MobileNetV3Large', weights='imagenet', freeze_backbone=True, freeze_batch_norm=True, name='classifier', deep_layer=5, pooling='avg', pre_pool_attention=None, size=1024, activation="swish", kernel_regularizer=l2(0.001), bias_regularizer=l2(0.001), dropout=0.3, return_logits=False, iqa_head=False):
     '''
     ---------- (`pre_pool_attention`, plan.md §9.1) ----------
     pre_pool_attention: `None` (default, existing behavior unchanged),
@@ -20,6 +20,30 @@ def classifier(input_tensor, n_classes, backbone='MobileNetV3Large', weights='im
         itself with learnable Generalized-Mean pooling, ignoring
         `pooling`) — see `swiss_army_keras.layer_utils.GeMPooling2D`/
         `ECABlock`/`CoordAttLite` for what each one actually does.
+
+    ---------- (`return_logits`, plan.md §13.2) ----------
+    return_logits: `False` (default) — unchanged behavior, a single
+        softmax-probabilities output, exactly as before. `True` — splits
+        the final `Dense`+softmax into two separate layer calls (same
+        restructuring `ordinal_classifier` already does, zero new
+        trainable weights) and returns `[probabilities, logits]` instead
+        of just `probabilities`, so raw logits become available for
+        `swiss_army_keras.layer_utils.add_energy_score_output` (softmax
+        alone can't recover them — it normalizes away the scale the Energy
+        Score formula needs).
+
+    ---------- (`iqa_head`, plan.md §13.7) ----------
+    iqa_head: `False` (default) — unchanged behavior. `True` — adds a
+        small `swiss_army_keras.layer_utils.iqa_regression_head` side
+        branch tapped off this same backbone (`base_model`, before this
+        function's own pooling/Dense tail), trained simultaneously with
+        the main classification task (e.g. via
+        `swiss_army_keras.iqa_utils.add_teacher_iqa_labels` supplying a
+        teacher-distilled quality pseudo-label) — the exported model
+        carries both heads off one shared encoder. Appends its `[0, 1]`
+        score as the *last* output — `[probabilities, iqa_score]`, or
+        `[probabilities, logits, iqa_score]` if `return_logits=True` is
+        also set (the two flags compose).
     '''
 
     backbone_ = backbone_zoo(
@@ -45,10 +69,22 @@ def classifier(input_tensor, n_classes, backbone='MobileNetV3Large', weights='im
 
     drop_out_class = qat_annotate_layer(
         tf.keras.layers.Dropout(dropout))(pre_classifier)
-    classifier = qat_annotate_layer(tf.keras.layers.Dense(
-        n_classes, activation='softmax', kernel_regularizer=kernel_regularizer, bias_regularizer=bias_regularizer))(drop_out_class)
 
-    res = tf.keras.models.Model(inputs=input_tensor, outputs=classifier)
+    if return_logits:
+        logits = qat_annotate_layer(tf.keras.layers.Dense(
+            n_classes, activation=None, kernel_regularizer=kernel_regularizer, bias_regularizer=bias_regularizer))(drop_out_class)
+        classifier = qat_annotate_layer(tf.keras.layers.Activation('softmax'))(logits)
+        outputs = [classifier, logits]
+    else:
+        classifier = qat_annotate_layer(tf.keras.layers.Dense(
+            n_classes, activation='softmax', kernel_regularizer=kernel_regularizer, bias_regularizer=bias_regularizer))(drop_out_class)
+        outputs = classifier
+
+    if iqa_head:
+        iqa_score = iqa_regression_head(base_model, name='{}_iqa'.format(name))
+        outputs = (outputs if isinstance(outputs, list) else [outputs]) + [iqa_score]
+
+    res = tf.keras.models.Model(inputs=input_tensor, outputs=outputs)
 
     with tfmot.quantization.keras.quantize_scope():
         res = tfmot.quantization.keras.quantize_apply(res)
@@ -546,6 +582,185 @@ def ordinal_classifier(input_tensor, n_classes, backbone='MobileNetV3Large', wei
         tf.keras.layers.Activation('sigmoid', name='{}_sigmoid'.format(name)))(ordinal_logits)
 
     res = tf.keras.models.Model(inputs=input_tensor, outputs=classifier_out)
+
+    with tfmot.quantization.keras.quantize_scope():
+        res = tfmot.quantization.keras.quantize_apply(res)
+
+    res.preprocessing = backbone_.preprocessing
+
+    return res
+
+
+def pose_regression_head(input_tensor, n_keypoints, backbone='MobileNetV3Large', weights='imagenet', freeze_backbone=True, freeze_batch_norm=True, name='pose_regression', deep_layer=5, pooling='avg', pre_pool_attention=None, size=1024, activation="swish", kernel_regularizer=l2(0.001), bias_regularizer=l2(0.001), dropout=0.3):
+    '''Lightweight single-person keypoint-regression head (plan.md §13.3) —
+    a direct, heatmap-free alternative to MoveNet-style pose estimation,
+    architecturally identical to `classifier()`'s own trunk with the final
+    softmax classification swapped for a linear-then-sigmoid keypoint
+    regression (BlazePose's own inference-time shape, Bazarevsky et al.
+    2020, arXiv:2006.10204, once its training-only heatmap branch is
+    dropped) — no upsampling, no argmax, no gather, per-tensor
+    int8-quantization-friendly with no caveats.
+
+    **Single-person only, by design** (plan.md §13.3's own explicit scoping
+    decision, not an oversight) — no person-center heatmap, no
+    multi-instance grouping. Intended for a top-down pipeline: crop a
+    person box from this repo's own `fcos_lite_head`/`gfl_lite_head`
+    detection output, resize the crop to this head's own input size, run
+    this model on it. Multi-person/heatmap-based pose (MoveNet's own
+    architecture) is a separately-scoped, much larger addition, not
+    attempted here.
+
+    Input
+    ----------
+        input_tensor, n_keypoints: the input tensor, and how many keypoints
+                                   to regress per person.
+        backbone, weights, freeze_backbone, freeze_batch_norm, deep_layer,
+        pooling, pre_pool_attention, size, activation, kernel_regularizer,
+        bias_regularizer, dropout: identical meaning to `classifier()`'s
+            own arguments — same trunk (backbone tap → optional
+            `pre_pool_attention` gate → pooling → `Dense(size)` →
+            `Dropout`).
+
+    Output
+    ----------
+        A `tf.keras.Model` with a `.preprocessing` attribute, producing
+        `(batch, n_keypoints, 3)` — `(x, y, visibility)` per keypoint, all
+        three **sigmoid-bounded to `[0, 1]`**: `(x, y)` are fraction-of-
+        input-size coordinates, not pixel coordinates (multiply by this
+        model's own input width/height to get pixels — the same
+        normalized-coordinate convention BlazePose itself uses);
+        `visibility` is a soft confidence/occlusion score, not a hard flag.
+        Train with a regression loss (e.g. smooth-L1/MSE) against
+        `(x, y, visibility)` targets in the same `[0, 1]` convention.
+    '''
+
+    backbone_ = backbone_zoo(
+        backbone, weights, input_tensor, deep_layer, freeze_backbone, freeze_batch_norm)
+
+    base_model = backbone_([input_tensor, ])[deep_layer-1]
+    base_model = apply_pre_pool_attention(base_model, pre_pool_attention, name='{}_attn'.format(name))
+
+    if pre_pool_attention == 'gem':
+        pool = GeMPooling2D(name='{}_gem'.format(name))(base_model)
+    else:
+        pool = qat_annotate_layer(tf.keras.layers.GlobalAveragePooling2D())(
+            base_model) if pooling == 'avg' else qat_annotate_layer(tf.keras.layers.GlobalMaxPool2D())(base_model)
+
+    pre_head = qat_annotate_layer(tf.keras.layers.Dense(
+        size,
+        activation=activation,
+        kernel_regularizer=kernel_regularizer,
+        bias_regularizer=bias_regularizer,
+    ))(pool)
+
+    drop_out = qat_annotate_layer(
+        tf.keras.layers.Dropout(dropout))(pre_head)
+
+    raw = qat_annotate_layer(tf.keras.layers.Dense(
+        n_keypoints * 3, activation='sigmoid',
+        kernel_regularizer=kernel_regularizer, bias_regularizer=bias_regularizer,
+        name='{}_keypoints'.format(name),
+    ))(drop_out)
+    keypoints = tf.keras.layers.Reshape((n_keypoints, 3), name='{}_reshape'.format(name))(raw)
+
+    res = tf.keras.models.Model(inputs=input_tensor, outputs=keypoints)
+
+    with tfmot.quantization.keras.quantize_scope():
+        res = tfmot.quantization.keras.quantize_apply(res)
+
+    res.preprocessing = backbone_.preprocessing
+
+    return res
+
+
+def reid_embedding_head(input_tensor, embedding_size=128, backbone='MobileNetV3Large', weights='imagenet', freeze_backbone=True, freeze_batch_norm=True, name='reid_embedding', deep_layer=5, pooling='avg', pre_pool_attention='gem', size=1024, activation="swish", kernel_regularizer=l2(0.001), bias_regularizer=l2(0.001), dropout=0.3):
+    '''Lightweight embedding head for re-identification / metric-learning
+    (plan.md §13.4) — `classifier()`'s own trunk with the final softmax
+    classification removed, replaced by a linear projection + L2
+    normalization, trained via a metric-learning loss (`losses.triplet_1d`,
+    already implemented — no new loss needed) rather than cross-entropy.
+    Architecturally close enough to `classifier()`'s own trunk that this is
+    a near-trivial addition, not a new architecture.
+
+    **`pre_pool_attention` defaults to `'gem'`, unlike every other
+    classifier variant in this file (`classifier`/`wise_srnet_classifier`/
+    etc. default to `None`)** — a deliberate, domain-specific choice:
+    Generalized-Mean pooling (`GeMPooling2D`, plan.md §9.1) is the same
+    pooling convention the well-known "strong ReID baseline" uses (Luo,
+    Gu, Liao, Lai, Jiang, "Bag of Tricks and a Strong Baseline for Deep
+    Person Re-identification", CVPR-W 2019, arXiv:1903.07071), not copied
+    from `classifier()`'s own default verbatim.
+
+    **The final `UnitNormalization` layer is deliberately not
+    `qat_annotate_layer`-wrapped** — confirmed empirically that
+    `tfmot.quantization.keras.quantize_apply` raises `RuntimeError:
+    ...UnitNormalization is not supported` when annotated, the same
+    "unregistered layer type" rule already established in this repo for
+    `Add`/`Multiply`/`Concatenate`/`BilinearResize` — left un-annotated
+    like those.
+
+    ----------
+    Luo, H., Gu, Y., Liao, X., Lai, S. and Jiang, W., 2019. Bag of tricks
+    and a strong baseline for deep person re-identification. CVPR
+    Workshops.
+
+    Input
+    ----------
+        input_tensor, embedding_size: the input tensor, and the output
+                                      embedding's dimensionality.
+        backbone, weights, freeze_backbone, freeze_batch_norm, deep_layer,
+        pooling, size, activation, kernel_regularizer, bias_regularizer,
+        dropout: identical meaning to `classifier()`'s own arguments.
+        pre_pool_attention: as `classifier()`'s own argument, but defaults
+                            to `'gem'` here (see above) instead of `None`.
+
+    Output
+    ----------
+        A `tf.keras.Model` with a `.preprocessing` attribute, producing an
+        L2-normalized `(batch, embedding_size)` embedding (`||embedding||_2
+        == 1`, not a class probability). **Training**: call this same
+        model 3 times (anchor/positive/negative crops), concatenate the 3
+        `(batch, embedding_size)` outputs along the last axis into one
+        `(batch, 3*embedding_size)` tensor, and pass that as `y_pred` to
+        `losses.triplet_1d(y_true, y_pred, N=embedding_size)` — a
+        training-loop concern, not built into this model's own graph (the
+        same reasoning already established for why this repo's dynamic
+        detection assigners aren't wired into a forced loss either).
+        ArcFace/CosFace-style angular-margin losses are not implemented in
+        this repo and not required — `triplet_1d` alone is sufficient to
+        train this head.
+    '''
+
+    backbone_ = backbone_zoo(
+        backbone, weights, input_tensor, deep_layer, freeze_backbone, freeze_batch_norm)
+
+    base_model = backbone_([input_tensor, ])[deep_layer-1]
+    base_model = apply_pre_pool_attention(base_model, pre_pool_attention, name='{}_attn'.format(name))
+
+    if pre_pool_attention == 'gem':
+        pool = GeMPooling2D(name='{}_gem'.format(name))(base_model)
+    else:
+        pool = qat_annotate_layer(tf.keras.layers.GlobalAveragePooling2D())(
+            base_model) if pooling == 'avg' else qat_annotate_layer(tf.keras.layers.GlobalMaxPool2D())(base_model)
+
+    pre_head = qat_annotate_layer(tf.keras.layers.Dense(
+        size,
+        activation=activation,
+        kernel_regularizer=kernel_regularizer,
+        bias_regularizer=bias_regularizer,
+    ))(pool)
+
+    drop_out = qat_annotate_layer(
+        tf.keras.layers.Dropout(dropout))(pre_head)
+
+    embedding = qat_annotate_layer(tf.keras.layers.Dense(
+        embedding_size, activation=None,
+        kernel_regularizer=kernel_regularizer, bias_regularizer=bias_regularizer,
+        name='{}_embedding'.format(name),
+    ))(drop_out)
+    embedding = tf.keras.layers.UnitNormalization(axis=-1, name='{}_l2norm'.format(name))(embedding)
+
+    res = tf.keras.models.Model(inputs=input_tensor, outputs=embedding)
 
     with tfmot.quantization.keras.quantize_scope():
         res = tfmot.quantization.keras.quantize_apply(res)

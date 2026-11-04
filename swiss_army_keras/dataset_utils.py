@@ -230,10 +230,23 @@ class SegmentationAlbumentationsDataLoader:
             logging.warn(f'Normalizing in range: {self.normalization}')
             self.normalized_dynamic_range = self.normalization
         else:
-            mr = self.normalization(
-                np.array([[[[0, self.dinamic_range]]]])).flatten()
-            logging.warn(f'Normalizing in range: {mr}')
-            self.normalized_dynamic_range = (mr[0], mr[1])
+            # Probe with a real 3-channel (RGB) pixel at each endpoint, not
+            # a single (1,1,1,2) array whose last axis stood in for "the
+            # two probe points" - that shape only worked for a
+            # channel-count-agnostic elementwise `normalization` (e.g. the
+            # old `x/255`-style placeholders). A real per-channel
+            # `(x-mean)/std` normalization (RepViT/FastViT/MobileOne/
+            # MobileNetV4's real ImageNet preprocessing, plan.md §12) needs
+            # exactly 3 channels and raised `ValueError: operands could not
+            # be broadcast together with shapes (1,1,1,2) (3,)` here.
+            # `.mean()` collapses the (up to) 3 slightly different
+            # per-channel outputs to the single scalar this attribute is
+            # actually used as everywhere downstream (display rescaling).
+            mn = self.normalization(np.zeros((1, 1, 1, 3))).flatten().mean()
+            mx = self.normalization(
+                np.full((1, 1, 1, 3), self.dinamic_range, dtype=np.float64)).flatten().mean()
+            logging.warn(f'Normalizing in range: {(mn, mx)}')
+            self.normalized_dynamic_range = (mn, mx)
 
         self.assert_dataset()
 
@@ -684,10 +697,16 @@ class ClassificationAlbumentationsDataLoader:
             logging.warn(f'Normalizing in range: {self.normalization}')
             self.normalized_dynamic_range = self.normalization
         else:
-            mr = self.normalization(
-                np.array([[[[0, self.dinamic_range]]]])).flatten()
-            logging.warn(f'Normalizing in range: {mr}')
-            self.normalized_dynamic_range = (mr[0], mr[1])
+            # See the identical fix/comment in
+            # `SegmentationAlbumentationsDataLoader.__init__` - a real
+            # 3-channel probe, not a (1,1,1,2) array, since a real
+            # per-channel `normalization` (RepViT/FastViT/MobileOne/
+            # MobileNetV4, plan.md §12) needs exactly 3 channels.
+            mn = self.normalization(np.zeros((1, 1, 1, 3))).flatten().mean()
+            mx = self.normalization(
+                np.full((1, 1, 1, 3), self.dinamic_range, dtype=np.float64)).flatten().mean()
+            logging.warn(f'Normalizing in range: {(mn, mx)}')
+            self.normalized_dynamic_range = (mn, mx)
 
         randpart = b64encode(os.urandom(5), altchars=b'01').decode()
 

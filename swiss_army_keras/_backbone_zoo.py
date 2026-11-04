@@ -52,6 +52,12 @@ from swiss_army_keras._backbone_mobilenetv4 import (
     mobilenetv4_preprocess_input,
     mobilenetv4_stage_output_names,
 )
+from swiss_army_keras._backbone_strideformer import (
+    StrideFormer_Tiny,
+    StrideFormer_Base,
+    strideformer_preprocess_input,
+    strideformer_stage_output_names,
+)
 
 import tensorflow_hub as hub
 
@@ -302,6 +308,32 @@ for _mobilenetv4_key, _mobilenetv4_ctor in [
         preprocessing=mobilenetv4_preprocess_input,
     )
 del _mobilenetv4_key, _mobilenetv4_ctor
+
+# StrideFormer (Baidu PaddleSeg, 2023) - the fifth custom backbone
+# (plan.md §3.5). A genuine **3-tap** pyramid (stride 8/16/32) - fewer taps
+# than any other backbone registered here, including RepViT/FastViT's
+# 4-tap patchify-stem situation - since this family's first tap is already
+# at stride8 (`_backbone_strideformer.py`'s own `_strideformer_network`
+# starts a stage2/3/4 tap numbering at stride8, not stride2/4). Decoders
+# consuming this backbone need an explicit `feature_levels=(1,2,3)`/
+# `deep_layer=3` override, the same pattern RepViT/FastViT already need.
+# In the reference, this backbone's own `forward()` also runs AAM (a
+# 3-level fusion module) internally, producing one already-fused output -
+# deliberately not reproduced here, so this backbone stays genuinely
+# swappable with every decoder in this repo, not just its own paper's head
+# (`pp_mobileseg`, which applies AAM itself as a decoder-level step instead
+# - see `_model_pp_mobileseg.py` and `_backbone_strideformer.py`'s own
+# module docstring for the full reasoning).
+for _strideformer_key, _strideformer_ctor in [
+    ('StrideFormer-Tiny', StrideFormer_Tiny),
+    ('StrideFormer-Base', StrideFormer_Base),
+]:
+    BACKBONE_REGISTRY[_strideformer_key] = BackboneSpec(
+        constructor=_strideformer_ctor,
+        layers=strideformer_stage_output_names(_strideformer_key.replace('-', '_')),
+        preprocessing=strideformer_preprocess_input,
+    )
+del _strideformer_key, _strideformer_ctor
 
 
 hub_layer_candidates = {

@@ -136,3 +136,123 @@ def test_include_top_builds_classifier_head():
     inp = tf.keras.Input((INPUT_SIZE, INPUT_SIZE, 3))
     model = MobileNetV4_ConvS(include_top=True, weights=None, input_tensor=inp, classes=10)
     assert model.output_shape == (None, 10)
+
+
+def test_weights_local_path_loads(tmp_path):
+    """`weights=<path>` (e.g. a checkpoint produced by
+    `scripts/port_mobilenetv4_weights.py`, plan.md §12.5) should load real
+    weights into a freshly-built model - checked structurally (do saved and
+    reloaded weights match?), not numerically against PyTorch, since that
+    needs `torch`/`timm` + network access this test suite shouldn't depend
+    on (plan.md §12: one-time conversion-only tools, never a runtime
+    dependency).
+    """
+    inp = tf.keras.Input((INPUT_SIZE, INPUT_SIZE, 3))
+    source_model = MobileNetV4_ConvS(include_top=False, weights=None, input_tensor=inp)
+    weights_path = tmp_path / "mobilenetv4_conv_s.weights.h5"
+    source_model.save_weights(str(weights_path))
+
+    inp2 = tf.keras.Input((INPUT_SIZE, INPUT_SIZE, 3))
+    loaded_model = MobileNetV4_ConvS(include_top=False, weights=str(weights_path), input_tensor=inp2)
+
+    for source_layer, loaded_layer in zip(source_model.layers, loaded_model.layers):
+        for source_w, loaded_w in zip(source_layer.get_weights(), loaded_layer.get_weights()):
+            np.testing.assert_array_equal(source_w, loaded_w)
+
+
+def test_extradw_stride_is_on_mid_conv_not_start():
+    """Regression test for a real architecture bug found while porting real
+    ImageNet weights (plan.md §12.5): when a UIB block has both depthwise
+    convs (`start_k>0` and `mid_k>0`, "ExtraDW" - the most common
+    downsampling block kind in every variant), the reference always puts
+    the block's stride on `dw_mid`, never on `dw_start` - this file
+    previously had it backwards. Confirmed directly via the reference
+    (`UniversalInvertedResidual.__init__`: `dw_mid` always gets
+    `stride=stride` when it exists; `dw_start` only gets the stride when
+    `dw_mid` doesn't exist at all).
+    """
+    from swiss_army_keras._backbone_mobilenetv4 import uib_block
+
+    inp = tf.keras.Input((INPUT_SIZE, INPUT_SIZE, 3))
+    uib_block(inp, 32, start_k=3, mid_k=5, stride=2, expand_ratio=4, name='block')
+    model = tf.keras.Model(inp, uib_block(inp, 32, start_k=3, mid_k=5, stride=2, expand_ratio=4, name='block'))
+
+    dw_start = model.get_layer('block_dwstart_dw')
+    dw_mid = model.get_layer('block_dwmid_dw')
+    assert dw_start.strides == (1, 1), "dw_start must NOT carry the block's stride when dw_mid also exists"
+    assert dw_mid.strides == (2, 2), "dw_mid must carry the block's full stride"
+
+
+def test_hybrid_uib_blocks_have_layer_scale():
+    """Regression test for a real bug found while porting real ImageNet
+    weights (plan.md §12.5): the reference applies a learnable per-channel
+    `LayerScale` to every UIB block's output for Hybrid-M/L
+    (`layer_scale_init_value=1e-5`) but not for Conv-S/M/L
+    (`layer_scale_init_value=None`) - this file had no `LayerScale` in
+    `uib_block` at all until this fix.
+    """
+    inp = tf.keras.Input((INPUT_SIZE, INPUT_SIZE, 3))
+    hybrid_model = MobileNetV4_HybridM(include_top=False, weights=None, input_tensor=inp)
+    assert any(l.name.endswith('_scale') and 'stage2_block0' in l.name for l in hybrid_model.layers), \
+        "Hybrid-M's UIB blocks should have a LayerScale layer"
+
+    inp2 = tf.keras.Input((INPUT_SIZE, INPUT_SIZE, 3))
+    conv_model = MobileNetV4_ConvS(include_top=False, weights=None, input_tensor=inp2)
+    uib_scale_layers = [l for l in conv_model.layers if l.name.endswith('_scale') and 'stage2_block0' in l.name]
+    assert not uib_scale_layers, "Conv-S's UIB blocks should have no LayerScale layer"
+
+
+def test_mqa_kv_have_independent_downsample_convs():
+    """Regression test for a real bug found while porting real ImageNet
+    weights (plan.md §12.5): the reference (`MultiQueryAttention2d`) builds
+    two *separate*, independently-trained depthwise conv+BN modules for K
+    and V's optional spatial downsample (`key.down_conv`, `value.down_conv`)
+    - this file previously shared one downsample conv's output between both
+    K and V projections.
+    """
+    from swiss_army_keras._backbone_mobilenetv4 import mobile_mqa_block
+
+    inp = tf.keras.Input((16, 16, 32))
+    out = mobile_mqa_block(inp, num_heads=4, key_dim=16, kv_stride=2, name='mqa')
+    model = tf.keras.Model(inp, out)
+
+    k_dw = model.get_layer('mqa_k_dw')
+    v_dw = model.get_layer('mqa_v_dw')
+    assert k_dw is not v_dw
+    assert k_dw.get_weights()[0].shape == v_dw.get_weights()[0].shape
+    assert not np.array_equal(k_dw.get_weights()[0], v_dw.get_weights()[0]), \
+        "K and V downsample convs must be independently initialized/trained, not a shared conv"
+
+
+def test_mqa_output_proj_has_no_bias():
+    """Regression test for a real bug found while porting real ImageNet
+    weights (plan.md §12.5): the reference's `MultiQueryAttention2d` never
+    adds a bias to Q/K/V/output projections (`use_bias=False` throughout,
+    including the output proj - confirmed via the reference's own state
+    dict having no `attn.output.proj.bias` key); this file had
+    `use_bias=True` on the output proj specifically.
+    """
+    from swiss_army_keras._backbone_mobilenetv4 import mobile_mqa_block
+
+    inp = tf.keras.Input((16, 16, 32))
+    out = mobile_mqa_block(inp, num_heads=4, key_dim=16, kv_stride=1, name='mqa')
+    model = tf.keras.Model(inp, out)
+    assert model.get_layer('mqa_out_proj').use_bias is False
+
+
+def test_stem_conv_uses_explicit_symmetric_padding():
+    """Regression test for a real bug found while porting real ImageNet
+    weights (plan.md §12.5): every stride>1 conv in this file used Keras's
+    `padding='same'` (can pad asymmetrically at stride>1) instead of the
+    reference's fixed, symmetric `kernel_size // 2` padding (`timm`'s
+    `create_conv2d` - confirmed by reading its `.padding` attribute
+    directly) - the same bug class already fixed for MobileOne/FastViT,
+    just never applied here. Checked structurally: the stem conv must be
+    preceded by an explicit `ZeroPadding2D` and itself use `padding='valid'`.
+    """
+    inp = tf.keras.Input((INPUT_SIZE, INPUT_SIZE, 3))
+    model = MobileNetV4_ConvS(include_top=False, weights=None, input_tensor=inp)
+    stem_conv = model.get_layer('MobileNetV4_ConvS_stem_conv')
+    assert stem_conv.padding == 'valid'
+    pad_layer = model.get_layer('MobileNetV4_ConvS_stem_conv_pad')
+    assert isinstance(pad_layer, tf.keras.layers.ZeroPadding2D)

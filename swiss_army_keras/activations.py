@@ -1,4 +1,5 @@
 
+import tensorflow as tf
 from tensorflow import math
 from tensorflow.keras.layers import Layer
 from tensorflow.keras.utils import register_keras_serializable
@@ -6,8 +7,20 @@ import tensorflow.keras.backend as K
 
 
 def gelu_(X):
-
-    return 0.5*X*(1.0 + math.tanh(0.7978845608028654*(X + 0.044715*math.pow(X, 3))))
+    # Exact (erf-based) GELU, not the tanh approximation this used to be -
+    # PyTorch's default `nn.GELU()` (`approximate='none'`) is exact, and
+    # every backbone in this repo that uses GELU (RepViT, FastViT,
+    # MobileNetV4) is architecturally modeled on a PyTorch/timm reference
+    # that uses that default. The mismatch was invisible for `weights=None`
+    # (random-init) training, but measurably hurt pretrained-weight-porting
+    # fidelity - confirmed while porting RepViT's real ImageNet weights
+    # (plan.md §12.1): swapping in the exact formula cut a ported model's
+    # numerical divergence from the PyTorch reference by ~6x on the
+    # deepest RepViT variant tested (RepViT-M1.5, max abs diff 0.28 -> 0.04),
+    # with the gap growing with network depth under the old approximation
+    # (more GELU calls compounding the same per-call error) - a smoking gun
+    # for exactly this being the cause, not a deeper conversion bug.
+    return tf.nn.gelu(X, approximate=False)
 
 def snake_(X, beta):
 

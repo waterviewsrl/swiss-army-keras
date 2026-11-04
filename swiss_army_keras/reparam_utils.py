@@ -52,7 +52,20 @@ def fuse_conv_bn(kernel, bias, gamma, beta, moving_mean, moving_variance, epsilo
                  actually built/trained with — mismatches here are silent).
         channel_axis: which axis of `kernel` BN's per-channel scale/offset
                       broadcasts over. `-1` for regular `Conv2D`, `-2` for
-                      `DepthwiseConv2D` (depth_multiplier=1).
+                      `DepthwiseConv2D` with `depth_multiplier=1` (BN's
+                      channel count then equals `cin`). For
+                      `DepthwiseConv2D` with `depth_multiplier > 1`, BN's
+                      channel count is `cin * depth_multiplier` — the
+                      *flattened* `(cin, depth_multiplier)` pair, not either
+                      axis alone — pass the tuple `(-2, -1)` for this case;
+                      `gamma`/etc. are then reshaped directly onto the
+                      kernel's trailing `(cin, depth_multiplier)` shape,
+                      which is exactly how Keras already orders a depthwise
+                      conv's output channels (input channel `i`'s
+                      `depth_multiplier` outputs occupy consecutive
+                      positions `i*depth_multiplier .. i*depth_multiplier +
+                      depth_multiplier - 1`), so this reshape needs no
+                      further permutation.
 
     Output
     ----------
@@ -64,7 +77,11 @@ def fuse_conv_bn(kernel, bias, gamma, beta, moving_mean, moving_variance, epsilo
 
     scale = gamma / np.sqrt(moving_variance + epsilon)
     broadcast_shape = [1] * kernel.ndim
-    broadcast_shape[channel_axis] = scale.shape[0]
+    if isinstance(channel_axis, tuple):
+        for axis in channel_axis:
+            broadcast_shape[axis] = kernel.shape[axis]
+    else:
+        broadcast_shape[channel_axis] = scale.shape[0]
     fused_kernel = kernel * scale.reshape(broadcast_shape)
     fused_bias = (bias - moving_mean) * scale + beta
     return fused_kernel, fused_bias
@@ -82,7 +99,10 @@ def fuse_conv_bn_layers(conv_layer, bn_layer):
     kernel = weights[0]
     bias = weights[1] if len(weights) > 1 else None
     gamma, beta, moving_mean, moving_variance = bn_layer.get_weights()
-    channel_axis = -2 if isinstance(conv_layer, tf.keras.layers.DepthwiseConv2D) else -1
+    if isinstance(conv_layer, tf.keras.layers.DepthwiseConv2D):
+        channel_axis = (-2, -1) if conv_layer.depth_multiplier > 1 else -2
+    else:
+        channel_axis = -1
     return fuse_conv_bn(
         kernel, bias, gamma, beta, moving_mean, moving_variance,
         epsilon=bn_layer.epsilon, channel_axis=channel_axis,

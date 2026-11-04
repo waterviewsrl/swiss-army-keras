@@ -101,6 +101,49 @@ def test_fused_block_matches_multibranch_output(depthwise):
     np.testing.assert_allclose(y_multibranch, y_fused, rtol=1e-4, atol=1e-4)
 
 
+def test_fuse_conv_bn_layers_depthwise_multiplier_greater_than_one():
+    """Regression test for a real gap found while porting FastViT's real
+    ImageNet weights (plan.md §12.2): `fuse_conv_bn`/`fuse_conv_bn_layers`
+    only supported `channel_axis=-1` (regular `Conv2D`) or `-2`
+    (`DepthwiseConv2D` with `depth_multiplier=1`) - for `depth_multiplier >
+    1`, BN's per-channel params correspond to the *flattened*
+    `(cin, depth_multiplier)` pair, not either kernel axis alone, and both
+    single-axis broadcasts silently produced wrong shapes/values. Fixed by
+    accepting `channel_axis=(-2, -1)`, reshaping BN's scale directly onto
+    the kernel's trailing `(cin, depth_multiplier)` shape (matching how
+    Keras already orders a depthwise conv's own output channels - no
+    further permutation needed). `fuse_conv_bn_layers` now auto-detects this
+    case via the layer's own `depth_multiplier` attribute.
+    """
+    channels, multiplier, size = 4, 3, 8
+    conv = tf.keras.layers.DepthwiseConv2D(3, padding="same", depth_multiplier=multiplier, use_bias=False)
+    bn = tf.keras.layers.BatchNormalization()
+    inp = tf.keras.Input((size, size, channels))
+    out = bn(conv(inp))
+    model = tf.keras.Model(inp, out)
+
+    rng = np.random.default_rng(2)
+    x = rng.standard_normal((2, size, size, channels)).astype("float32")
+    # give BN real (non-identity) stats to train mode
+    model(x, training=True)
+    bn_weights = bn.get_weights()
+    bn_weights[0] = rng.uniform(0.5, 2.0, size=bn_weights[0].shape).astype("float32")
+    bn_weights[1] = rng.uniform(-1, 1, size=bn_weights[1].shape).astype("float32")
+    bn.set_weights(bn_weights)
+
+    y_original = model.predict(x, verbose=0)
+
+    fused_kernel, fused_bias = fuse_conv_bn_layers(conv, bn)
+    assert fused_kernel.shape == (3, 3, channels, multiplier)
+
+    fused_conv = tf.keras.layers.DepthwiseConv2D(3, padding="same", depth_multiplier=multiplier, use_bias=True)
+    fused_conv.build(inp.shape)
+    fused_conv.set_weights([fused_kernel, fused_bias])
+    y_fused = fused_conv(x).numpy()
+
+    np.testing.assert_allclose(y_original, y_fused, rtol=1e-4, atol=1e-4)
+
+
 def test_pad_kernel_to_centers_and_zero_pads():
     k = np.arange(1 * 1 * 2 * 3, dtype="float32").reshape(1, 1, 2, 3)
     padded = pad_kernel_to(k, target_size=3)

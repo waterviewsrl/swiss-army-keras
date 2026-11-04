@@ -9,9 +9,10 @@ not ImageNet accuracy, and must not depend on network access.
 """
 
 import numpy as np
+import pytest
 import tensorflow as tf
 
-from swiss_army_keras.models import deeplab_v3_plus, deeplab_v3_plus_lite, lr_aspp, pp_liteseg, ddrnet
+from swiss_army_keras.models import deeplab_v3_plus, deeplab_v3_plus_lite, lr_aspp, pp_liteseg, ddrnet, pidnet, pp_mobileseg
 
 INPUT_SIZE = 128
 N_LABELS = 3
@@ -182,6 +183,35 @@ def test_lr_aspp_with_backbone_builds_and_predicts():
     out = model.predict(_random_batch(), verbose=0)
     assert out.shape == (2, INPUT_SIZE, INPUT_SIZE, N_LABELS)
     assert np.all(np.isfinite(out))
+
+
+def test_lr_aspp_iqa_head_false_keeps_output_unchanged():
+    inp = tf.keras.Input((INPUT_SIZE, INPUT_SIZE, 3))
+    model = lr_aspp(
+        inp, n_labels=N_LABELS, backbone="MobileNetV2", weights=None,
+        freeze_backbone=False, iqa_head=False,
+    )
+    out = model.predict(_random_batch(), verbose=0)
+    assert not isinstance(out, list)
+    assert out.shape == (2, INPUT_SIZE, INPUT_SIZE, N_LABELS)
+
+
+def test_lr_aspp_iqa_head_true_adds_bounded_second_output():
+    """`iqa_head=True` (plan.md §13.7, Phase 11) taps `deep_feature` - the
+    same tensor the LR-ASPP module itself consumes - for a small side-head
+    trained simultaneously with the main segmentation task.
+    """
+    inp = tf.keras.Input((INPUT_SIZE, INPUT_SIZE, 3))
+    model = lr_aspp(
+        inp, n_labels=N_LABELS, backbone="MobileOne-S0", weights=None,
+        freeze_backbone=False, iqa_head=True,
+    )
+    assert len(model.outputs) == 2
+
+    logit_map, iqa = model.predict(_random_batch(), verbose=0)
+    assert logit_map.shape == (2, INPUT_SIZE, INPUT_SIZE, N_LABELS)
+    assert iqa.shape == (2, 1)
+    assert iqa.min() >= 0.0 and iqa.max() <= 1.0
 
 
 def test_lr_aspp_with_4_tap_custom_backbone_builds_and_predicts():
@@ -365,6 +395,32 @@ def test_ddrnet_dappm_cascade_channel_count():
     assert out.shape[-1] == 128
 
 
+def test_ddrnet_dappm_matches_pidnet_pappm_channel_contract():
+    """Not a DDRNet regression test - documents a real, deliberately-not-
+    fixed discrepancy found while implementing PIDNet (plan.md §3.4/Phase
+    9): DDRNet's `dappm` appends an extra `BatchNormalization` after each
+    of its 5 branches' 1x1 conv that the verified PyTorch reference (both
+    DDRNet's own and PIDNet's byte-identical `DAPPM` class) does not have -
+    each branch there ends on a bare `Conv2d(bias=False)`. `dappm` is still
+    reused as-is for PIDNet's own `m != 2` ("L") pooling path (out of scope
+    to retroactively "fix" this file's already-shipped, already-tested
+    behavior as a side effect of a different task) - this test only pins
+    down the channel-count contract both `dappm` and the new, more
+    faithful `_pappm` (`_model_pidnet.py`) share, so a future fix to either
+    doesn't silently break the other's call sites.
+    """
+    from swiss_army_keras._model_ddrnet import dappm
+    from swiss_army_keras._model_pidnet import _pappm
+
+    inp1 = tf.keras.Input((16, 16, 256))
+    out1 = dappm(inp1, branch_channels=32, out_channels=128, name='dappm_contract_test')
+    assert out1.shape[-1] == 128
+
+    inp2 = tf.keras.Input((16, 16, 256))
+    out2 = _pappm(inp2, branch_channels=32, out_channels=128, name='pappm_contract_test')
+    assert out2.shape[-1] == 128
+
+
 def test_ddrnet_prebn_layers_are_not_quantize_annotated():
     """Regression test for the one real build-time issue found while
     implementing DDRNet (plan.md §3.3): DAPPM's (and `segmenthead`'s)
@@ -384,3 +440,223 @@ def test_ddrnet_prebn_layers_are_not_quantize_annotated():
     assert any(layer.name.endswith('_dappm_scale0_bn') for layer in model.layers)
     out = model.predict(_random_ddrnet_batch(), verbose=0)
     assert np.all(np.isfinite(out))
+
+
+# PIDNet with PagFM/Bag (plan.md §3.4, Phase 9) - architecture verified
+# directly against the official reference (`XuJiacong/PIDNet`,
+# `models/pidnet.py` + `models/model_utils.py`, fetched and read verbatim),
+# see `_model_pidnet.py`'s module docstring. Like DDRNet, a complete
+# self-contained network (no `backbone=` parameter) - reuses
+# DDRNET_INPUT_SIZE's own reasoning (PIDNet's I-branch also reaches stride
+# 64, and its PAPPM/DAPPM pooling modules use the same largest-kernel-17
+# branch DDRNet's DAPPM does) rather than defining a separate constant.
+
+
+def _random_pidnet_batch(batch_size=1):
+    return np.random.rand(batch_size, DDRNET_INPUT_SIZE, DDRNET_INPUT_SIZE, 3).astype("float32")
+
+
+def test_pidnet_s_with_aux_heads_builds_and_predicts():
+    """`m=2` reproduces the official "S"/"M" configs (PAPPM + Light_Bag)."""
+    inp = tf.keras.Input((DDRNET_INPUT_SIZE, DDRNET_INPUT_SIZE, 3))
+    model = pidnet(inp, n_labels=N_LABELS, m=2, n=3, planes=32, ppm_planes=96, head_planes=128, augment=True)
+    assert len(model.outputs) == 3
+    p_aux, main_out, d_aux = model.predict(_random_pidnet_batch(), verbose=0)
+    assert p_aux.shape == (1, DDRNET_INPUT_SIZE, DDRNET_INPUT_SIZE, N_LABELS)
+    assert main_out.shape == (1, DDRNET_INPUT_SIZE, DDRNET_INPUT_SIZE, N_LABELS)
+    # The D (boundary) auxiliary head outputs a single raw boundary logit,
+    # not `n_labels` channels like the main/P-aux heads - confirmed from
+    # the reference (`self.seghead_d = segmenthead(planes*2, planes, 1)`),
+    # an easy detail to get wrong by analogy to DDRNet's own single
+    # auxiliary head (which does output `n_labels` channels).
+    assert d_aux.shape == (1, DDRNET_INPUT_SIZE, DDRNET_INPUT_SIZE, 1)
+    assert np.all(np.isfinite(p_aux)) and np.all(np.isfinite(main_out)) and np.all(np.isfinite(d_aux))
+
+
+def test_pidnet_without_aux_heads_builds_and_predicts():
+    inp = tf.keras.Input((DDRNET_INPUT_SIZE, DDRNET_INPUT_SIZE, 3))
+    model = pidnet(inp, n_labels=N_LABELS, augment=False)
+    assert len(model.outputs) == 1
+    out = model.predict(_random_pidnet_batch(), verbose=0)
+    assert out.shape == (1, DDRNET_INPUT_SIZE, DDRNET_INPUT_SIZE, N_LABELS)
+    assert np.all(np.isfinite(out))
+
+
+def test_pidnet_l_variant_builds_and_predicts():
+    """`m=3` (with `n=4`, `planes=64`, `ppm_planes=112`, `head_planes=256`)
+    reproduces the official "L" config - the *other* fusion path (DAPPM +
+    `Bag`, not PAPPM + `Light_Bag`) than every other test in this section
+    exercises, since `m` selects both the block-repeat count *and* which
+    pooling/fusion module pair the whole network uses (confirmed genuine
+    double duty in the reference, not simplified here - see
+    `_model_pidnet.py`'s module docstring).
+    """
+    inp = tf.keras.Input((DDRNET_INPUT_SIZE, DDRNET_INPUT_SIZE, 3))
+    model = pidnet(inp, n_labels=N_LABELS, m=3, n=4, planes=64, ppm_planes=112, head_planes=256, augment=False)
+    out = model.predict(_random_pidnet_batch(), verbose=0)
+    assert out.shape == (1, DDRNET_INPUT_SIZE, DDRNET_INPUT_SIZE, N_LABELS)
+    assert np.all(np.isfinite(out))
+
+
+def test_pidnet_light_bag_and_bag_output_channel_count():
+    """Regression test for `_light_bag`/`_bag`'s output channel contract -
+    `_light_bag`'s two parallel conv paths (`conv_p`/`conv_i`) and `_bag`'s
+    single conv must all project to `out_channels` regardless of `p`/`i`/`d`'s
+    own (here, deliberately different) input channel counts, matching the
+    reference's `Light_Bag(in_channels, out_channels)`/`Bag(in_channels,
+    out_channels)` contract.
+    """
+    from swiss_army_keras._model_pidnet import _bag, _light_bag
+
+    p = tf.keras.Input((16, 16, 64))
+    i = tf.keras.Input((16, 16, 64))
+    d = tf.keras.Input((16, 16, 64))
+
+    out_light = _light_bag(p, i, d, out_channels=128, name='light_bag_test')
+    assert out_light.shape[-1] == 128
+
+    out_bag = _bag(p, i, d, out_channels=128, name='bag_test')
+    assert out_bag.shape[-1] == 128
+
+
+def test_pidnet_pagfm_output_matches_p_branch_shape():
+    """Regression test for PagFM's fusion contract: the output must match
+    the P (detail) branch's own resolution/channel count exactly (it's an
+    attention-weighted blend of P with an upsampled, channel-matched I
+    contribution, not a concatenation or a projection to some other width).
+    """
+    from swiss_army_keras._model_pidnet import _pagfm
+
+    p = tf.keras.Input((32, 32, 64))
+    i_compressed = tf.keras.Input((16, 16, 64))
+
+    out = _pagfm(p, i_compressed, mid_channels=32, name='pagfm_test')
+    assert out.shape[1:] == (32, 32, 64)
+
+
+def test_pidnet_d_branch_channel_width_depends_on_m():
+    """Regression test for the D branch's most easily-gotten-wrong detail
+    (plan.md §3.4): its channel width at `layer3_d`/`layer4_d` genuinely
+    depends on `m` (`planes`/`planes*2` for `m==2`, `planes*2`/`planes*2`
+    otherwise) - confirmed from the reference, not a simplification - while
+    `layer5_d` always ends at `planes*4` regardless of `m` (needed so
+    `Light_Bag`/`Bag` always receive a consistently-shaped `d` argument).
+    This only checks the model builds successfully for both `m` values at
+    a small size (already implicitly covered by the S/L variant tests
+    above) with an explicit assertion that both variants' D-branch layers
+    actually got built under their expected, different names.
+    """
+    inp_light = tf.keras.Input((DDRNET_INPUT_SIZE, DDRNET_INPUT_SIZE, 3))
+    model_light = pidnet(inp_light, n_labels=N_LABELS, m=2, n=3, planes=32, augment=False, name='pidnet_light')
+    assert any(layer.name == 'pidnet_light_layer3_d_block0_add' for layer in model_light.layers)
+
+    inp_full = tf.keras.Input((DDRNET_INPUT_SIZE, DDRNET_INPUT_SIZE, 3))
+    model_full = pidnet(inp_full, n_labels=N_LABELS, m=3, n=4, planes=64, augment=False, name='pidnet_full')
+    assert any(layer.name == 'pidnet_full_layer3_d_block0_add' for layer in model_full.layers)
+
+
+# PP-MobileSeg with StrideFormer/AAM (plan.md §3.5, Phase 9) - architecture
+# verified directly against the official reference (`PaddlePaddle/PaddleSeg`,
+# `paddleseg/models/pp_mobileseg.py`), see `_model_pp_mobileseg.py`'s module
+# docstring. `StrideFormer-Tiny`/`-Base` are a genuine 3-tap pyramid (no
+# earlier taps to skip), so `feature_levels=(1, 2, 3)` (this decoder's own
+# default) is already correct - no override needed, unlike RepViT/FastViT
+# elsewhere in this file. Reuses `DDRNET_INPUT_SIZE` for the same "SEA
+# attention's own internal stride-2 downsample needs real spatial extent"
+# reasoning `test_backbone_strideformer.py`'s own `INPUT_SIZE` documents.
+
+
+def test_pp_mobileseg_tiny_with_full_aam_builds_and_predicts():
+    """Tiny pairs with the `'full'` AAM variant in the reference's own
+    training config - not an arbitrary choice, the two are not
+    interchangeable (see `_model_pp_mobileseg.py`'s module docstring).
+    """
+    inp = tf.keras.Input((DDRNET_INPUT_SIZE, DDRNET_INPUT_SIZE, 3))
+    model = pp_mobileseg(
+        inp, n_labels=N_LABELS, backbone='StrideFormer-Tiny', weights=None,
+        freeze_backbone=False, aam_variant='full',
+    )
+    out = model.predict(_random_ddrnet_batch(), verbose=0)
+    assert out.shape == (1, DDRNET_INPUT_SIZE, DDRNET_INPUT_SIZE, N_LABELS)
+    assert np.all(np.isfinite(out))
+
+
+def test_pp_mobileseg_base_with_simplified_aam_builds_and_predicts():
+    """Base pairs with the `'simplified'` (`AAMSx8`) AAM variant in the
+    reference's own training config.
+    """
+    inp = tf.keras.Input((DDRNET_INPUT_SIZE, DDRNET_INPUT_SIZE, 3))
+    model = pp_mobileseg(
+        inp, n_labels=N_LABELS, backbone='StrideFormer-Base', weights=None,
+        freeze_backbone=False, aam_variant='simplified',
+    )
+    out = model.predict(_random_ddrnet_batch(), verbose=0)
+    assert out.shape == (1, DDRNET_INPUT_SIZE, DDRNET_INPUT_SIZE, N_LABELS)
+    assert np.all(np.isfinite(out))
+
+
+def test_strideformer_is_genuinely_swappable_with_other_decoders():
+    """The whole point of moving AAM out of the backbone and into this
+    decoder (§3.5's central design decision, `_backbone_strideformer.py`'s
+    module docstring) was to make StrideFormer a real, swappable backbone
+    usable by *any* decoder in this repo, not just its own paper's head -
+    this test exists to actually confirm that claim holds, not leave it as
+    an unverified aspiration. RepViT/FastViT-style 4-tap overrides don't
+    apply here (StrideFormer is a 3-tap backbone), so `deep_layer=3`/
+    `feature_levels=(1, 2, 3)` are used instead.
+    """
+    inp1 = tf.keras.Input((DDRNET_INPUT_SIZE, DDRNET_INPUT_SIZE, 3))
+    model1 = lr_aspp(
+        inp1, n_labels=N_LABELS, backbone='StrideFormer-Tiny', weights=None,
+        freeze_backbone=False, deep_layer=3, shallow_layer=1,
+    )
+    out1 = model1.predict(_random_ddrnet_batch(), verbose=0)
+    assert out1.shape == (1, DDRNET_INPUT_SIZE, DDRNET_INPUT_SIZE, N_LABELS)
+    assert np.all(np.isfinite(out1))
+
+    inp2 = tf.keras.Input((DDRNET_INPUT_SIZE, DDRNET_INPUT_SIZE, 3))
+    model2 = pp_liteseg(
+        inp2, n_labels=N_LABELS, backbone='StrideFormer-Base', weights=None,
+        freeze_backbone=False, feature_levels=(1, 2, 3),
+    )
+    out2 = model2.predict(_random_ddrnet_batch(), verbose=0)
+    assert out2.shape == (1, DDRNET_INPUT_SIZE, DDRNET_INPUT_SIZE, N_LABELS)
+    assert np.all(np.isfinite(out2))
+
+
+def test_pp_mobileseg_rejects_unknown_aam_variant():
+    inp = tf.keras.Input((DDRNET_INPUT_SIZE, DDRNET_INPUT_SIZE, 3))
+    with pytest.raises(ValueError, match="aam_variant"):
+        pp_mobileseg(inp, n_labels=N_LABELS, backbone='StrideFormer-Tiny', weights=None, aam_variant='bogus')
+
+
+def test_pp_mobileseg_requires_a_backbone():
+    """Unlike `pp_liteseg`/`lr_aspp`, this decoder has no `backbone=None`
+    plain-conv fallback - a deliberate scope choice (see
+    `_model_pp_mobileseg.py`'s module docstring), not an oversight.
+    """
+    inp = tf.keras.Input((DDRNET_INPUT_SIZE, DDRNET_INPUT_SIZE, 3))
+    with pytest.raises(ValueError, match="backbone"):
+        pp_mobileseg(inp, n_labels=N_LABELS, backbone=None, weights=None)
+
+
+def test_aam_full_and_simplified_output_different_resolutions():
+    """Regression test for a real, easy-to-get-backwards detail found while
+    implementing this (plan.md §3.5): `aam_full` downsamples the finest
+    input (`t8`) to match the middle one (`t16`)'s resolution, while
+    `aam_simplified` does the *opposite* - keeps `t8` at its own (finest)
+    resolution and upsamples `t16` to match it instead. Confirmed from
+    source, not assumed by symmetry with `aam_full` (this implementation's
+    first draft did assume symmetry and got it backwards).
+    """
+    from swiss_army_keras._model_pp_mobileseg import aam_full, aam_simplified
+
+    t8 = tf.keras.Input((32, 32, 16))
+    t16 = tf.keras.Input((16, 16, 16))
+    t32 = tf.keras.Input((8, 8, 16))
+
+    full_out = aam_full(t8, t16, t32, out_channels=8, name='full_test')
+    assert full_out.shape[1:3] == (16, 16), "aam_full should output at t16's (the middle) resolution"
+
+    simplified_out = aam_simplified(t8, t16, t32, out_channels=8, name='simplified_test')
+    assert simplified_out.shape[1:3] == (32, 32), "aam_simplified should output at t8's (the finest) resolution"

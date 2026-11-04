@@ -3,6 +3,7 @@ from __future__ import absolute_import
 
 import math
 
+import cv2
 import numpy as np
 import tensorflow as tf
 import tensorflow.keras.backend as K
@@ -645,6 +646,296 @@ def boundary_loss(y_true, y_pred):
     dist_map.set_shape(y_pred.shape)
 
     return tf.reduce_mean(dist_map * y_pred)
+
+# ========================= #
+# Monocular depth losses (plan.md §13.5, Phase 11)
+
+
+def scale_invariant_log_loss(y_true, y_pred, lam=0.5):
+    '''
+    Scale-invariant log loss for monocular depth regression — penalizes
+    relative (log-space) depth error while being insensitive to a global
+    multiplicative bias in the prediction, since absolute scale is
+    generally unrecoverable from a single image.
+
+    scale_invariant_log_loss(y_true, y_pred, lam=0.5)
+
+    ----------
+    Eigen, D., Puhrsch, C. and Fergus, R., 2014. Depth map prediction from
+    a single image using a multi-scale deep network. NeurIPS.
+
+    Eigen, D. and Fergus, R., 2015. Predicting depth, surface normals and
+    semantic labels with a common multi-scale convolutional architecture.
+    ICCV. (source of this function's own `lam=0.5` default, in place of the
+    original paper's fully scale-invariant `lam=1.0`.)
+
+    Input
+    ----------
+        y_true: ground-truth depth (or inverse depth), any positive-valued
+                unit — pixels with `y_true <= 0` are treated as invalid/
+                missing and excluded from the loss (a common convention for
+                depth sensors with holes/missing returns).
+        y_pred: predicted depth, same shape/units as `y_true`, must be
+                strictly positive (clipped to `K.epsilon()` before the log).
+        lam: trade-off between plain log-MSE (`lam=0`) and full scale
+             invariance (`lam=1`) — `0.5` (this function's default) is
+             Eigen & Fergus's own later-paper value, not the original
+             paper's `1.0`.
+
+    '''
+    y_pred = tf.convert_to_tensor(y_pred)
+    y_true = tf.cast(y_true, y_pred.dtype)
+
+    valid_mask = tf.cast(y_true > 0, y_pred.dtype)
+    y_pred_clipped = tf.maximum(y_pred, K.epsilon())
+    y_true_clipped = tf.maximum(y_true, K.epsilon())
+
+    e = (tf.math.log(y_pred_clipped) - tf.math.log(y_true_clipped)) * valid_mask
+    n = tf.maximum(tf.reduce_sum(valid_mask), 1.0)
+
+    return tf.reduce_sum(tf.square(e)) / n - lam * tf.square(tf.reduce_sum(e) / n)
+
+
+def berhu_loss(y_true, y_pred):
+    '''
+    BerHu (reverse Huber) loss for monocular depth regression — L1 near
+    zero error (preserves gradient signal on the many small-error pixels
+    typical of depth regression), L2 beyond a per-batch threshold `c`
+    (down-weights the gradient contribution of large outlier errors rather
+    than letting them dominate, the way plain L1 would).
+
+    berhu_loss(y_true, y_pred)
+
+    ----------
+    Laina, I., Rupprecht, C., Belagiannis, V., Tombari, F. and Navab, N.,
+    2016. Deeper depth prediction with fully convolutional residual
+    networks. 3DV.
+
+    Input
+    ----------
+        y_true: ground-truth depth, same shape as `y_pred`.
+        y_pred: predicted depth.
+
+    * The threshold `c = 0.2 * max(|y_pred - y_true|)` is computed fresh
+      per batch and `tf.stop_gradient`'d — a fixed, target-derived scalar
+      by the paper's own formulation, not a learned quantity, the same
+      "detach a target-derived statistic" idiom `boundary_loss` above
+      already uses for its own distance map (no `tf.numpy_function` needed
+      here, since `reduce_max` is already a plain, differentiable TF op
+      that's being deliberately detached, not an external/non-differentiable
+      computation).
+
+    '''
+    y_pred = tf.convert_to_tensor(y_pred)
+    y_true = tf.cast(y_true, y_pred.dtype)
+
+    x = y_pred - y_true
+    abs_x = tf.abs(x)
+    c = tf.stop_gradient(0.2 * tf.reduce_max(abs_x))
+
+    quadratic = (tf.square(x) + tf.square(c)) / (2.0 * c + K.epsilon())
+    loss = tf.where(abs_x <= c, abs_x, quadratic)
+
+    return tf.reduce_mean(loss)
+
+
+# ========================= #
+# YOLACT instance-segmentation mask loss (plan.md §13.6, Phase 11)
+
+
+def yolact_mask_loss(y_true, y_pred, box_area):
+    '''Per-instance, area-normalized binary cross-entropy for YOLACT-style
+    assembled instance masks (`swiss_army_keras._model_detection.
+    fcos_lite_instance_segmentation`'s own `sigmoid(prototypes @
+    coefficients)`-then-cropped-to-box masks) — YOLACT's own paper formula
+    (Bolya, Zhou, Xiao, Lee, "YOLACT: Real-time Instance Segmentation",
+    ICCV 2019, arXiv:1904.02689), confirmed from the reference
+    implementation's own `multibox_loss.py`: sum the per-pixel BCE over
+    each instance's own assembled mask, then divide by that instance's own
+    ground-truth box area (in mask-resolution units) — not a plain mean —
+    so small instances aren't drowned out by large ones the way a flat
+    per-pixel average across a whole batch would.
+
+    yolact_mask_loss(y_true, y_pred, box_area)
+
+    ----------
+    Bolya, D., Zhou, C., Xiao, F. and Lee, Y.J., 2019. YOLACT: Real-time
+    instance segmentation. ICCV.
+
+    Input
+    ----------
+        y_true: `(..., H, W)` ground-truth binary mask(s), resized to the
+                prototype/mask resolution (e.g.
+                `_model_detection.assign_instance_targets`'s own
+                `mask_targets` output).
+        y_pred: `(..., H, W)` predicted masks, already `sigmoid`-activated
+                probabilities, same shape as `y_true`.
+        box_area: `(...,)` — that instance's own ground-truth box area in
+                  the *same* mask-resolution units as `y_true`/`y_pred`
+                  (e.g. `assign_instance_targets`'s own `mask_areas` — pass
+                  the matching per-instance value, not recomputed here).
+
+    '''
+    y_pred = tf.convert_to_tensor(y_pred)
+    y_true = tf.cast(y_true, y_pred.dtype)
+    box_area = tf.cast(box_area, y_pred.dtype)
+
+    y_pred_clipped = tf.clip_by_value(y_pred, K.epsilon(), 1.0 - K.epsilon())
+    bce = -(y_true * tf.math.log(y_pred_clipped) + (1.0 - y_true) * tf.math.log(1.0 - y_pred_clipped))
+
+    per_instance_sum = tf.reduce_sum(bce, axis=[-2, -1])
+    per_instance_loss = per_instance_sum / tf.maximum(box_area, 1.0)
+
+    return tf.reduce_mean(per_instance_loss)
+
+
+# ========================= #
+# PIDNet boundary losses (plan.md §3.4, Phase 9)
+
+
+def _canny_boundary_map_np(label, dilate_size):
+    '''label: (H, W) integer class-index map -> binary boundary map (H, W)
+    float32, 1.0 at/near a class-boundary pixel. `cv2.Canny` run directly
+    on the integer class-index map (not a photo) - works because a class
+    boundary is exactly where consecutive label values jump, which Canny's
+    gradient detector picks up as an edge - confirmed from the reference
+    (`XuJiacong/PIDNet`, `datasets/base_dataset.py::gen_sample`:
+    `edge = cv2.Canny(label, 0.1, 0.2); edge = (cv2.dilate(edge,
+    ones((edge_size,edge_size)), iterations=1) > 50)`), not guessed.
+    '''
+    edge = cv2.Canny(label.astype(np.uint8), 0.1, 0.2)
+    kernel = np.ones((dilate_size, dilate_size), np.uint8)
+    return (cv2.dilate(edge, kernel, iterations=1) > 50).astype(np.float32)
+
+
+def _canny_boundary_map_batch_np(y_true, dilate_size):
+    '''y_true: (batch, H, W, n_classes) one-hot numpy array -> (batch, H,
+    W, 1) binary boundary maps, derived from the class-index map
+    (`argmax(y_true, axis=-1)`) - the boundary target is *derived*, not
+    supplied separately, same "compute the target from y_true internally"
+    pattern `boundary_loss`'s own `_signed_distance_map_batch_np` above
+    already uses.
+    '''
+    class_map = np.argmax(y_true, axis=-1)
+    out = np.zeros(y_true.shape[:3] + (1,), dtype=np.float32)
+    for b in range(y_true.shape[0]):
+        out[b, ..., 0] = _canny_boundary_map_np(class_map[b], dilate_size)
+    return out
+
+
+def pidnet_boundary_loss(y_true, y_pred, dilate_size=4):
+    '''
+    PIDNet's own boundary-branch supervision (term 3 of its 4-term total
+    loss, plan.md §3.4) - a class-balanced weighted BCE against a
+    Canny+dilate boundary map derived from `y_true` internally (via
+    `tf.numpy_function`, `tf.stop_gradient`'d, same idiom as `boundary_loss`
+    above), not a separately-supplied target.
+
+    pidnet_boundary_loss(y_true, y_pred, dilate_size=4)
+
+    ----------
+    Xu, J., Xiong, Z. and Bhattacharyya, S.P., 2023. PIDNet: A real-time
+    semantic segmentation network inspired by PID controllers. In CVPR.
+
+    Input
+    ----------
+        y_true: one-hot segmentation labels, shape (batch, H, W, n_classes)
+                - the *semantic* labels, not a boundary map; the boundary
+                target is derived from these.
+        y_pred: the D (boundary) branch's raw single-channel logit, shape
+                (batch, H, W, 1) - matches `pidnet()`'s own `d_aux` output
+                exactly (`augment=True`'s 3rd output), no activation
+                applied.
+        dilate_size: the boundary-map dilation kernel size - directly
+                     controls the recall/precision tradeoff of what counts
+                     as a "boundary" pixel; `4` matches the reference's own
+                     default (`edge_size=4`).
+
+    * Confirmed from the reference (`utils/criterion.py::weighted_bce`):
+      per-pixel weight = (count of the *other* class) / (total pixel
+      count) - boundary pixels (typically the rare minority) get weighted
+      by the non-boundary count (close to 1), non-boundary pixels get
+      weighted by the boundary count (small) - standard inverse-class-
+      frequency balancing, not a fixed constant.
+    * The reference's own `BondaryLoss` bakes an additional `coeff_bce=20.0`
+      scale into its return value before summing with the other 3 loss
+      terms; left out of this function (which returns the plain weighted
+      BCE) so the ~20x weighting can be applied at the call site, matching
+      this file's `deep_supervision_loss`-style "raw loss, caller weights"
+      convention used everywhere else.
+    '''
+    y_true = tf.cast(y_true, tf.float32)
+    y_pred = tf.convert_to_tensor(y_pred)
+
+    def _batch_fn(y_true_np):
+        return _canny_boundary_map_batch_np(y_true_np, dilate_size)
+
+    boundary_map = tf.numpy_function(_batch_fn, [y_true], tf.float32)
+    boundary_map = tf.stop_gradient(boundary_map)
+    boundary_map.set_shape(y_pred.shape)
+
+    pos_mask = boundary_map
+    neg_mask = 1.0 - boundary_map
+    pos_num = tf.reduce_sum(pos_mask)
+    neg_num = tf.reduce_sum(neg_mask)
+    total = pos_num + neg_num + K.epsilon()
+    weight = pos_mask * (neg_num / total) + neg_mask * (pos_num / total)
+    weight = tf.stop_gradient(weight)
+
+    bce = tf.nn.sigmoid_cross_entropy_with_logits(labels=boundary_map, logits=y_pred)
+    return tf.reduce_mean(weight * bce)
+
+
+def pidnet_boundary_attentive_loss(y_true, main_pred, boundary_pred, threshold=0.8):
+    '''
+    PIDNet's "boundary-attentive" semantic loss (term 4 of its 4-term total
+    loss, plan.md §3.4) - extra cross-entropy supervision on the *main*
+    output, restricted to pixels the D branch is confident are boundary
+    pixels; everywhere else contributes nothing.
+
+    pidnet_boundary_attentive_loss(y_true, main_pred, boundary_pred, threshold=0.8)
+
+    ----------
+    Xu, J., Xiong, Z. and Bhattacharyya, S.P., 2023. PIDNet: A real-time
+    semantic segmentation network inspired by PID controllers. In CVPR.
+
+    Input
+    ----------
+        y_true: one-hot segmentation labels, shape (batch, H, W, n_classes).
+        main_pred: the main/final head's raw logit, shape
+                   (batch, H, W, n_classes) - `pidnet()`'s main output
+                   (`augment=True`'s 2nd output, or the only output when
+                   `augment=False`).
+        boundary_pred: the D branch's raw single-channel logit, shape
+                       (batch, H, W, 1) - the same tensor
+                       `pidnet_boundary_loss`'s `y_pred` is.
+        threshold: confident-boundary cutoff on `sigmoid(boundary_pred)` -
+                   `0.8` matches the reference exactly
+                   (`utils/utils.py::FullModel.forward`:
+                   `bd_label = where(sigmoid(outputs[-1]) > 0.8, labels,
+                   ignore_label)`, `loss_sb = sem_loss(outputs[-2],
+                   bd_label)`).
+
+    * The reference masks out non-boundary pixels via a sparse-label
+      `ignore_label`, consumed by a `CrossEntropyLoss(ignore_index=...)`;
+      this file's losses work with one-hot `y_true` instead (no ignore-
+      class convention), so masking here is a plain "zero out this
+      pixel's loss contribution, average only over the kept ones" instead
+      - the same effect (unmasked pixels contribute nothing to the mean),
+      not a literal ignore-index reproduction.
+    '''
+    y_true = tf.cast(y_true, tf.float32)
+    main_pred = tf.convert_to_tensor(main_pred)
+    boundary_pred = tf.convert_to_tensor(boundary_pred)
+
+    mask = tf.cast(tf.sigmoid(boundary_pred) > threshold, tf.float32)
+    mask = tf.stop_gradient(mask)
+
+    log_probs = tf.nn.log_softmax(main_pred, axis=-1)
+    ce = -tf.reduce_sum(y_true * log_probs, axis=-1, keepdims=True)
+
+    denom = tf.reduce_sum(mask) + K.epsilon()
+    return tf.reduce_sum(mask * ce) / denom
 
 # ========================= #
 # Structure loss (PraNet)
