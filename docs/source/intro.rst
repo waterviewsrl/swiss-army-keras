@@ -40,10 +40,11 @@ Features
 7. **Losses, optimizers, metrics.** Region, boundary and focal losses for
    imbalanced segmentation, detection losses, depth losses; Lion, SAM,
    AdaBelief and others; boundary F-score and mean average precision.
-8. **Deployment utilities.** Quantization-aware-training wrapping in every
-   head, full-integer and float16 TFLite export, structural
-   reparameterization for MobileOne / FastViT / RepViT, an in-graph uint8
-   input wrapper, out-of-distribution scores and test-time augmentation.
+8. **Deployment utilities.** Target profiles for Axis ARTPEC-8/9 and CPU
+   runtimes, full-integer and float16 TFLite export with automatic
+   reparameterization of MobileOne / FastViT / RepViT backbones, a check of
+   the exported operators against the target, an in-graph uint8 input
+   wrapper, out-of-distribution scores and test-time augmentation.
 
 The complete inventory, with registry names and limitations, is in
 :doc:`model_zoo`; export details are in :doc:`deployment`.

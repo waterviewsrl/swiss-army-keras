@@ -195,8 +195,13 @@ class TrainingDriver():
               (default: model name + timestamp).
         quantizer_name: prefix for the `.tflite` files (default: model name
               + timestamp).
+        export_profile, reparameterize, strip_qat: passed to `Quantizer`
+              (`profile=`, `reparameterize=`, `strip_qat=`): the deployment
+              target the TFLite files are exported and checked for, e.g.
+              `export_profile='artpec8'`. After `run()`, the `Quantizer`
+              is available as `self.quantizer` (with its `lint_report`).
     '''
-    def __init__(self, model, model_name, optimizer, loss, metrics, train_set, val_set, test_set, epochs, patience=20, unfreezed_epochs=-1, callbacks=(), quant_batches=1, plot_metrics=True, metrics_name=None, checkpoint_name=None, quantizer_name=None):
+    def __init__(self, model, model_name, optimizer, loss, metrics, train_set, val_set, test_set, epochs, patience=20, unfreezed_epochs=-1, callbacks=(), quant_batches=1, plot_metrics=True, metrics_name=None, checkpoint_name=None, quantizer_name=None, export_profile='default', reparameterize=True, strip_qat=None):
         self.model = model
         self.model_name = model_name
         self.optimizer = optimizer
@@ -208,6 +213,9 @@ class TrainingDriver():
         self.epochs = epochs
         self.unfreezed_epochs = epochs if unfreezed_epochs == -1 else unfreezed_epochs
         self.quant_batches = quant_batches
+        self.export_profile = export_profile
+        self.reparameterize = reparameterize
+        self.strip_qat = strip_qat
         self.plot_metrics = plot_metrics
 
         self.patience = patience
@@ -357,6 +365,10 @@ class TrainingDriver():
                       self.quantizer_name,
                       batches=self.quant_batches,
                       weights_checkpoint_name=self.weights_checkpoint_name,
-                      append_datetime=False)
+                      append_datetime=False,
+                      profile=self.export_profile,
+                      reparameterize=self.reparameterize,
+                      strip_qat=self.strip_qat)
 
         q.quantize()
+        self.quantizer = q

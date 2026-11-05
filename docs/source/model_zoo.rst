@@ -277,6 +277,11 @@ Auxiliary utilities
        (``add_teacher_iqa_labels``, ``laplacian_variance_quality``).
    * - ``inference_utils.tta_predict``
      - Flip and multi-scale test-time augmentation for segmentation.
+   * - ``deploy_utils``
+     - Deployment profiles, ``reparameterize_model`` (fuses the
+       training-time branches of a MobileOne / FastViT / RepViT backbone
+       inside any model), ``strip_qat``, ``convert_to_tflite`` and
+       ``lint_tflite`` (see :doc:`deployment`).
    * - ``reparam_utils`` and ``reparameterize_*``
-     - Fuse the training-time branches of MobileOne / FastViT / RepViT into
-       plain convolutions (see :doc:`deployment`).
+     - The per-family fusion functions and kernel arithmetic that
+       ``deploy_utils.reparameterize_model`` builds on.

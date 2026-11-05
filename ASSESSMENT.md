@@ -463,3 +463,47 @@ linting, reparameterization at export, cross-layer equalization) and plain
 convolutional components (ResNet-18/34, STDC, a gate-free decoder, an
 NMS-free detection head) are worth more on Axis hardware than further
 mobile-transformer families.
+
+---
+
+## 10. Follow-up on 2026-11-05: export pipeline
+
+Implemented the first block of `ROADMAP.md`.
+
+| Change | Where |
+|---|---|
+| `reparameterize_model`: fuses a MobileOne, RepViT or FastViT backbone nested in any model (or standalone), reusing the existing per-family functions | `swiss_army_keras/deploy_utils.py` |
+| Deployment profiles (`default`, `litert-cpu`, `artpec7`, `artpec8`, `artpec9`): weight granularity, I/O type, operator list, channel multiple | same |
+| `convert_to_tflite` and `lint_tflite`: conversion per profile and a check of the result (types, float operators, weight granularity, operators outside the target's list, per-operator constraints, channel counts) | same |
+| `strip_qat`: plain float copy of a QAT-wrapped model with the trained weights | same |
+| `Quantizer(profile=, reparameterize=, strip_qat=, strict=)` runs the pipeline and keeps the report; `TrainingDriver(export_profile=)` | `quantization_utils.py`, `training_utils.py` |
+| Tests: 16 fast tests on small models, 8 new slow end-to-end export tests | `tests/test_deploy_utils.py`, `tests/test_tflite_export.py` |
+
+Findings made while building it:
+
+- **QAT-wrapped heads do not export cleanly for integer-only targets.** In
+  LR-ASPP and DeepLabV3+ the converter leaves the backbone's last
+  convolution in floating point. Cause: `tfmot` attaches an output
+  quantizer to the head's pooling layer, pooling must use one scale for
+  input and output, and that scale disagrees with the calibrated scale the
+  sibling convolution needs on the same backbone tap. Un-annotating the
+  pooling layer does not help (`tfmot` adds the output quantizer anyway),
+  and neither does an explicit quantizer on the tap.
+- **QAT wrappers keep convolution weights per channel** even when the
+  converter is told to quantize per tensor.
+- Both are solved by stripping the wrappers at export and quantizing the
+  whole graph post-training. All five models probed (LR-ASPP, PP-LiteSeg,
+  DeepLabV3+ and a classifier, on MobileOne-S0 and MobileNetV4-Conv-S)
+  export without errors that way; four of them had errors with the wrappers.
+- Consequence: **on Axis targets the QAT wrapping no longer provides
+  activation ranges.** It still exposes the head to quantization noise
+  during training, but its value is now an open question (roadmap, sections
+  1 and 7). `tfmot` does offer a per-tensor QAT scheme
+  (`Default8BitQuantizeScheme(disable_per_axis=True)`), which fixes the
+  weight granularity but not the float operator.
+- Measured effect on `lr_aspp` + MobileOne-S0 at 128x128: 432 operators and
+  5.5 MB as built, 61 operators and 1.4 MB after the pipeline with the
+  `artpec8` profile.
+- Not verified: accuracy of the per-tensor post-training export on a trained
+  model. No training was run. This needs a real dataset and, for ARTPEC
+  targets, a device.

@@ -63,6 +63,17 @@ latency figures of unlabelled items are deliberately omitted.
 
 The recommended order is in section 6.
 
+> **Status update, later on 2026-11-05.** Step 1 of section 6 is implemented
+> except for the raw-output detection export: deployment profiles,
+> per-tensor export, the operator check and fusion of nested backbones are in
+> `swiss_army_keras/deploy_utils.py`. The work also showed that QAT-wrapped
+> heads cannot be exported cleanly for integer-only targets (a float
+> operator and per-channel weights remain), so accelerator profiles now
+> strip the wrappers and quantize post-training. That makes the "PTQ-only
+> pipeline evaluation" of section 4.1 more pressing: on Axis targets the
+> library already is a PTQ pipeline. Sections 3 and 4 describe the state
+> before this change.
+
 ---
 
 ## 2. What the targets reward

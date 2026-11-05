@@ -108,6 +108,9 @@ Export and inference
 .. automodule:: swiss_army_keras.quantization_utils
    :members:
 
+.. automodule:: swiss_army_keras.deploy_utils
+   :members:
+
 .. automodule:: swiss_army_keras.inference_utils
    :members:
 

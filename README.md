@@ -21,7 +21,7 @@ experiment.
 | Detection | Anchor-free FCOS-lite and GFL-lite detectors, YOLACT-style instance segmentation | `models` |
 | Other heads | Single-label, multi-label and ordinal classifiers, keypoint regression, re-identification embeddings, monocular depth, image-quality side head | `models` |
 | Losses, optimizers, metrics | Region, boundary and focal losses; detection and depth losses; Lion, SAM, AdaBelief and others; boundary F-score, mean average precision | `losses`, `optimizers`, `metrics` |
-| Deployment | QAT wrapping in every head, full-integer and float16 TFLite export, structural reparameterization, uint8 input wrapper, out-of-distribution scores, test-time augmentation | `quantization_utils`, `layer_utils`, `ood_utils`, `inference_utils` |
+| Deployment | Target profiles (Axis ARTPEC-8/9, CPU), full-integer and float16 TFLite export with automatic backbone reparameterization, export check against the target's operator list, uint8 input wrapper, out-of-distribution scores, test-time augmentation | `quantization_utils`, `deploy_utils`, `layer_utils`, `ood_utils`, `inference_utils` |
 
 The complete inventory, with registry names and limitations, is in
 [docs/source/model_zoo.rst](docs/source/model_zoo.rst).
@@ -113,12 +113,18 @@ passed as a file path; automatic download is not available yet. See the
 
 ## Deployment
 
-Models are exported as TFLite files, full-integer (uint8 input and output) and
-float16. Before targeting an accelerator, read
-[docs/source/deployment.rst](docs/source/deployment.rst): it covers
-per-tensor quantization, structural reparameterization (not applied
-automatically yet), the operators each model produces, and the constraints of
-the Axis DLPU family and other targets.
+Models are exported as TFLite files, full-integer and float16. The export
+fuses reparameterizable backbones (MobileOne, RepViT, FastViT), converts for
+a deployment profile, and checks the result against it:
+
+```python
+TrainingDriver(..., export_profile="artpec8").run()   # per-tensor weights, checked against the ARTPEC-8 operator list
+```
+
+Profiles: `default`, `litert-cpu`, `artpec7`, `artpec8`, `artpec9`.
+[docs/source/deployment.rst](docs/source/deployment.rst) explains the
+pipeline, the profiles, the export check, and the constraints of the Axis
+DLPU family and other targets.
 
 ## Documentation
 

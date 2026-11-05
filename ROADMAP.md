@@ -11,15 +11,23 @@ Effort: S is up to 2 days, M is up to 2 weeks, L is more.
 
 ## 1. Make exported models right for the target
 
+Done on 2026-11-05 (`swiss_army_keras/deploy_utils.py`, `Quantizer`,
+`TrainingDriver(export_profile=...)`): fusion of reparameterizable backbones
+nested in a full model, deployment profiles with per-tensor weights, the
+export check against the target's operator list, and stripping of QAT
+wrappers for integer-only targets, which also removed the float operators
+found in LR-ASPP and DeepLabV3+ exports.
+
+Still open:
+
 | Item | Effort |
 |---|---|
-| Fuse reparameterizable backbones nested in a full model before export (today MobileOne exports with 416 operators instead of 50) | M |
-| `Quantizer` deployment profiles: per-tensor weights, int8 or uint8 I/O, target presets (ARTPEC-8, ARTPEC-9, LiteRT CPU) | M |
-| Operator linter: fail export or test when a graph uses operators the target does not accelerate | S |
-| Track down the float islands (DEQUANTIZE / QUANTIZE) in LR-ASPP and DeepLabV3+ exports | S |
+| Verify the Axis operator lists in `deploy_utils.py` on real ARTPEC-8 and ARTPEC-9 devices and correct them | S |
+| Cover the remaining published per-operator constraints in the lint (pooling windows, kernel sizes, padding amounts) | S |
 | Export detectors without in-graph decoding and NMS, with a reference decoder | S |
-| Extend `tests/test_tflite_export.py` to every decoder, head and backbone family, per profile | M |
+| Extend `tests/test_tflite_export.py` to every decoder, head and backbone family | M |
 | On-device benchmark harness and a published latency table | M |
+| Decide the future of QAT wrapping: it no longer contributes activation ranges for accelerator exports. Options: keep it as a training regularizer, make it optional per builder, or drop it in favour of post-training quantization (see section 7) | M |
 
 ## 2. Make per-tensor quantization accurate
 

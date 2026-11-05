@@ -1,12 +1,18 @@
-'''TFLite export: `Quantizer` converts a trained model to full-integer (uint8
-I/O) and float16 TFLite files and can visualize their predictions.
+'''TFLite export: `Quantizer` prepares a trained model for a deployment profile
+(reparameterization, QAT stripping), converts it to full-integer and float16
+TFLite files, checks the result, and can visualize its predictions. The
+building blocks live in `deploy_utils`.
 '''
 import tensorflow as tf
 import numpy as np
 
 from datetime import datetime
 
+import logging
+
 import matplotlib.pyplot as plt
+
+from swiss_army_keras import deploy_utils
 
 
 def visualize(**images):
@@ -47,27 +53,38 @@ totflite_dict[1] = symmetric_totflite
 
 
 class Quantizer():
-    '''TFLite export of a trained model, in two flavours.
+    '''
+    TFLite export of a trained model for a deployment target.
 
     `quantize()` writes two files (prefix `name`, relative to the current
     working directory):
 
-    * `<name>_quant_ui8.tflite`: full-integer model. Only
-      `TFLITE_BUILTINS_INT8` ops are allowed (conversion fails otherwise),
-      input and output tensors are `uint8`, and `batches` batches of
-      `dataset` are used as the representative (calibration) dataset.
+    * `<name>_quant_ui8.tflite` (`_quant_i8` for a profile with int8
+      input/output): full-integer model. Only `TFLITE_BUILTINS_INT8` ops are
+      allowed (conversion fails otherwise) and `batches` batches of `dataset`
+      are used as the representative (calibration) dataset.
     * `<name>_quant_f16.tflite`: float16 weights, float32 input/output.
 
-    Models built by this library are already wrapped for quantization-aware
-    training, so the fake-quant ranges learned during training are used; the
-    representative dataset only calibrates tensors those wrappers do not
-    cover.
+    Before converting, the model is prepared for deployment:
 
-    Current limitations (see `docs/source/deployment.rst`): weights are
-    quantized per channel (the TFLite default; a per-tensor switch for
-    targets such as the Axis ARTPEC-8 DLPU is not exposed yet), the integer
-    I/O type is fixed to uint8, and structural reparameterization
-    (`reparameterize_mobileone` etc.) is not applied automatically.
+    1. **Reparameterization** (`reparameterize=True`): the training-time
+       branches of a MobileOne, RepViT or FastViT backbone are fused into
+       plain convolutions (`deploy_utils.reparameterize_model`). The result
+       computes the same function with several times fewer operators.
+    2. **QAT stripping** (`strip_qat`): the quantization-aware-training
+       wrappers of the head are removed and the whole graph is quantized
+       post-training from the calibration data
+       (`deploy_utils.strip_qat`). This is needed for integer-only
+       accelerators: with the wrappers left in, the converter can leave an
+       operator in floating point where the head's learned ranges and the
+       backbone's calibrated ranges disagree, and convolution weights of
+       the head stay quantized per channel. By default (`strip_qat=None`)
+       the wrappers are stripped for profiles marked `integer_only`
+       (`artpec7`, `artpec8`, `artpec9`) and kept otherwise.
+
+    After converting, the flatbuffer is checked against the profile
+    (`deploy_utils.lint_tflite`); the report is logged and kept in
+    `self.lint_report`.
 
     Input
     ----------
@@ -81,8 +98,21 @@ class Quantizer():
         batches: number of dataset batches used for calibration.
         weights_checkpoint_name: optional weights checkpoint to load into
                `model` before converting (ignored when `model` is a path).
+        profile: name of a deployment profile (`deploy_utils.PROFILES`:
+               'default', 'litert-cpu', 'artpec7', 'artpec8', 'artpec9') or
+               a `deploy_utils.DeploymentProfile`. It sets the weight
+               quantization granularity (per channel or per tensor), the
+               input/output type, and what the exported file is checked
+               against.
+        reparameterize: fuse reparameterizable backbones before converting.
+        strip_qat: True / False to force, None for the profile-dependent
+               default described above.
+        strict: raise `RuntimeError` if the lint report has errors or
+               operators outside the profile's operator list, instead of
+               only logging a warning.
     '''
-    def __init__(self, dataset, model, name, append_datetime=True, batches=1, weights_checkpoint_name=None):
+    def __init__(self, dataset, model, name, append_datetime=True, batches=1, weights_checkpoint_name=None,
+                 profile='default', reparameterize=True, strip_qat=None, strict=False):
         self.dataset = dataset
         self.model = model
         if append_datetime:
@@ -97,88 +127,77 @@ class Quantizer():
         self.normalization = 0
         self.weights_checkpoint_name = weights_checkpoint_name
 
-    def quantize(self):
+        self.profile = deploy_utils.get_profile(profile)
+        self.reparameterize = reparameterize
+        self.strip_qat = self.profile.integer_only if strip_qat is None else strip_qat
+        self.strict = strict
+        self.export_model = None
+        self.lint_report = None
+        self.tflite_int_path = None
+        self.tflite_f16_path = None
 
-        '''Convert the model and write the `_quant_ui8.tflite` and
-        `_quant_f16.tflite` files. The converted flatbuffers are also kept in
-        `self.tflite_ui8_model` and `self.tflite_f16_model`. Sets
-        `model.trainable = False` on the model as a side effect.
+    def _prepare_export_model(self):
+        '''Load weights, then fuse and strip the model as configured.'''
+        if isinstance(self.model, str):
+            model = tf.keras.models.load_model(self.model, compile=False)
+            self.saved_model_dirname = self.model
+        else:
+            model = self.model
+            if self.weights_checkpoint_name is not None:
+                model.load_weights(self.weights_checkpoint_name)
+            self.saved_model_dirname = self.name + 'saved_model'
+        model.trainable = False
+
+        if self.reparameterize:
+            try:
+                model = deploy_utils.reparameterize_model(model)
+            except Exception as e:  # keep exporting: an unfused model is slower, not wrong
+                logging.warning('Reparameterization failed (%s: %s); exporting the unfused model.',
+                                type(e).__name__, e)
+        if self.strip_qat:
+            model = deploy_utils.strip_qat(model)
+        return model
+
+    def quantize(self):
         '''
+        Prepare the model, convert it and write the full-integer and float16
+        TFLite files. The flatbuffers are kept in `self.tflite_ui8_model`
+        (the full-integer one, whatever its input/output type) and
+        `self.tflite_f16_model`, the file paths in `self.tflite_int_path`
+        and `self.tflite_f16_path`, the prepared Keras model in
+        `self.export_model`, and the check of the full-integer file in
+        `self.lint_report`. Sets `model.trainable = False` on the model as a
+        side effect.
+        '''
+
         def representative_data_gen():
-            # for input_value in tf.data.Dataset.from_tensor_slices(test_input).batch(1).take(1):
-            #    yield [tf.cast(input_value, tf.float32) /255.]
             for i in range(self.batches):
                 vals = self.dataset.__iter__().next()[0]
                 for val in vals:
                     yield [tf.expand_dims(tf.cast(val, tf.float32), axis=0)]
 
-        if isinstance(self.model, str):
-            loaded_model = tf.keras.models.load_model(
-                self.model,
-                compile=False)
-            loaded_model.trainable = False
-            converter = tf.lite.TFLiteConverter.from_keras_model(loaded_model)
-            self.saved_model_dirname = self.model
-        else:
-            if self.weights_checkpoint_name is not None:
-                self.model.load_weights(self.weights_checkpoint_name)
-            self.model.trainable = False
-            converter = tf.lite.TFLiteConverter.from_keras_model(self.model)
-            self.saved_model_dirname = self.name + 'saved_model'
+        self.export_model = self._prepare_export_model()
 
-        converter.optimizations = [tf.lite.Optimize.DEFAULT]
-        converter.representative_dataset = representative_data_gen
-        # Ensure that if any ops can't be quantized, the converter throws an error
-        converter.target_spec.supported_ops = [
-            tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
-        # Set the input and output tensors to uint8 (APIs added in r2.3)
-        converter.inference_input_type = tf.uint8
-        converter.inference_output_type = tf.uint8
-
-        self.tflite_ui8_model = converter.convert()
-
-        with open(f'{self.name}quant_ui8.tflite', 'wb') as f:
+        self.tflite_ui8_model = deploy_utils.convert_to_tflite(
+            self.export_model, representative_data_gen, profile=self.profile)
+        suffix = 'i8' if self.profile.io_dtype == 'int8' else 'ui8'
+        self.tflite_int_path = f'{self.name}quant_{suffix}.tflite'
+        with open(self.tflite_int_path, 'wb') as f:
             f.write(self.tflite_ui8_model)
 
-        if isinstance(self.model, str):
-            loaded_model = tf.keras.models.load_model(
-                self.model,
-                compile=False)
-            loaded_model.trainable = False
-            converter = tf.lite.TFLiteConverter.from_keras_model(loaded_model)
-            self.saved_model_dirname = self.model
+        self.lint_report = deploy_utils.lint_tflite(self.tflite_ui8_model, profile=self.profile)
+        if self.lint_report.ok:
+            logging.info('%s', self.lint_report)
         else:
-            self.model.trainable = False
-            converter = tf.lite.TFLiteConverter.from_keras_model(self.model)
-            self.saved_model_dirname = self.name + 'saved_model'
+            logging.warning('%s', self.lint_report)
+            if self.strict:
+                raise RuntimeError('Exported model does not match profile \'{}\':\n{}'.format(
+                    self.profile.name, self.lint_report))
 
-        converter.optimizations = [tf.lite.Optimize.DEFAULT]
-        converter.target_spec.supported_types = [tf.float16]
-
-        # Ensure that if any ops can't be quantized, the converter throws an error
-        self.tflite_f16_model = converter.convert()
-
-        with open(f'{self.name}quant_f16.tflite', 'wb') as f:
+        self.tflite_f16_model = deploy_utils.convert_to_tflite(self.export_model, float16=True)
+        self.tflite_f16_path = f'{self.name}quant_f16.tflite'
+        with open(self.tflite_f16_path, 'wb') as f:
             f.write(self.tflite_f16_model)
-
-        '''params = tf.experimental.tensorrt.ConversionParams(
-            precision_mode='INT8',
-            maximum_cached_engines=1,
-            use_calibration=True)
-        converter = tf.experimental.tensorrt.Converter(
-            input_saved_model_dir=self.saved_model_dirname, conversion_params=params)
-
-        converter.convert(calibration_input_fn=representative_data_gen)
-        converter.save(self.name + 'tensorrt_ui8')
-
-        params = tf.experimental.tensorrt.ConversionParams(
-            precision_mode='FP16',
-            maximum_cached_engines=4)
-        converter = tf.experimental.tensorrt.Converter(
-            input_saved_model_dir=self.saved_model_dirname, conversion_params=params)
-
-        converter.convert()
-        converter.save(self.name + 'tensorrt_f16')'''
 
     def vizualize_ui8_results(self, num_images):
 

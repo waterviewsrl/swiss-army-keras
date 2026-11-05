@@ -89,7 +89,8 @@ Segmentation in five steps
       model_metrics = [tf.keras.metrics.CategoricalAccuracy(), metrics.MeanIOU(num_classes=N_LABELS)]
 
 4. **Train.** ``TrainingDriver`` runs a frozen-backbone phase, an optional
-   unfrozen phase, and the export.
+   unfrozen phase, and the export. Pass ``export_profile="artpec8"`` (or
+   another profile, see :doc:`deployment`) to export for a specific target.
 
    .. code-block:: python
 

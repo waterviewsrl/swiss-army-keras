@@ -25,6 +25,10 @@ Always `import swiss_army_keras` before `import tensorflow` (see the README).
   Prefer "output is not constant" or a numeric reference.
 - Every new head or backbone family gets a case in
   `tests/test_tflite_export.py`.
+- Export behaviour (profiles, lint, QAT stripping, reparameterization) is
+  tested on small models in `tests/test_deploy_utils.py`.
+- A new reparameterizable backbone family must be added to
+  `deploy_utils._reparam_families` so it is fused at export.
 - Do not edit files under `swiss_army_keras/` while the suite is running.
   Keras re-reads a custom layer's source from disk when it first traces it,
   so a concurrent edit makes unrelated tests fail.
