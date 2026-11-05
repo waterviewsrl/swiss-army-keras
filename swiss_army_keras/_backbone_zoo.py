@@ -1,3 +1,6 @@
+'''Backbone registry (`BACKBONE_REGISTRY`) and the `backbone_zoo` factory that
+turns a registered backbone into a multi-output feature-pyramid model.
+'''
 from __future__ import absolute_import
 
 from dataclasses import dataclass, field

@@ -8,6 +8,18 @@ water/smoke segmentation, visibility estimation, and lens-health detection.
 Every reference to one of `plan.md`'s own sections is written as `plan.md
 §X`; a plain `§X` refers to a section within this file.
 
+> **Implementation status of what these recipes mention** (checked against
+> the code on 2026-11-05). Available: every loss named below, the `SAM`
+> optimizer wrapper, `tta_predict`, `ordinal_classifier`, the attention
+> pooling layers, the DDRNet auxiliary head and `deep_supervision_loss`,
+> the freeze/unfreeze phases of `TrainingDriver`. **Not implemented yet**,
+> although the text recommends them: EMA and SWA weight averaging,
+> rare-class-aware and domain-balanced batch sampling in `dataset_utils.py`,
+> loss-weight ramping (it has to be done with a custom callback), a
+> differential learning rate for backbone and head, and the dark-channel
+> input feature. They are tracked in [ROADMAP.md](ROADMAP.md). None of the
+> recipes has been validated on a real dataset yet.
+
 ## 1. Water & smoke segmentation: combining losses & hyperparameters (indoor + outdoor)
 
 There isn't one universal recipe — the four target scenarios differ enough in

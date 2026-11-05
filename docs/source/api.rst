@@ -1,14 +1,13 @@
 API Reference
 =============
 
-Autodoc reference for every public module in ``swiss_army_keras`` — added
-to close a real, pre-existing gap (plan.md §11): ``sphinx.ext.autodoc`` and
-``sphinx.ext.napoleon`` were already configured in ``conf.py``, but no
-``.rst`` file anywhere in ``docs/source/`` contained a single
-``automodule::``/``autoclass::``/``autofunction::`` directive, so building
-the docs produced zero reference documentation for any function, class, or
-module — regardless of docstring quality — for the existing backbones/
-decoders/losses, let alone the ones added since.
+Generated from the docstrings. The public entry points are
+``swiss_army_keras.models`` (full models) and ``swiss_army_keras.base``
+(feature builders without input layer and head); both only re-export the
+functions documented below, grouped here by the module that defines them.
+
+Docstrings follow the package's own plain-text convention (a summary, then
+``Input`` and ``Output`` sections), rendered as literal blocks.
 
 Backbones
 ---------
@@ -28,11 +27,14 @@ Backbones
 .. automodule:: swiss_army_keras._backbone_repvit
    :members:
 
+.. automodule:: swiss_army_keras._backbone_strideformer
+   :members:
+
 .. automodule:: swiss_army_keras.reparam_utils
    :members:
 
-Decoders
---------
+Segmentation decoders
+---------------------
 
 .. automodule:: swiss_army_keras._model_deeplab_v3_plus
    :members:
@@ -46,14 +48,26 @@ Decoders
 .. automodule:: swiss_army_keras._model_ddrnet
    :members:
 
-Classification
----------------
+.. automodule:: swiss_army_keras._model_pidnet
+   :members:
+
+.. automodule:: swiss_army_keras._model_pp_mobileseg
+   :members:
+
+Classification, regression and embedding heads
+----------------------------------------------
 
 .. automodule:: swiss_army_keras._model_classifier
    :members:
 
-Object detection
------------------
+Monocular depth
+---------------
+
+.. automodule:: swiss_army_keras._model_depth
+   :members:
+
+Object detection and instance segmentation
+------------------------------------------
 
 .. automodule:: swiss_army_keras._model_detection
    :members:
@@ -76,29 +90,83 @@ Metrics
 .. automodule:: swiss_army_keras.metrics
    :members:
 
-Layers and shared building blocks
------------------------------------
+Data loading
+------------
 
-.. automodule:: swiss_army_keras.layer_utils
+.. automodule:: swiss_army_keras.dataset_utils
+   :members: SegmentationAlbumentationsDataLoader, ClassificationAlbumentationsDataLoader
+
+Training
+--------
+
+.. automodule:: swiss_army_keras.training_utils
    :members:
 
-Inference utilities
+Export and inference
 --------------------
+
+.. automodule:: swiss_army_keras.quantization_utils
+   :members:
 
 .. automodule:: swiss_army_keras.inference_utils
    :members:
 
-Base (encoder/feature-builder) and full-model entry points
---------------------------------------------------------------
+Out-of-distribution and image-quality utilities
+-----------------------------------------------
 
-.. automodule:: swiss_army_keras.base
+.. automodule:: swiss_army_keras.ood_utils
    :members:
 
-.. automodule:: swiss_army_keras.models
+.. automodule:: swiss_army_keras.iqa_utils
+   :members:
+
+Layers and shared building blocks
+---------------------------------
+
+.. automodule:: swiss_army_keras.layer_utils
+   :members:
+
+.. automodule:: swiss_army_keras.activations
+   :members:
+
+.. automodule:: swiss_army_keras.transformer_layers
    :members:
 
 General utilities
-------------------
+-----------------
 
 .. automodule:: swiss_army_keras.utils
+   :members:
+
+U-Net family (inherited from keras-unet-collection)
+---------------------------------------------------
+
+.. automodule:: swiss_army_keras._model_unet_2d
+   :members:
+
+.. automodule:: swiss_army_keras._model_vnet_2d
+   :members:
+
+.. automodule:: swiss_army_keras._model_unet_plus_2d
+   :members:
+
+.. automodule:: swiss_army_keras._model_r2_unet_2d
+   :members:
+
+.. automodule:: swiss_army_keras._model_att_unet_2d
+   :members:
+
+.. automodule:: swiss_army_keras._model_resunet_a_2d
+   :members:
+
+.. automodule:: swiss_army_keras._model_u2net_2d
+   :members:
+
+.. automodule:: swiss_army_keras._model_unet_3plus_2d
+   :members:
+
+.. automodule:: swiss_army_keras._model_transunet_2d
+   :members:
+
+.. automodule:: swiss_army_keras._model_swin_unet_2d
    :members:

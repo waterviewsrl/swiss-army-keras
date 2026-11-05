@@ -1,4 +1,5 @@
-
+'''General utilities: model loading, image loading, model (un)freezing.
+'''
 import numpy as np
 
 from PIL import Image
@@ -102,12 +103,18 @@ def freeze_model(model, freeze_batch_norm=False):
 
 def unfreeze_model(model, unfreeze_batch_norm=False):
     '''
-    freeze a keras model
+    Unfreeze a keras model (the inverse of `freeze_model`).
 
     Input
     ----------
         model: a keras model
-        freeze_batch_norm: False for not freezing batch notmalization layers
+        unfreeze_batch_norm: if False (default), the BatchNormalization
+            layers found directly in `model.layers` stay frozen and every
+            other layer becomes trainable; if True, every layer becomes
+            trainable. Only the top level of `model.layers` is visited: a
+            nested sub-model (e.g. the backbone built by `backbone_zoo`) is
+            switched as a whole, so its own BatchNormalization layers DO
+            become trainable regardless of this flag.
     '''
     if unfreeze_batch_norm:
         for layer in model.layers:

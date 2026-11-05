@@ -1,3 +1,6 @@
+'''Metrics: `MeanIOU` (one-hot aware mean IoU), `BoundaryFScore` and
+`MeanAveragePrecision`.
+'''
 import numpy as np
 import tensorflow as tf
 
@@ -5,6 +8,12 @@ from scipy.ndimage import binary_erosion, distance_transform_edt
 
 
 class MeanIOU(tf.keras.metrics.MeanIoU):
+    '''`tf.keras.metrics.MeanIoU` for one-hot labels and per-class score maps:
+    both `y_true` and `y_pred` are reduced with `argmax` over the last axis
+    before the confusion matrix is updated, so it can be used directly with
+    the segmentation models and data loaders of this library (logits or
+    probabilities).
+    '''
     def update_state(self, y_true, y_pred, sample_weight=None):
         return super().update_state(tf.argmax(y_true, axis=-1), tf.argmax(y_pred, axis=-1), sample_weight)
 

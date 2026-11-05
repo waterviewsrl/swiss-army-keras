@@ -408,3 +408,58 @@ Runtime note for CI planning: the ten slowest tests take 12 to 25 seconds
 each (depth heads, static-batch detection, PIDNet). A `-m "not slow"` PR job
 of about 15 to 20 minutes on a 4-core runner is realistic; splitting by file
 across 3 or 4 jobs brings it under 7 minutes.
+
+---
+
+## 9. Follow-up on 2026-11-05: documentation pass and candidates assessment
+
+### 9.1 Documentation
+
+| Change | Where |
+|---|---|
+| Docs build went from 265 docutils warnings to 0. A Sphinx hook renders the package's `Input` / `Output` docstring convention instead of rewriting several hundred docstrings | `docs/source/conf.py` |
+| New guides: getting started, model zoo (the single detailed inventory), deployment | `docs/source/getting_started.rst`, `model_zoo.rst`, `deployment.rst` |
+| API reference now covers every module (it stopped at the Phase 5 modules) | `docs/source/api.rst` |
+| README rewritten around the actual feature set, with a verified quick start; intro page reduced to a summary that points at the model zoo | `README.md`, `docs/source/intro.rst` |
+| Docstrings written for the user-facing classes that had none: `TrainingDriver`, `ModelBuilder`, `Quantizer`, both data loaders, `MeanIOU`, `loss_adapter`, `distiller_classifier`, the learnable-resizer classifiers; module docstrings for the public modules | `swiss_army_keras/` |
+| Wrong docstrings corrected: `deeplab_v3_plus` and `deeplab_v3_plus_lite` carried the UNet 3+ text; `unfreeze_model` carried the `freeze_model` text | `_model_deeplab_v3_plus.py`, `utils.py` |
+| `CONTRIBUTING.md` (setup, tests, documentation rules), `ROADMAP.md` (ordered open work), changelog entry for the unreleased work, implementation-status note in `use_case_recipes.md` | repository root |
+| Docs version read from `swiss_army_keras.__version__`; notebooks never re-executed at build time; the MobileNetV4 notebook added to the examples page | `docs/source/conf.py`, `examples.rst` |
+
+### 9.2 New findings from this pass
+
+- **Reparameterization is never applied on export.** A MobileOne-S0 feature
+  extractor exports to 416 TFLite operators and 4.2 MB with its training-time
+  branches, against 50 operators and 1.0 MB after `reparameterize_mobileone`
+  (outputs agree to 4e-4). The fusion functions only accept a backbone built
+  directly from its constructor, not one nested in a decoder, so no model
+  trained through `TrainingDriver` can be fused today.
+- **Exports contain operators that Axis does not list for its DLPUs**:
+  SPACE_TO_BATCH_ND from DeepLabV3+'s dilated convolutions, GELU and
+  squeeze-excite gates in RepViT, MEAN and REDUCE_MAX in PP-LiteSeg, and
+  DEQUANTIZE / QUANTIZE float islands in LR-ASPP and DeepLabV3+.
+  Details in `EDGE_AI_CANDIDATES.md` section 3.
+- **`unfreeze_model` unfreezes the backbone's batch normalization.** It only
+  inspects top-level layers; the nested backbone is switched as a whole, so
+  all 226 batch-norm layers of a MobileOne-S0 backbone become trainable in
+  the unfrozen phase although `unfreeze_batch_norm=False`.
+- **`TrainingDriver` never saved its metric plots** with the default name:
+  `os.makedirs('')` raised and the error was only logged. Fixed.
+- **Non-square inputs do not work in the data loaders**: images are resized
+  to `(height, width)` but shapes are set as `(width, height)`.
+- **`use_case_recipes.md` recommends features that do not exist** (EMA, SWA,
+  class- and domain-balanced sampling, loss ramping, differential learning
+  rate). Now stated at the top of that file.
+- Many docstrings in the newer modules narrate development history and
+  refer to `plan.md` sections. They render correctly now, but they are long
+  and hard to use as reference. Trimming them is listed in `ROADMAP.md`.
+
+### 9.3 Candidates assessment
+
+`EDGE_AI_CANDIDATES.md` assesses further networks, optimizers and strategies
+against three hardware tiers (Axis DLPUs, other aarch64 stacks, Jetson Orin).
+Its main conclusion is that deployment tooling (per-tensor profiles, operator
+linting, reparameterization at export, cross-layer equalization) and plain
+convolutional components (ResNet-18/34, STDC, a gate-free decoder, an
+NMS-free detection head) are worth more on Axis hardware than further
+mobile-transformer families.

@@ -94,65 +94,60 @@ def deeplab_v3_plus(input_tensor, n_labels, filter_num_down=[64, 128, 256, 512, 
                     stack_num_down=2, stack_num_up=1, activation='ReLU', batch_norm=False, pool=True, unpool=True,
                     backbone=None, weights='imagenet', freeze_backbone=True, freeze_batch_norm=True, name='deeplab_v3_plus'):
     '''
-    The base of UNET 3+ with an optional ImagNet-trained backbone.
-
-    unet_3plus_2d_base(input_tensor, filter_num_down, filter_num_skip, filter_num_aggregate, 
-                       stack_num_down=2, stack_num_up=1, activation='ReLU', batch_norm=False, pool=True, unpool=True, 
-                       backbone=None, weights='imagenet', freeze_backbone=True, freeze_batch_norm=True, name='deeplab_v3_plus')
+    DeepLabV3+ semantic segmentation model: backbone, atrous spatial pyramid
+    pooling (ASPP) on a deep feature, fusion with a shallow feature, and
+    bilinear upsampling back to the input resolution.
 
     ----------
-    Huang, H., Lin, L., Tong, R., Hu, H., Zhang, Q., Iwamoto, Y., Han, X., Chen, Y.W. and Wu, J., 2020. 
-    UNet 3+: A Full-Scale Connected UNet for Medical Image Segmentation. 
-    In ICASSP 2020-2020 IEEE International Conference on Acoustics, 
-    Speech and Signal Processing (ICASSP) (pp. 1055-1059). IEEE.
+    Chen, L.C., Zhu, Y., Papandreou, G., Schroff, F. and Adam, H., 2018.
+    Encoder-Decoder with Atrous Separable Convolution for Semantic Image
+    Segmentation. In ECCV 2018.
 
     Input
     ----------
-        input_tensor: the input tensor of the base, e.g., `keras.layers.Inpyt((None, None, 3))`.        
-        filter_num_down: a list that defines the number of filters for each 
-                         downsampling level. e.g., `[64, 128, 256, 512, 1024]`.
-                         the network depth is expected as `len(filter_num_down)`
-        filter_num_skip: a list that defines the number of filters after each 
-                         full-scale skip connection. Number of elements is expected to be `depth-1`.
-                         i.e., the bottom level is not included.
-                         * Huang et al. (2020) applied the same numbers for all levels. 
-                           e.g., `[64, 64, 64, 64]`.
-        filter_num_aggregate: an int that defines the number of channels of full-scale aggregations.
-        stack_num_down: number of convolutional layers per downsampling level/block. 
-        stack_num_up: number of convolutional layers (after full-scale concat) per upsampling level/block.          
-        activation: one of the `tensorflow.keras.layers` or `swiss_army_keras.activations` interfaces, e.g., ReLU                
-        batch_norm: True for batch normalization.
-        pool: True or 'max' for MaxPooling2D.
-              'ave' for AveragePooling2D.
-              False for strided conv + batch norm + activation.
-        unpool: True or 'bilinear' for Upsampling2D with bilinear interpolation.
-                'nearest' for Upsampling2D with nearest interpolation.
-                False for Conv2DTranspose + batch norm + activation.     
-        name: prefix of the created keras model and its layers.
+        input_tensor: the input tensor, e.g. `keras.layers.Input((512, 512, 3))`.
+                      A fixed spatial size is required (upsampling factors
+                      are computed from static shapes).
+        n_labels: number of segmentation classes (output channels).
+        filter_num_down: only used when `backbone=None`: number of filters
+                         of each level of the built-in plain encoder.
+        deep_layer: 1-based index of the backbone tap fed to the ASPP module
+                    (5 = stride 32 for 5-tap backbones; use 4 for the 4-tap
+                    RepViT/FastViT families).
+        shallow_layer: 1-based index of the tap used for the low-level skip
+                       connection.
+        num_filters_deep: channels of the ASPP branches and its output.
+        num_filters_shallow: channels of the 1x1 projection of the shallow
+                             tap.
+        multiscale_factor: 0 (default) disables it. Otherwise a second
+                           `MobileNetV3Large` encoder is run on the input
+                           downscaled by this factor and its deep feature is
+                           concatenated to the main one before the ASPP.
+        atrous_rates: dilation rates of the ASPP 3x3 branches. Dilated
+                      convolutions are exported to TFLite as
+                      SPACE_TO_BATCH_ND / BATCH_TO_SPACE_ND pairs, which many
+                      NPUs do not accelerate; prefer `lr_aspp`/`pp_liteseg`
+                      for such targets.
+        stack_num_down, stack_num_up, activation, batch_norm, pool, unpool:
+                      only used by the `backbone=None` encoder.
+        name: prefix of the created layers.
 
         ---------- (keywords of backbone options) ----------
-        backbone_name: the bakcbone model name. Should be one of the `tensorflow.keras.applications` class.
-                       None (default) means no backbone. 
-                       Currently supported backbones are:
-                       (1) VGG16, VGG19
-                       (2) ResNet50, ResNet101, ResNet152
-                       (3) ResNet50V2, ResNet101V2, ResNet152V2
-                       (4) DenseNet121, DenseNet169, DenseNet201
-                       (5) EfficientNetB[0-7]
-        weights: one of None (random initialization), 'imagenet' (pre-training on ImageNet), 
-                 or the path to the weights file to be loaded.
+        backbone: name of a registered backbone (any key of
+                  `swiss_army_keras._backbone_zoo.BACKBONE_REGISTRY`, or a
+                  `hub://` name), or None for a plain built-in encoder.
+        weights: None (random initialization), 'imagenet' (only for the
+                 `tf.keras.applications` backbones), or the path of a weights
+                 file.
         freeze_backbone: True for a frozen backbone.
-        freeze_batch_norm: False for not freezing batch normalization layers.   
-
-    * Downsampling is achieved through maxpooling and can be replaced by strided convolutional layers here.
-    * Upsampling is achieved through bilinear interpolation and can be replaced by transpose convolutional layers here.
+        freeze_batch_norm: False for not freezing batch normalization layers.
 
     Output
     ----------
-        A list of tensors with the first/second/third tensor obtained from 
-        the deepest/second deepest/third deepest upsampling block, etc.
-        * The feature map sizes of these tensors are different, 
-          with the first tensor has the smallest size. 
+        a QAT-wrapped `tf.keras.Model` returning raw logits
+        (no softmax; use `losses.loss_adapter(..., from_logits=True)`), with a
+        `preprocessing` attribute holding the backbone's input normalization.
+        Output shape: `(batch, H, W, n_labels)`, same spatial size as the input.
 
     '''
 
@@ -302,65 +297,66 @@ def deeplab_v3_plus_lite(input_tensor, n_labels, filter_num_down=[64, 128, 256, 
                     stack_num_down=2, stack_num_up=1, activation='ReLU', batch_norm=False, pool=True, unpool=True,
                     backbone=None, weights='imagenet', freeze_backbone=True, freeze_batch_norm=True, name='deeplab_v3_plus'):
     '''
-    The base of UNET 3+ with an optional ImagNet-trained backbone.
-
-    unet_3plus_2d_base(input_tensor, filter_num_down, filter_num_skip, filter_num_aggregate, 
-                       stack_num_down=2, stack_num_up=1, activation='ReLU', batch_norm=False, pool=True, unpool=True, 
-                       backbone=None, weights='imagenet', freeze_backbone=True, freeze_batch_norm=True, name='deeplab_v3_plus')
+    DeepLabV3+ without the final upsampling stage: identical to
+    `deeplab_v3_plus` up to the fused decoder feature, but the logits are
+    returned at the resolution of the shallow tap (e.g. 1/4 of the input for
+    `shallow_layer=2`) instead of being upsampled to the input size. This
+    removes the most expensive resize from the deployed graph; upsample the
+    mask on the host side, and train with `mask_downsample` set accordingly
+    in `SegmentationAlbumentationsDataLoader` (or
+    `losses.loss_adapter(..., contract=True)`).
 
     ----------
-    Huang, H., Lin, L., Tong, R., Hu, H., Zhang, Q., Iwamoto, Y., Han, X., Chen, Y.W. and Wu, J., 2020. 
-    UNet 3+: A Full-Scale Connected UNet for Medical Image Segmentation. 
-    In ICASSP 2020-2020 IEEE International Conference on Acoustics, 
-    Speech and Signal Processing (ICASSP) (pp. 1055-1059). IEEE.
+    Chen, L.C., Zhu, Y., Papandreou, G., Schroff, F. and Adam, H., 2018.
+    Encoder-Decoder with Atrous Separable Convolution for Semantic Image
+    Segmentation. In ECCV 2018.
 
     Input
     ----------
-        input_tensor: the input tensor of the base, e.g., `keras.layers.Inpyt((None, None, 3))`.        
-        filter_num_down: a list that defines the number of filters for each 
-                         downsampling level. e.g., `[64, 128, 256, 512, 1024]`.
-                         the network depth is expected as `len(filter_num_down)`
-        filter_num_skip: a list that defines the number of filters after each 
-                         full-scale skip connection. Number of elements is expected to be `depth-1`.
-                         i.e., the bottom level is not included.
-                         * Huang et al. (2020) applied the same numbers for all levels. 
-                           e.g., `[64, 64, 64, 64]`.
-        filter_num_aggregate: an int that defines the number of channels of full-scale aggregations.
-        stack_num_down: number of convolutional layers per downsampling level/block. 
-        stack_num_up: number of convolutional layers (after full-scale concat) per upsampling level/block.          
-        activation: one of the `tensorflow.keras.layers` or `swiss_army_keras.activations` interfaces, e.g., ReLU                
-        batch_norm: True for batch normalization.
-        pool: True or 'max' for MaxPooling2D.
-              'ave' for AveragePooling2D.
-              False for strided conv + batch norm + activation.
-        unpool: True or 'bilinear' for Upsampling2D with bilinear interpolation.
-                'nearest' for Upsampling2D with nearest interpolation.
-                False for Conv2DTranspose + batch norm + activation.     
-        name: prefix of the created keras model and its layers.
+        input_tensor: the input tensor, e.g. `keras.layers.Input((512, 512, 3))`.
+                      A fixed spatial size is required (upsampling factors
+                      are computed from static shapes).
+        n_labels: number of segmentation classes (output channels).
+        filter_num_down: only used when `backbone=None`: number of filters
+                         of each level of the built-in plain encoder.
+        deep_layer: 1-based index of the backbone tap fed to the ASPP module
+                    (5 = stride 32 for 5-tap backbones; use 4 for the 4-tap
+                    RepViT/FastViT families).
+        shallow_layer: 1-based index of the tap used for the low-level skip
+                       connection.
+        num_filters_deep: channels of the ASPP branches and its output.
+        num_filters_shallow: channels of the 1x1 projection of the shallow
+                             tap.
+        multiscale_factor: 0 (default) disables it. Otherwise a second
+                           `MobileNetV3Large` encoder is run on the input
+                           downscaled by this factor and its deep feature is
+                           concatenated to the main one before the ASPP.
+        atrous_rates: dilation rates of the ASPP 3x3 branches. Dilated
+                      convolutions are exported to TFLite as
+                      SPACE_TO_BATCH_ND / BATCH_TO_SPACE_ND pairs, which many
+                      NPUs do not accelerate; prefer `lr_aspp`/`pp_liteseg`
+                      for such targets.
+        stack_num_down, stack_num_up, activation, batch_norm, pool, unpool:
+                      only used by the `backbone=None` encoder.
+        name: prefix of the created layers.
 
         ---------- (keywords of backbone options) ----------
-        backbone_name: the bakcbone model name. Should be one of the `tensorflow.keras.applications` class.
-                       None (default) means no backbone. 
-                       Currently supported backbones are:
-                       (1) VGG16, VGG19
-                       (2) ResNet50, ResNet101, ResNet152
-                       (3) ResNet50V2, ResNet101V2, ResNet152V2
-                       (4) DenseNet121, DenseNet169, DenseNet201
-                       (5) EfficientNetB[0-7]
-        weights: one of None (random initialization), 'imagenet' (pre-training on ImageNet), 
-                 or the path to the weights file to be loaded.
+        backbone: name of a registered backbone (any key of
+                  `swiss_army_keras._backbone_zoo.BACKBONE_REGISTRY`, or a
+                  `hub://` name), or None for a plain built-in encoder.
+        weights: None (random initialization), 'imagenet' (only for the
+                 `tf.keras.applications` backbones), or the path of a weights
+                 file.
         freeze_backbone: True for a frozen backbone.
-        freeze_batch_norm: False for not freezing batch normalization layers.   
-
-    * Downsampling is achieved through maxpooling and can be replaced by strided convolutional layers here.
-    * Upsampling is achieved through bilinear interpolation and can be replaced by transpose convolutional layers here.
+        freeze_batch_norm: False for not freezing batch normalization layers.
 
     Output
     ----------
-        A list of tensors with the first/second/third tensor obtained from 
-        the deepest/second deepest/third deepest upsampling block, etc.
-        * The feature map sizes of these tensors are different, 
-          with the first tensor has the smallest size. 
+        a QAT-wrapped `tf.keras.Model` returning raw logits
+        (no softmax; use `losses.loss_adapter(..., from_logits=True)`), with a
+        `preprocessing` attribute holding the backbone's input normalization.
+        Output shape: `(batch, H / s, W / s, n_labels)` where `s` is the
+        stride of the shallow tap.
 
     '''
 

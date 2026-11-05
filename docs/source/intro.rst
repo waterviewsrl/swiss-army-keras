@@ -1,33 +1,54 @@
 Introduction
 ============
 
-A library to help with the development of AI models with Keras, with a focus on edge / IoT applications. 
+``swiss_army_keras`` helps with the development of compact vision models in
+Keras, with a focus on edge / IoT deployment. It started as a fork of
+`keras-unet-collection <https://github.com/yingkaisha/keras-unet-collection>`_
+and has grown into a toolkit that covers the whole path from a folder of
+images to a quantized TFLite file.
 
 Motivation
 **********
 
-Building CNN experiments with flexible and scalable augmentation pipelines, with the ability to cobine different encoder and decoder architectures, 
-can require a huge initial effort. 
-This is even more true in the case of edge-AI models, where models need to be build taking into account more severe constraints and quantization is usually required.
+Building experiments with flexible augmentation pipelines, and being able to
+combine different encoders and decoders, requires a large initial effort. This
+is even more true for edge models, which must respect tight latency and memory
+budgets and usually have to be quantized to 8-bit integers.
 
-This library wants you to focus on dataset, model architecture and hyperparameters tuning, without worring about the rest.
-
-It provides several helper classes which help in the development of CNN based AI models for edge IoT applications, where resources are limited and model quantization is reccomended.
+The library lets you concentrate on the dataset, the architecture choice and
+the hyper-parameters, and takes care of the rest.
 
 Features
 ********
 
-The main features of the library are the following:
+1. **Dataset pipelines.** ``tf.data`` loaders for segmentation and
+   classification with `albumentations <https://albumentations.ai/>`_
+   augmentation running in a pool of worker processes.
+2. **Training driver.** Frozen-backbone training, optional unfrozen
+   fine-tuning, built-in callbacks, and TFLite export at the end.
+3. **Backbones.** One registry for the ``tf.keras.applications`` families
+   (MobileNet, ResNet, DenseNet, EfficientNet, VGG), EfficientNet-Lite, and
+   five edge-oriented families implemented in this library: MobileOne,
+   MobileNetV4, FastViT, RepViT and StrideFormer.
+4. **Segmentation.** DeepLabV3+, LR-ASPP, PP-LiteSeg, DDRNet, PIDNet and
+   PP-MobileSeg, plus the U-Net family inherited from keras-unet-collection.
+5. **Detection and instance segmentation.** Anchor-free FCOS-lite and
+   GFL-lite detectors and a YOLACT-style instance-segmentation head.
+6. **Classification and regression heads.** Single-label, multi-label,
+   ordinal, keypoint regression, re-identification embeddings, monocular
+   depth, and an optional image-quality side head.
+7. **Losses, optimizers, metrics.** Region, boundary and focal losses for
+   imbalanced segmentation, detection losses, depth losses; Lion, SAM,
+   AdaBelief and others; boundary F-score and mean average precision.
+8. **Deployment utilities.** Quantization-aware-training wrapping in every
+   head, full-integer and float16 TFLite export, structural
+   reparameterization for MobileOne / FastViT / RepViT, an in-graph uint8
+   input wrapper, out-of-distribution scores and test-time augmentation.
 
-1. Flexible, efficient and scalable Dataset management with augmentation pipelines leveraging albumentations (https://albumentations.ai/) and td-data (https://www.tensorflow.org/guide/data)
-2. Training driver with builtin callbacks, configurable backbone unfreezing, and quantized model generation
-3. Helper classes to easiliy combine pretrained backbones for Edge AI applications with the desired segmentation and classification architectures -- beyond the standard ``tf.keras.applications`` backbones (VGG, ResNet, DenseNet, EfficientNet, MobileNet, ...), also includes 4 modern edge-oriented backbone families built from scratch for this library: **MobileOne**, **MobileNetV4** (incl. the Hybrid attention variants), **FastViT**, and **RepViT** (all published sizes each)
-4. Additional loss functions and optimizers which are not part of the Keras distribution, as for now -- including Lovász-Softmax, boundary loss, structure loss (PraNet), log-cosh Dice, OHEM, Quality Focal / Distribution Focal / VariFocal loss, CIoU/SIoU box regression, Lion, and a SAM (Sharpness-Aware Minimization) optimizer wrapper
-5. Lightweight semantic segmentation decoders -- **LR-ASPP**, **PP-LiteSeg** (with UAFM), and **DDRNet** (with DAPPM) -- alongside the existing DeepLabV3+ family, all pluggable with any registered backbone
-6. A lightweight anchor-free object detection head (**FCOS-lite**, with a PAFPN-lite neck and ATSS label assignment) and additional classification heads (multi-label, CORAL-style ordinal) with optional GeM/ECA/CoordAtt attention pooling
+The complete inventory, with registry names and limitations, is in
+:doc:`model_zoo`; export details are in :doc:`deployment`.
 
 .. note::
-   This list is kept in sync with the repository's ``README.md`` feature
-   list by hand (plan.md §10/§11 flagged the two as near-duplicates that
-   had drifted apart once already) -- update both together.
-
+   This short list mirrors the "What it provides" table of the repository's
+   ``README.md``. The detailed inventory lives only in :doc:`model_zoo`, so
+   there is a single place to update when a component is added.

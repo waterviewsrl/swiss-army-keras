@@ -1,4 +1,6 @@
-
+'''Public entry points for the feature-map ("base") builders, without the
+input layer and output head where the architecture separates them.
+'''
 from __future__ import absolute_import
 
 import warnings

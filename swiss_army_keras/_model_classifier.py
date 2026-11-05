@@ -95,6 +95,8 @@ def classifier(input_tensor, n_classes, backbone='MobileNetV3Large', weights='im
 
 
 def conv_block(x, filters, kernel_size, strides, activation=tf.keras.layers.LeakyReLU(0.2)):
+    '''Separable conv + BatchNorm + activation block used by the learnable resizer. Internal.
+    '''
     x = qat_annotate_layer(tf.keras.layers.SeparableConv2D(filters, kernel_size, strides,
                                                                                          padding="same", use_bias=False))(x)
     x = qat_annotate_layer(
@@ -105,6 +107,8 @@ def conv_block(x, filters, kernel_size, strides, activation=tf.keras.layers.Leak
 
 
 def res_block(x, resizer_filters=16):
+    '''Residual block made of two `conv_block` calls, used by the learnable resizer. Internal.
+    '''
     inputs = x
     x = conv_block(x, resizer_filters, 3, 1)
     x = conv_block(x, resizer_filters, 3, 1, activation=None)
@@ -117,6 +121,25 @@ def learnable_resizer_classifier(input_tensor, n_classes, target_size=(480, 480)
                                  pooling='avg', size=1024, activation="swish", kernel_regularizer=l2(0.001),
                                  bias_regularizer=l2(0.001), dropout=0.3):
 
+    '''`classifier` preceded by a learnable resizer (Talebi & Milanfar, 2021,
+    "Learning to Resize Images for Computer Vision Tasks"): a small CNN that
+    resizes the input to `target_size` jointly trained with the classifier,
+    added to a plain `interpolation` resize as a residual.
+
+    Input
+    ----------
+        input_tensor: the input tensor (any fixed size).
+        n_classes: number of classes.
+        target_size: `(height, width)` fed to the backbone.
+        resizer_filters, resizer_kernel_size, num_res_blocks: size of the
+            resizer network.
+        interpolation: interpolation of the resize operations.
+        (remaining arguments: see `classifier`)
+
+    Output
+    ----------
+        a QAT-wrapped `tf.keras.Model` with a `preprocessing` attribute.
+    '''
     inputs = tf.keras.layers.Input(shape=[target_size[0], target_size[1], 3])
 
     # First, perform naive resizing.
@@ -272,6 +295,9 @@ def wise_srnet_classifier(input_tensor, n_classes, backbone='MobileNetV3Large', 
 def learnable_resizer_distiller_classifier(input_tensor, n_classes, target_size=(480, 480), resizer_filters=16, resizer_kernel_size=5, num_res_blocks=1,
                                            interpolation='bilinear',  backbone='MobileNetV3Large', weights='imagenet', freeze_backbone=True, freeze_batch_norm=True, name='classifier', deep_layer=5, pooling='avg', pool_size=3, macrofeatures_number=8, size=64, activation="swish", pool_activation=None, kernel_regularizer=l2(0.001), bias_regularizer=l2(0.001), dropout=0.3):
 
+    '''`distiller_classifier` preceded by the learnable resizer described in
+    `learnable_resizer_classifier`. Arguments are the union of the two.
+    '''
     inputs = tf.keras.layers.Input(shape=[target_size[0], target_size[1], 3])
 
     # First, perform naive resizing.
@@ -373,6 +399,32 @@ def learnable_resizer_distiller_classifier(input_tensor, n_classes, target_size=
 
 def distiller_classifier(input_tensor, n_classes, backbone='MobileNetV3Large', weights='imagenet', freeze_backbone=True, freeze_batch_norm=True, name='classifier', deep_layer=5, pooling='avg', pool_size=3, macrofeatures_number=8, size=64, activation="swish", pool_activation=None, kernel_regularizer=l2(0.001), bias_regularizer=l2(0.001), dropout=0.3):
 
+    '''Classifier head that distils the backbone's last feature map into a few
+    "macro-features" instead of globally pooling it: the feature map is
+    pooled with a `pool_size` window, then `macrofeatures_number` parallel
+    full-size depthwise convolutions (non-negative weights) each reduce it to
+    one vector; the vectors are concatenated and fed to a small dense layer
+    and a softmax classifier.
+
+    Input
+    ----------
+        input_tensor: the input tensor.
+        n_classes: number of classes (softmax output).
+        backbone, weights, freeze_backbone, freeze_batch_norm: see `classifier`.
+        deep_layer: index (1-based) of the backbone tap to use.
+        pooling: 'avg' or 'max' for the initial pooling.
+        pool_size: window (and stride) of the initial pooling.
+        macrofeatures_number: number of parallel depthwise reductions.
+        size: units of the dense layer before the classifier.
+        activation: activation of that dense layer.
+        pool_activation: optional activation of the depthwise reductions.
+        kernel_regularizer, bias_regularizer, dropout: regularization of the
+            dense layers.
+
+    Output
+    ----------
+        a QAT-wrapped `tf.keras.Model` with a `preprocessing` attribute.
+    '''
     backbone_ = backbone_zoo(
         backbone, weights, input_tensor, deep_layer, freeze_backbone, freeze_batch_norm)
 

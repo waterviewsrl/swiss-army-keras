@@ -12,7 +12,7 @@ def swin_transformer_stack(X, stack_num, embed_dim, num_patch, num_heads, window
     Stacked Swin Transformers that share the same token size.
     
     Alternated Window-MSA and Swin-MSA will be configured if `shift_window=True`, Window-MSA only otherwise.
-    *Dropout is turned off.
+    Note: dropout is turned off.
     '''
     # Turn-off dropouts
     mlp_drop_rate = 0 # Droupout after each MLP layer

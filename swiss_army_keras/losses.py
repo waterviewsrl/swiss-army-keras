@@ -1,4 +1,8 @@
-
+'''Loss functions for segmentation (Dice, Tversky, focal variants, Lovasz,
+boundary, structure, OHEM), detection (IoU family, QFL/DFL/VFL), depth
+(scale-invariant log, BerHu), instance masks and ranking, plus the
+`loss_adapter` and `deep_supervision_loss` wrappers.
+'''
 from __future__ import absolute_import
 
 import math
@@ -253,7 +257,7 @@ def ms_ssim(y_true, y_pred, **kwargs):
     """
     Multiscale structural similarity (MS-SSIM) loss.
 
-    ms_ssim(y_true, y_pred, **tf_ssim_kw)
+    `ms_ssim(y_true, y_pred, **tf_ssim_kw)`
 
     ----------
     Wang, Z., Simoncelli, E.P. and Bovik, A.C., 2003, November. Multiscale structural similarity for image quality assessment.
@@ -1140,6 +1144,19 @@ def triplet_1d(y_true, y_pred, N, margin=5.0):
 
 def focal_categorical_crossentropy(gamma, n_classes, label_smoothing=0.0):
 
+    '''Focal categorical cross-entropy with optional label smoothing, for
+    probability (not logit) predictions.
+
+    Input
+    ----------
+        gamma: focusing parameter (0 reduces to plain cross-entropy).
+        n_classes: number of classes (used to spread the smoothing mass).
+        label_smoothing: smoothing factor in [0, 1).
+
+    Output
+    ----------
+        a `loss(y_true, y_pred)` function.
+    '''
     gamma_v = gamma
     n_classes_v = n_classes
     label_smoothing_v = label_smoothing
@@ -1335,6 +1352,28 @@ def categorical_focal_loss(alpha, gamma=2.):
 
 def loss_adapter(loss_function, factor=1, expand=False, contract=False, from_logits=False, label_smoothing=0.0):
 
+    '''Wrap a loss so it can be used with models whose output does not match
+    the labels directly: raw logits, and/or an output resolution different
+    from the label resolution.
+
+    Input
+    ----------
+        loss_function: a `loss(y_true, y_pred)` function expecting
+                       probabilities.
+        factor: constant multiplier applied to the loss value.
+        expand: resize `y_pred` (nearest) to the spatial size of `y_true`
+                before computing the loss.
+        contract: resize `y_true` (nearest) to the spatial size of `y_pred`
+                  instead. Ignored if `expand` is True.
+        from_logits: apply a softmax to `y_pred` first. Needed for the
+                     segmentation decoders of this library, which output
+                     logits.
+        label_smoothing: smoothing factor applied to `y_true`.
+
+    Output
+    ----------
+        a `loss(y_true, y_pred)` function.
+    '''
     loss_f = loss_function
     expand_ = expand
 

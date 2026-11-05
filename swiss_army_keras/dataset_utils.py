@@ -1,3 +1,7 @@
+'''Dataset pipelines: `SegmentationAlbumentationsDataLoader` and
+`ClassificationAlbumentationsDataLoader` build `tf.data` datasets with
+albumentations augmentation executed in a pool of worker processes.
+'''
 from codecs import ignore_errors
 from swiss_army_keras import __path__ as mypath
 from PIL import ImageFont
@@ -52,6 +56,8 @@ def visualize(**images):
 
 
 class BrokerProcess(Process):
+    '''ZeroMQ broker process routing augmentation requests from the data loader to the worker pool. Internal.
+    '''
     class Autorizer(object):
         db = None
 
@@ -78,6 +84,8 @@ class BrokerProcess(Process):
 
 
 class WorkerProcess(Process):
+    '''Augmentation worker process: applies the (dill-serialized) albumentations pipeline of the requested split to one image. Internal.
+    '''
     class Workload(object):
         pre = None
 
@@ -168,6 +176,59 @@ class WorkerProcess(Process):
 
 class SegmentationAlbumentationsDataLoader:
 
+    '''`tf.data` input pipeline for semantic segmentation with albumentations
+    augmentation.
+
+    Expected layout::
+
+        dataset_path/
+            <images_dir>/   xxx.jpg, yyy.png, ...   (any format `tf.image.decode_image` reads)
+            <masks_dir>/    xxx.png, yyy.png, ...   (same file stem, single-channel class ids)
+
+    Every file in `images_dir` is used, so the directory must contain images
+    only. `build_datasets()` returns `(train, val, test)` datasets of
+    `(image, one_hot_mask)` batches: images are float32, resized to
+    `(height, width)` and normalized; masks are resized with
+    nearest-neighbour to `(height / mask_downsample, width / mask_downsample)`
+    and one-hot encoded over `num_classes`.
+
+    Augmentation runs in a pool of `cpu_count() / 2` worker processes started
+    by the constructor (they live until the Python process exits). Because
+    the transforms are shipped to the workers with `dill`, pass
+    `albumentations` pipelines, not arbitrary closures over large objects.
+
+    Known limitations: `width` and `height` are not used consistently, so use
+    square sizes; the remainder batch is dropped; `resize` is accepted for
+    backward compatibility but ignored (images are always resized).
+
+    Input
+    ----------
+        dataset_path: root directory of the dataset.
+        precache: decode and resize the whole dataset once and cache it in
+                  memory before training.
+        train_augmentations, val_augmentations, test_augmentations: an
+                  `albumentations.Compose` per split, or `None` for no
+                  augmentation.
+        images_dir, masks_dir: sub-directories of `dataset_path`.
+        width, height: network input size.
+        batch_size: batch size (static; the last partial batch is dropped).
+        num_classes: number of classes for the one-hot masks.
+        mask_downsample: integer factor between input and mask resolution,
+                  for decoders whose output is smaller than their input
+                  (e.g. `deeplab_v3_plus_lite`).
+        train_val_test_split: three fractions of the dataset.
+        buffer_size: shuffle buffer size, in batches.
+        label_shift: value subtracted from the mask before one-hot encoding
+                  (e.g. `1` when class ids in the files start at 1).
+        normalization: either a `(min, max)` tuple (linear rescale of
+                  `[0, dinamic_range]`) or a callable such as
+                  `model.preprocessing`.
+        dinamic_range: maximum raw pixel value (255 for 8-bit images).
+        ignore_errors: skip files that fail to decode instead of raising.
+        seed: seed of the one-off shuffle that defines the train/val/test
+              split. `None` gives a different split in every process; pass
+              an int for a reproducible split.
+    '''
     def __init__(self, dataset_path, precache=False, train_augmentations=None, val_augmentations=None, test_augmentations=None, images_dir='images', masks_dir='annotations', resize=True, width=512, height=512, batch_size=16, num_classes=2, mask_downsample=1, train_val_test_split=[0.8, 0.1, 0.1], buffer_size=4, label_shift=0, normalization=(0, 1), dinamic_range=255, ignore_errors=False, seed=None):
 
         self.ids = os.listdir(os.path.join(dataset_path, images_dir))
@@ -350,6 +411,9 @@ class SegmentationAlbumentationsDataLoader:
         self.__dict__.update(state)
 
     def get_class_weights(self):
+        '''Inverse-frequency class weights, normalized to sum to 1, computed by
+        scanning the whole dataset once.
+        '''
         h = None
         for f in tqdm(self.labels):
             m = Image.open(f).resize(
@@ -543,6 +607,14 @@ class SegmentationAlbumentationsDataLoader:
         return dataset
 
     def build_datasets(self):
+        '''Split the file list into train/val/test and build the three `tf.data`
+        pipelines (decode, resize, shuffle, batch, augment, normalize).
+
+        Output
+        ----------
+            (train_dataset, val_dataset, test_dataset); also stored in
+            `self.datasets['train' | 'val' | 'test']`.
+        '''
         dataset = tf.data.Dataset.from_tensor_slices(
             (self.images, self.labels)
         )
@@ -567,6 +639,9 @@ class SegmentationAlbumentationsDataLoader:
     def show_images(self,  num_images=4, dset='train',):
 
         # extract 1 batch from the dataset
+        '''Plot `num_images` samples (image and label) of one batch of split
+        `dset`. Call `build_datasets()` first.
+        '''
         res = next(self.datasets[dset].__iter__())
 
         images = (res[0] - self.normalized_dynamic_range[0]) * \
@@ -586,6 +661,10 @@ class SegmentationAlbumentationsDataLoader:
     def show_results(self, model, num_images=4, dset='test', output=None):
 
         # extract 1 batch from the dataset
+        '''Plot predictions of `model` against the reference labels for
+        `num_images` samples of one batch of split `dset`. For multi-output
+        models pass the index of the output to show as `output`.
+        '''
         res = next(self.datasets[dset].__iter__())
 
         images = res[0]
@@ -610,6 +689,42 @@ class SegmentationAlbumentationsDataLoader:
 
 class ClassificationAlbumentationsDataLoader:
 
+    '''`tf.data` input pipeline for image classification with albumentations
+    augmentation.
+
+    Expected layout (one sub-directory per class; nested directories are
+    walked)::
+
+        dataset_path/
+            class_a/  *.jpg ...
+            class_b/  *.jpg ...
+
+    Class ids are assigned in alphabetical order of the directory names and
+    are available as `classes_map` / `reverse_classes_map`; `num_classes` is
+    derived from the directory count. `build_datasets()` returns
+    `(train, val, test)` datasets of `(image, one_hot_label)` batches.
+
+    The augmentation worker pool, the `normalization` argument, the `seed`
+    behaviour and the known limitations are the same as for
+    `SegmentationAlbumentationsDataLoader`.
+
+    Input
+    ----------
+        dataset_path: root directory containing one folder per class.
+        precache: decode and resize the whole dataset once and cache it.
+        train_augmentations, val_augmentations, test_augmentations: an
+                  `albumentations.Compose` per split, or `None`.
+        width, height: network input size.
+        batch_size: batch size (the last partial batch is dropped).
+        train_val_test_split: three fractions of the dataset.
+        buffer_size: shuffle buffer size, in batches.
+        normalization: `(min, max)` tuple or a callable such as
+                  `model.preprocessing`.
+        dinamic_range: maximum raw pixel value (255 for 8-bit images).
+        ignore_errors: skip files that fail to decode instead of raising.
+        seed: seed of the split shuffle; `None` for a different split in
+              every process.
+    '''
     def __init__(self, dataset_path, precache=False, train_augmentations=None, val_augmentations=None, test_augmentations=None, resize=True, width=512, height=512, batch_size=16, train_val_test_split=[0.8, 0.1, 0.1], buffer_size=4, normalization=(0, 1), dinamic_range=255, ignore_errors=False, seed=None):
 
         self.data_root = pathlib.Path(dataset_path)
@@ -819,6 +934,9 @@ class ClassificationAlbumentationsDataLoader:
         self.__dict__.update(state)
 
     def get_class_weights(self):
+        '''Inverse-frequency class weights, normalized to sum to 1, computed by
+        scanning the whole dataset once.
+        '''
         h = None
         for f in tqdm(self.labels):
             m = Image.open(f).resize(
@@ -999,6 +1117,14 @@ class ClassificationAlbumentationsDataLoader:
 
     def build_datasets(self):
 
+        '''Split the file list into train/val/test and build the three `tf.data`
+        pipelines (decode, resize, shuffle, batch, augment, normalize).
+
+        Output
+        ----------
+            (train_dataset, val_dataset, test_dataset); also stored in
+            `self.datasets['train' | 'val' | 'test']`.
+        '''
         dataset = self.files_ds
 
         def process_path(file_path):
@@ -1031,6 +1157,9 @@ class ClassificationAlbumentationsDataLoader:
     def show_images(self,  num_images=4, dset='train',):
 
         # extract 1 batch from the dataset
+        '''Plot `num_images` samples (image and label) of one batch of split
+        `dset`. Call `build_datasets()` first.
+        '''
         res = next(self.datasets[dset].__iter__())
 
         images = (res[0] - self.normalized_dynamic_range[0]) * \
@@ -1061,6 +1190,10 @@ class ClassificationAlbumentationsDataLoader:
     def show_results(self, model, num_images=4, dset='test', output=None):
 
         # extract 1 batch from the dataset
+        '''Plot predictions of `model` against the reference labels for
+        `num_images` samples of one batch of split `dset`. For multi-output
+        models pass the index of the output to show as `output`.
+        '''
         res = next(self.datasets[dset].__iter__())
 
         images = res[0]

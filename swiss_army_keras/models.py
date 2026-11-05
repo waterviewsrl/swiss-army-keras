@@ -1,4 +1,5 @@
-
+'''Public entry points: every full model builder of the library.
+'''
 from __future__ import absolute_import
 
 import warnings

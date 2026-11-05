@@ -133,8 +133,8 @@ Uses `qat_annotate_layer` wrapping for QAT parity, the same policy as
 BN not directly following a `Conv2D` are left unannotated (`tfmot`'s
 default scheme has no quantization config for Keras merge layers, and no
 support for a BN that doesn't directly follow a `Conv2D`/`DepthwiseConv2D`
-— both already-confirmed findings from `_model_ddrnet.py`/`_model_lr_aspp.py`
-/`_model_pp_liteseg.py`, not re-derived here).
+— both already-confirmed findings from `_model_ddrnet.py`, `_model_lr_aspp.py`
+and `_model_pp_liteseg.py`, not re-derived here).
 
 Weights: `weights=None` (random init) only, no pretrained-weight support in
 this pass — matching DDRNet's own current status, and consistent with how

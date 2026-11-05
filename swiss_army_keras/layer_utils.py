@@ -1,4 +1,7 @@
-
+'''Shared building blocks: QAT annotation helper, encoder/decoder convolution
+stacks, attention gate, ASPP, attention pooling layers (GeM, ECA, CoordAtt),
+the IQA regression head, the uint8 input wrapper and energy-score outputs.
+'''
 from __future__ import absolute_import
 
 import math
@@ -503,6 +506,8 @@ def CONV_output(X, n_labels, kernel_size=1, activation='Softmax', name='conv_out
 
 
 def dummy_preprocessing(x):
+    '''Identity preprocessing, used when a model has no backbone-specific input normalization.
+    '''
     return x
 
 

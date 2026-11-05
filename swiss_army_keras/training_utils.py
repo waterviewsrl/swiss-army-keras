@@ -1,3 +1,6 @@
+'''Training helpers: `TrainingDriver` (frozen/unfrozen fine-tuning followed by
+TFLite export), `ModelBuilder`, and layer freezing utilities.
+'''
 import os
 import datetime
 from matplotlib import pyplot as plt
@@ -28,6 +31,20 @@ def freeze_layers(model, tlist=None):
     # `tlist=[]` as a default accumulated state across calls (the same list
     # object was reused), so a second `freeze_layers` call appended to the
     # first call's history and `unfreeze_layers` popped the wrong flags.
+    '''Recursively set `trainable=False` on every layer of `model` (descending
+    into nested sub-models such as a backbone), recording each layer's
+    previous state.
+
+    Input
+    ----------
+        model: a `tf.keras.Model`.
+        tlist: internal accumulator for the recursion; leave as `None`.
+
+    Output
+    ----------
+        (model, tlist): the same model, and the list of previous `trainable`
+        flags, to be passed to `unfreeze_layers` to restore them.
+    '''
     if tlist is None:
         tlist = []
     for i in model.layers:
@@ -40,6 +57,17 @@ def freeze_layers(model, tlist=None):
 
 
 def unfreeze_layers(model, tlist):
+    '''Restore the `trainable` flags recorded by `freeze_layers`.
+
+    Input
+    ----------
+        model: the model previously passed to `freeze_layers`.
+        tlist: the list returned by `freeze_layers` (consumed in place).
+
+    Output
+    ----------
+        model: the same model with its `trainable` flags restored.
+    '''
     for i in model.layers:
         was = i.trainable
         i.trainable = tlist.pop()
@@ -51,6 +79,12 @@ def unfreeze_layers(model, tlist):
 @keras_export("keras.callbacks.WeightsModelCheckpoint")
 class WeightsModelCheckpoint(tf.keras.callbacks.ModelCheckpoint):
 
+    '''A `ModelCheckpoint` variant that always saves weights only
+    (`model.save_weights(filepath)`), on the same schedule as the parent
+    class (`save_freq='epoch'` or every N batches). Kept for backward
+    compatibility; `TrainingDriver` itself uses the stock
+    `tf.keras.callbacks.ModelCheckpoint(save_weights_only=True)`.
+    '''
     def on_train_batch_end(self, batch, logs=None):
         if self._should_save_on_batch(batch):
             self._freeze_and_save_model(
@@ -68,6 +102,16 @@ class WeightsModelCheckpoint(tf.keras.callbacks.ModelCheckpoint):
 
 class ModelBuilder:
 
+    '''Wraps a model built on some input tensor into a new model with a fresh
+    `Input` of a fixed `(width, height, channels)` shape, carrying over the
+    `preprocessing` attribute set by `backbone_zoo`.
+
+    Input
+    ----------
+        width, height, channels: shape of the new input, in that order
+            (note: used as `(width, height, channels)`, so pass square
+            sizes unless you have checked the layout).
+    '''
     def __init__(self, width, height, channels):
         self.width = width
         self.height = height
@@ -75,6 +119,15 @@ class ModelBuilder:
 
     def build(self, model):
 
+        '''Input
+        ----------
+            model: a model returned by one of the `swiss_army_keras.models`
+                   builders (must have a `preprocessing` attribute).
+
+        Output
+        ----------
+            a `tf.keras.Model` with the new input, and `preprocessing` copied.
+        '''
         input_tensor = tf.keras.layers.Input(
             shape=(self.width, self.height, self.channels))
 
@@ -88,6 +141,61 @@ class ModelBuilder:
 
 class TrainingDriver():
 
+    '''Two-phase fine-tuning driver followed by TFLite export.
+
+    `run()` performs, in order:
+
+    1. **Frozen phase**: `compile` + `fit` for `epochs` epochs with the model
+       exactly as given. Build the model with `freeze_backbone=True` so only
+       the head/decoder trains here.
+    2. **Unfrozen phase** (skipped when `unfreezed_epochs=0`): every layer is
+       made trainable with `utils.unfreeze_model` (only BatchNormalization
+       layers at the top level of the model stay frozen; those inside the
+       nested backbone become trainable too), the optimizer's slots are
+       rebuilt for the larger variable set, and the model is re-compiled and
+       fitted for `unfreezed_epochs` more epochs with the same optimizer
+       instance (so the same learning rate, unless a schedule or callback
+       changes it).
+    3. **Export**: the best weights checkpoint is reloaded and `Quantizer`
+       writes `<quantizer_name>_quant_ui8.tflite` (full integer, uint8
+       input/output) and `<quantizer_name>_quant_f16.tflite` (float16).
+
+    Callbacks installed automatically: TensorBoard
+    (`tblogs/logs_<model_name>_<UTC timestamp>`), best-only weights
+    checkpoint, best-only full-model `.h5` checkpoint, and
+    `EarlyStopping(monitor='val_loss', patience=patience,
+    restore_best_weights=True)`. User `callbacks` are appended after these.
+
+    All files are written relative to the current working directory.
+
+    Input
+    ----------
+        model: the model to train (from `swiss_army_keras.models`).
+        model_name: prefix for every output file and the TensorBoard run.
+        optimizer: a `tf.keras.optimizers.Optimizer` instance (legacy
+                   Keras 2 API), e.g. one from `swiss_army_keras.optimizers`.
+        loss: loss function (see `swiss_army_keras.losses`; wrap with
+              `losses.loss_adapter(..., from_logits=True)` for the decoders,
+              which output raw logits).
+        metrics: list of Keras metrics.
+        train_set, val_set, test_set: `tf.data.Dataset` objects yielding
+              `(images, labels)` batches, e.g. from
+              `SegmentationAlbumentationsDataLoader.build_datasets()`.
+              `test_set` is only used as the calibration set for export.
+        epochs: number of epochs for the frozen phase.
+        patience: `EarlyStopping` patience, in epochs.
+        unfreezed_epochs: epochs for the unfrozen phase; `-1` (default) means
+              "same as `epochs`", `0` skips the phase.
+        callbacks: extra Keras callbacks.
+        quant_batches: number of `test_set` batches used for calibration.
+        plot_metrics: if True, save loss/accuracy/IoU curves as
+              `<metrics_name>_<loss|acc|iou>_<frozen|unfrozen>.pdf`.
+        metrics_name: prefix for those PDFs (default: model name + timestamp).
+        checkpoint_name: prefix for the `.h5` and `.weights` checkpoints
+              (default: model name + timestamp).
+        quantizer_name: prefix for the `.tflite` files (default: model name
+              + timestamp).
+    '''
     def __init__(self, model, model_name, optimizer, loss, metrics, train_set, val_set, test_set, epochs, patience=20, unfreezed_epochs=-1, callbacks=(), quant_batches=1, plot_metrics=True, metrics_name=None, checkpoint_name=None, quantizer_name=None):
         self.model = model
         self.model_name = model_name
@@ -144,6 +252,10 @@ class TrainingDriver():
 
     def run(self):
 
+        '''Run the frozen phase, the optional unfrozen phase and the TFLite export
+        (see the class docstring). Blocking; returns nothing. The trained model
+        is available afterwards as `self.model`.
+        '''
         self.model.compile(loss=self.loss,
                            optimizer=self.optimizer,
                            metrics=self.metrics)
@@ -172,8 +284,11 @@ class TrainingDriver():
                     plt.xlabel('epochs')
                     plt.legend(legend, loc='upper left')
                     filename = self.metrics_name + '_'+k+'_frozen.pdf'
-                    os.makedirs(os.path.dirname(
-                        filename), exist_ok=True)
+                    # `os.makedirs('')` raises, so with the default
+                    # (directory-less) `metrics_name` the plots were never
+                    # saved - the error was only logged below.
+                    if os.path.dirname(filename):
+                        os.makedirs(os.path.dirname(filename), exist_ok=True)
                     plt.savefig(filename)
                     plt.clf()
 
@@ -227,8 +342,8 @@ class TrainingDriver():
                         plt.xlabel('epochs')
                         plt.legend(legend, loc='upper left')
                         filename = self.metrics_name + '_'+k+'_unfrozen.pdf'
-                        os.makedirs(os.path.dirname(
-                            filename), exist_ok=True)
+                        if os.path.dirname(filename):
+                            os.makedirs(os.path.dirname(filename), exist_ok=True)
                         plt.savefig(filename)
                         plt.clf()
 

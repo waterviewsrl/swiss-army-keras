@@ -1,3 +1,6 @@
+'''Optimizers not shipped with Keras: Yogi, RectifiedAdam2, AdaBeliefOptimizer,
+AdaHessian, Lion, and the SAM (sharpness-aware minimization) wrapper.
+'''
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function

@@ -1,3 +1,6 @@
+'''TFLite export: `Quantizer` converts a trained model to full-integer (uint8
+I/O) and float16 TFLite files and can visualize their predictions.
+'''
 import tensorflow as tf
 import numpy as np
 
@@ -20,14 +23,20 @@ def visualize(**images):
 
 
 def standard_totflite(val):
+    '''Convert an image tensor normalized for a float TFLite model to a float32 numpy array.
+    '''
     return val.numpy().astype(np.float32)
 
 
 def symmetric_totflite(val):
+    '''Same as `standard_totflite`; kept as a separate entry of `totflite_dict` for symmetric (`[-1, 1]`) normalization.
+    '''
     return val.numpy().astype(np.float32)
 
 
 def ui8_totflite(val):
+    '''Convert an image tensor normalized to `[0, 1]` to the uint8 numpy array a full-integer TFLite model expects.
+    '''
     return (val*255).numpy().astype(np.uint8)
 
 
@@ -38,6 +47,41 @@ totflite_dict[1] = symmetric_totflite
 
 
 class Quantizer():
+    '''TFLite export of a trained model, in two flavours.
+
+    `quantize()` writes two files (prefix `name`, relative to the current
+    working directory):
+
+    * `<name>_quant_ui8.tflite`: full-integer model. Only
+      `TFLITE_BUILTINS_INT8` ops are allowed (conversion fails otherwise),
+      input and output tensors are `uint8`, and `batches` batches of
+      `dataset` are used as the representative (calibration) dataset.
+    * `<name>_quant_f16.tflite`: float16 weights, float32 input/output.
+
+    Models built by this library are already wrapped for quantization-aware
+    training, so the fake-quant ranges learned during training are used; the
+    representative dataset only calibrates tensors those wrappers do not
+    cover.
+
+    Current limitations (see `docs/source/deployment.rst`): weights are
+    quantized per channel (the TFLite default; a per-tensor switch for
+    targets such as the Axis ARTPEC-8 DLPU is not exposed yet), the integer
+    I/O type is fixed to uint8, and structural reparameterization
+    (`reparameterize_mobileone` etc.) is not applied automatically.
+
+    Input
+    ----------
+        dataset: a `tf.data.Dataset` yielding `(images, labels)` batches with
+                 images already normalized the way the model expects, e.g.
+                 the test set returned by a data loader's `build_datasets()`.
+        model: a `tf.keras.Model`, or the path of a saved model loadable
+               with `tf.keras.models.load_model`.
+        name: prefix of the output files.
+        append_datetime: append a local timestamp to `name`.
+        batches: number of dataset batches used for calibration.
+        weights_checkpoint_name: optional weights checkpoint to load into
+               `model` before converting (ignored when `model` is a path).
+    '''
     def __init__(self, dataset, model, name, append_datetime=True, batches=1, weights_checkpoint_name=None):
         self.dataset = dataset
         self.model = model
@@ -55,6 +99,11 @@ class Quantizer():
 
     def quantize(self):
 
+        '''Convert the model and write the `_quant_ui8.tflite` and
+        `_quant_f16.tflite` files. The converted flatbuffers are also kept in
+        `self.tflite_ui8_model` and `self.tflite_f16_model`. Sets
+        `model.trainable = False` on the model as a side effect.
+        '''
         def representative_data_gen():
             # for input_value in tf.data.Dataset.from_tensor_slices(test_input).batch(1).take(1):
             #    yield [tf.cast(input_value, tf.float32) /255.]
@@ -133,15 +182,30 @@ class Quantizer():
 
     def vizualize_ui8_results(self, num_images):
 
+        '''Run the full-integer model on `num_images` images of one dataset batch
+        and plot image, predicted mask and reference mask. Segmentation models
+        only. Call `quantize()` first.
+        '''
         self.vizualize_results(num_images, self.tflite_ui8_model, -1)
 
     def vizualize_f16_results(self, num_images):
 
+        '''Same as `vizualize_ui8_results`, for the float16 model.
+        '''
         self.vizualize_results(
             num_images, self.tflite_f16_model, self.normalization)
 
     def vizualize_results(self, num_images, model, normalization):
 
+        '''Shared implementation of the two `vizualize_*` methods.
+
+        Input
+        ----------
+            num_images: number of images of the first batch to show.
+            model: TFLite flatbuffer bytes.
+            normalization: key of `totflite_dict` selecting how a dataset image
+                           is converted to the model's input type (`-1`: uint8).
+        '''
         interpreter = tf.lite.Interpreter(model_content=model)
         interpreter.allocate_tensors()
         input_details = interpreter.get_input_details()

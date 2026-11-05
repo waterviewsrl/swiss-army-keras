@@ -1,4 +1,5 @@
-
+'''Activation layers not shipped with Keras 2: `GELU` and `Snake`.
+'''
 import tensorflow as tf
 from tensorflow import math
 from tensorflow.keras.layers import Layer
