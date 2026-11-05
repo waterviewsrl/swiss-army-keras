@@ -10,3 +10,5 @@ import os as _os
 # before `import swiss_army_keras` (or any of its submodules), this has no
 # effect and Keras 3 stays active, which breaks QAT.
 _os.environ.setdefault('TF_USE_LEGACY_KERAS', '1')
+
+__version__ = '0.11.0'

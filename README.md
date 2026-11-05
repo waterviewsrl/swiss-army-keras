@@ -23,11 +23,18 @@ The main features of the library are the following:
 
 ### Dependencies
 
-tensorflow>=2.4.1 (cpu or gpu) must be installed.
+Python >= 3.9 and tensorflow >= 2.16 (cpu or gpu). The library runs on the
+legacy Keras 2 API (`tf-keras`, installed automatically) because
+`tensorflow_model_optimization`'s quantization-aware-training layers do not
+support Keras 3 yet; `import swiss_army_keras` **before** `import tensorflow`
+so the `TF_USE_LEGACY_KERAS=1` switch takes effect (the library raises a clear
+error at import if it did not).
 
-Install the dependency git+https://github.com/waterviewsrl/efficientnet-lite-keras.git (forked from [sebastian-sz/efficientnet-lite-keras](https://github.com/sebastian-sz/efficientnet-lite-keras)  to simplify requirements and solve minor import issues):
+The optional EfficientNet-Lite B0-B4 backbones need the
+[waterviewsrl/efficientnet-lite-keras](https://github.com/waterviewsrl/efficientnet-lite-keras)
+fork (Python <= 3.11 only):
 
-    pip3 install git+https://github.com/waterviewsrl/efficientnet-lite-keras.git
+    pip3 install "swiss-army-keras[efficientnet-lite]"
 
 ### Install with pip
 

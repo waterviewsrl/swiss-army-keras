@@ -3,9 +3,8 @@ scipy
 Pillow
 tensorflow>=2.16
 tf-keras>=2.16
-git+https://github.com/waterviewsrl/swiss-army-keras.git
 git+https://github.com/waterviewsrl/efficientnet-lite-keras.git
-typeguard
+tensorflow_hub
 irondomo
 nbsphinx
 sphinx

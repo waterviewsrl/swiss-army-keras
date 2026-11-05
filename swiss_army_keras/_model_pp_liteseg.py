@@ -131,6 +131,16 @@ def sppm_module(x, out_channels=128, bin_sizes=(1, 2, 4), name='sppm'):
     **sum** across scales (not concat) -> one more 3x3 Conv+BN+ReLU.
     '''
     height, width = int(x.shape[1]), int(x.shape[2])
+    max_bin = max(bin_sizes)
+    if height % max_bin or width % max_bin or height < max_bin or width < max_bin:
+        raise ValueError(
+            "sppm_module: the deepest (stride-32) feature map is {}x{} but "
+            "`sppm_bin_sizes`={} needs both sides to be a positive multiple of "
+            "{} - with the default bins this means an input of at least "
+            "{}x{} (and a multiple of {}). Use a larger input or smaller "
+            "`sppm_bin_sizes`.".format(
+                height, width, tuple(bin_sizes), max_bin,
+                32 * max_bin, 32 * max_bin, 32 * max_bin))
     branches = []
     for i, bin_size in enumerate(bin_sizes):
         pool_h, pool_w = height // bin_size, width // bin_size

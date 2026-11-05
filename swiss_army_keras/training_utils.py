@@ -24,7 +24,12 @@ from tensorflow.python.util.tf_export import keras_export
 from tensorflow.keras.models import Model
 
 
-def freeze_layers(model, tlist=[]):
+def freeze_layers(model, tlist=None):
+    # `tlist=[]` as a default accumulated state across calls (the same list
+    # object was reused), so a second `freeze_layers` call appended to the
+    # first call's history and `unfreeze_layers` popped the wrong flags.
+    if tlist is None:
+        tlist = []
     for i in model.layers:
         was = i.trainable
         i.trainable = False
@@ -83,7 +88,7 @@ class ModelBuilder:
 
 class TrainingDriver():
 
-    def __init__(self, model, model_name, optimizer, loss, metrics, train_set, val_set, test_set, epochs, patience=20, unfreezed_epochs=-1, callbacks=[], quant_batches=1, plot_metrics=True, metrics_name=None, checkpoint_name=None, quantizer_name=None):
+    def __init__(self, model, model_name, optimizer, loss, metrics, train_set, val_set, test_set, epochs, patience=20, unfreezed_epochs=-1, callbacks=(), quant_batches=1, plot_metrics=True, metrics_name=None, checkpoint_name=None, quantizer_name=None):
         self.model = model
         self.model_name = model_name
         self.optimizer = optimizer
@@ -101,7 +106,7 @@ class TrainingDriver():
 
         self.callbacks = []
 
-        self.datestr = datetime.datetime.utcnow().strftime("_%Y-%m-%d_%H-%M-%S")
+        self.datestr = datetime.datetime.now(datetime.timezone.utc).strftime("_%Y-%m-%d_%H-%M-%S")
 
         self.logsname = 'tblogs/logs_'+model_name+self.datestr
         self.checkpoint_name = checkpoint_name + '.h5' if checkpoint_name is not None else model_name + \

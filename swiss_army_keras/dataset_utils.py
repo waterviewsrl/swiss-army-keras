@@ -168,7 +168,7 @@ class WorkerProcess(Process):
 
 class SegmentationAlbumentationsDataLoader:
 
-    def __init__(self, dataset_path, precache=False, train_augmentations=None, val_augmentations=None, test_augmentations=None, images_dir='images', masks_dir='annotations', resize=True, width=512, height=512, batch_size=16, num_classes=2, mask_downsample=1, train_val_test_split=[0.8, 0.1, 0.1], buffer_size=4, label_shift=0, normalization=(0, 1), dinamic_range=255, ignore_errors=False):
+    def __init__(self, dataset_path, precache=False, train_augmentations=None, val_augmentations=None, test_augmentations=None, images_dir='images', masks_dir='annotations', resize=True, width=512, height=512, batch_size=16, num_classes=2, mask_downsample=1, train_val_test_split=[0.8, 0.1, 0.1], buffer_size=4, label_shift=0, normalization=(0, 1), dinamic_range=255, ignore_errors=False, seed=None):
 
         self.ids = os.listdir(os.path.join(dataset_path, images_dir))
         self.num_classes = num_classes
@@ -227,7 +227,7 @@ class SegmentationAlbumentationsDataLoader:
         self.dinamic_range = dinamic_range
 
         if (isinstance(self.normalization, tuple)):
-            logging.warn(f'Normalizing in range: {self.normalization}')
+            logging.warning(f'Normalizing in range: {self.normalization}')
             self.normalized_dynamic_range = self.normalization
         else:
             # Probe with a real 3-channel (RGB) pixel at each endpoint, not
@@ -245,7 +245,7 @@ class SegmentationAlbumentationsDataLoader:
             mn = self.normalization(np.zeros((1, 1, 1, 3))).flatten().mean()
             mx = self.normalization(
                 np.full((1, 1, 1, 3), self.dinamic_range, dtype=np.float64)).flatten().mean()
-            logging.warn(f'Normalizing in range: {(mn, mx)}')
+            logging.warning(f'Normalizing in range: {(mn, mx)}')
             self.normalized_dynamic_range = (mn, mx)
 
         self.assert_dataset()
@@ -288,6 +288,10 @@ class SegmentationAlbumentationsDataLoader:
         self._client_lock = threading.Lock()
 
         self.ignore_errors = ignore_errors
+        # Seed for the one-off train/val/test split shuffle below. `None` keeps
+        # the historical behaviour (a different split every process); pass an
+        # int to make the split reproducible across runs.
+        self.seed = seed
 
         self._warm_up_workers()
 
@@ -335,7 +339,11 @@ class SegmentationAlbumentationsDataLoader:
 
     def __getstate__(self):
         self_dict = self.__dict__.copy()
-        del self_dict['pool']
+        # The ZMQ broker/worker handles and the socket lock are process-local
+        # and not picklable (the old code tried to drop a `pool` attribute
+        # that never existed, so pickling raised `KeyError`).
+        for k in ('pool', 'broker', 'client', '_client_lock'):
+            self_dict.pop(k, None)
         return self_dict
 
     def __setstate__(self, state):
@@ -447,7 +455,9 @@ class SegmentationAlbumentationsDataLoader:
         return aug_img, aug_msk
 
     def open_images(self, image, label):
-        img = tf.image.decode_jpeg(tf.io.read_file(image), channels=3)
+        # `decode_image` (not `decode_jpeg`) so PNG/BMP/GIF inputs work too;
+        # `expand_animations=False` keeps the output rank-3 for GIFs.
+        img = tf.image.decode_image(tf.io.read_file(image), channels=3, expand_animations=False)
 
         lbl = tf.image.decode_png(tf.io.read_file(label), channels=1)
         
@@ -537,7 +547,7 @@ class SegmentationAlbumentationsDataLoader:
             (self.images, self.labels)
         )
         dataset = dataset.shuffle(
-            len(self.images), reshuffle_each_iteration=False)
+            len(self.images), seed=self.seed, reshuffle_each_iteration=False)
         train_dataset = dataset.take(self.train_val_test_split[0])
         val_dataset = dataset.skip(self.train_val_test_split[0]).take(
             self.train_val_test_split[1])
@@ -600,7 +610,7 @@ class SegmentationAlbumentationsDataLoader:
 
 class ClassificationAlbumentationsDataLoader:
 
-    def __init__(self, dataset_path, precache=False, train_augmentations=None, val_augmentations=None, test_augmentations=None, resize=True, width=512, height=512, batch_size=16, train_val_test_split=[0.8, 0.1, 0.1], buffer_size=4, normalization=(0, 1), dinamic_range=255, ignore_errors=False):
+    def __init__(self, dataset_path, precache=False, train_augmentations=None, val_augmentations=None, test_augmentations=None, resize=True, width=512, height=512, batch_size=16, train_val_test_split=[0.8, 0.1, 0.1], buffer_size=4, normalization=(0, 1), dinamic_range=255, ignore_errors=False, seed=None):
 
         self.data_root = pathlib.Path(dataset_path)
 
@@ -694,7 +704,7 @@ class ClassificationAlbumentationsDataLoader:
         self.dinamic_range = dinamic_range
 
         if (isinstance(self.normalization, tuple)):
-            logging.warn(f'Normalizing in range: {self.normalization}')
+            logging.warning(f'Normalizing in range: {self.normalization}')
             self.normalized_dynamic_range = self.normalization
         else:
             # See the identical fix/comment in
@@ -705,7 +715,7 @@ class ClassificationAlbumentationsDataLoader:
             mn = self.normalization(np.zeros((1, 1, 1, 3))).flatten().mean()
             mx = self.normalization(
                 np.full((1, 1, 1, 3), self.dinamic_range, dtype=np.float64)).flatten().mean()
-            logging.warn(f'Normalizing in range: {(mn, mx)}')
+            logging.warning(f'Normalizing in range: {(mn, mx)}')
             self.normalized_dynamic_range = (mn, mx)
 
         randpart = b64encode(os.urandom(5), altchars=b'01').decode()
@@ -748,6 +758,10 @@ class ClassificationAlbumentationsDataLoader:
         self._client_lock = threading.Lock()
 
         self.ignore_errors = ignore_errors
+        # Seed for the one-off train/val/test split shuffle below. `None` keeps
+        # the historical behaviour (a different split every process); pass an
+        # int to make the split reproducible across runs.
+        self.seed = seed
 
         self._warm_up_workers()
 
@@ -794,7 +808,11 @@ class ClassificationAlbumentationsDataLoader:
 
     def __getstate__(self):
         self_dict = self.__dict__.copy()
-        del self_dict['pool']
+        # The ZMQ broker/worker handles and the socket lock are process-local
+        # and not picklable (the old code tried to drop a `pool` attribute
+        # that never existed, so pickling raised `KeyError`).
+        for k in ('pool', 'broker', 'client', '_client_lock'):
+            self_dict.pop(k, None)
         return self_dict
 
     def __setstate__(self, state):
@@ -901,7 +919,9 @@ class ClassificationAlbumentationsDataLoader:
         return aug_img, aug_label
 
     def open_images(self, image, label):
-        img = tf.image.decode_jpeg(tf.io.read_file(image), channels=3)
+        # `decode_image` (not `decode_jpeg`) so PNG/BMP/GIF inputs work too;
+        # `expand_animations=False` keeps the output rank-3 for GIFs.
+        img = tf.image.decode_image(tf.io.read_file(image), channels=3, expand_animations=False)
 
         def fmaker(m):
             def f(): 
@@ -991,7 +1011,7 @@ class ClassificationAlbumentationsDataLoader:
         dataset = dataset.map(process_path)
 
         dataset = dataset.shuffle(
-            len(self.files_ds), reshuffle_each_iteration=False)
+            len(self.files_ds), seed=self.seed, reshuffle_each_iteration=False)
         train_dataset = dataset.take(self.train_val_test_split[0])
         val_dataset = dataset.skip(self.train_val_test_split[0]).take(
             self.train_val_test_split[1])

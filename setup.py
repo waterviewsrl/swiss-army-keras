@@ -1,14 +1,21 @@
 from setuptools import setup, find_packages
 from codecs import open
 from os import path
+import re
 
 here = path.abspath(path.dirname(__file__))
+
+# Single source of truth for the version: swiss_army_keras/__init__.py
+# (`swiss_army_keras.__version__`), read textually so setup.py does not have
+# to import the package (and therefore TensorFlow) at build time.
+with open(path.join(here, 'swiss_army_keras', '__init__.py'), encoding='utf-8') as f:
+    _version = re.search(r"^__version__ = '([^']+)'", f.read(), re.M).group(1)
 
 with open(path.join(here, 'README.md'), encoding='utf-8') as f:
     long_description = f.read()
 
 setup(name='swiss_army_keras',
-      version='0.11.0',
+      version=_version,
       description='A collection of models and utilities for the development of edge deployable Keras models',
       long_description=long_description,
       keywords=['keras', 'segmentation', 'classification', 'finetuning', 'edge',
@@ -18,9 +25,15 @@ setup(name='swiss_army_keras',
           'License :: OSI Approved :: MIT License',
           'Intended Audience :: Developers',
           'Intended Audience :: Science/Research',
-          'Programming Language :: Python :: 3.6',
-          'Topic :: Multimedia :: Graphics'],
-      url='http://github.com/desmoteo/swiss-army-keras',
+          'Programming Language :: Python :: 3',
+          'Programming Language :: Python :: 3.9',
+          'Programming Language :: Python :: 3.10',
+          'Programming Language :: Python :: 3.11',
+          'Programming Language :: Python :: 3.12',
+          'Topic :: Scientific/Engineering :: Artificial Intelligence'],
+      url='https://github.com/waterviewsrl/swiss-army-keras',
+      # tensorflow>=2.16 itself needs >=3.9; dataclasses/f-strings rule out 3.6.
+      python_requires='>=3.9',
       author='Matteo Ferrabone',
       author_email='matteo.ferrabone@gmail.com',
       license='MIT',
@@ -40,10 +53,12 @@ setup(name='swiss_army_keras',
           # though tensorflow_model_optimization also pulls it in, since this
           # package depends on it directly, not just transitively.
           'tf-keras>=2.16',
-          'efficientnet-lite-keras @ git+https://github.com/waterviewsrl/efficientnet-lite-keras.git',
+          # `_backbone_zoo.py` imports it unconditionally (the `hub://`
+          # EfficientNet-Lite feature-vector backbones) - was never declared
+          # (ASSESSMENT.md C1).
+          'tensorflow_hub',
           'irondomo',
           'pillow',
-          'typeguard',
           'tensorflow_model_optimization',
           # Previously used unconditionally (`dataset_utils.py`,
           # `quantization_utils.py`, `training_utils.py`) but never
@@ -64,4 +79,18 @@ setup(name='swiss_army_keras',
           # `tensorflow.python.summary.tb_summary.TBNotInstalledError`.
           'tensorboard',
       ],
+      extras_require={
+          # EfficientNet-Lite B0-B4 backbones. Kept out of install_requires
+          # because (a) PyPI rejects metadata with direct VCS URLs, which made
+          # `pip install swiss-army-keras` undeliverable for 0.11.0, and (b)
+          # the fork caps Python at <=3.11; `_backbone_zoo.py` degrades
+          # gracefully (with a warning) when it is absent (ASSESSMENT.md C1).
+          'efficientnet-lite': [
+              'efficientnet-lite-keras @ git+https://github.com/waterviewsrl/efficientnet-lite-keras.git',
+          ],
+          # One-time PyTorch -> Keras weight conversion (scripts/port_*_weights.py).
+          'porting': ['torch', 'timm', 'safetensors'],
+          'docs': ['sphinx', 'sphinx_rtd_theme', 'nbsphinx'],
+          'test': ['pytest'],
+      },
       zip_safe=False)

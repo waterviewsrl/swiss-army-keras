@@ -16,7 +16,7 @@ Section 7 (evidence) carries the `file:line` pointers for every claim above it.
 | Item | State |
 |---|---|
 | Package version | 0.11.0 (`setup.py`); no `__version__` attribute in the package |
-| Branch | `v2`, one commit ahead of `main` ("V2 progress"), plus a **large uncommitted diff** (35 files, +8.4k lines: StrideFormer registration, GFL/instance-seg detection, the 4 weight-porting scripts, test additions) |
+| Branch | `v2`, one commit ahead of `main` ("V2 progress") at the time of the read, plus a **large uncommitted diff** (35 modified files, +8.4k lines) **and six source modules that had never been added to git at all** (`_model_pidnet.py`, `_model_pp_mobileseg.py`, `_backbone_strideformer.py`, `_model_depth.py`, `ood_utils.py`, `iqa_utils.py`, with their four test files). Everything was committed as `d7d6d21` on 2026-11-04 (see §8). |
 | Source | 18.4k lines in `swiss_army_keras/`; 3 files exceed 950 lines (`_model_detection.py` 2259, `losses.py` 1592, `layer_utils.py` 955) |
 | Tests | 21 files, 292 test functions, 5.5k lines; pytest + `conftest.py` forcing `TF_USE_LEGACY_KERAS=1` |
 | Test run | see §1.1 |
@@ -28,8 +28,9 @@ Section 7 (evidence) carries the `file:line` pointers for every claim above it.
 
 ### 1.1 Test suite result
 
-Filled in at the end of this assessment from the background run:
-see `§7.1`.
+**All green: 411 passed, 0 failed** (non-slow tests, about 18 minutes of CPU
+time), plus the 2 new `slow` TFLite export tests. Details and two caveats
+(one flaky test fixed, one tooling trap) in §8.2.
 
 ---
 
@@ -224,6 +225,12 @@ Ordered by how much they unlock, not by effort.
   `layer_utils.py` monkeypatches tfmot's `QuantizeWrapper`/`QuantizeLayer`
   `__init__` at import time. Make `quantize=True` a constructor argument and
   keep the patch, but apply it lazily from that path.
+- PP-LiteSeg's SPPM silently assumed the stride-32 map is divisible by its
+  largest bin (4): below a 128×128 input it crashed inside Keras with
+  "`pool_size` ... Received: (0, 0)". Found by the new TFLite export test;
+  `sppm_module` now raises a `ValueError` that states the minimum input size.
+  No decoder documents its minimum input size or stride-divisibility
+  requirement; a shared `check_input_size()` helper would make this uniform.
 - `TrainingDriver` writes to the current directory (`tblogs/`, `.h5`, `.weights`,
   `.pdf`) with no `output_dir`; saves both a full `.h5` model and a weights
   file on every improvement; always quantizes at the end; uses deprecated
@@ -338,4 +345,66 @@ Worth saying explicitly so the list above is read in proportion:
 
 ### 7.1 Test run
 
-PENDING — replaced below once the background run completes.
+Recorded in §8.2.
+
+---
+
+## 8. Actions taken on 2026-11-04 (after the assessment above was written)
+
+### 8.1 Code changes
+
+| Change | Files |
+|---|---|
+| Committed all pending work, including the six never-tracked modules | commit `d7d6d21` |
+| `.gitignore`: training/export artifacts, datasets, `tblogs/`, PDFs; un-ignored `pyproject.toml`/`setup.cfg`/`setup.py` | `.gitignore` |
+| Packaging: version read from `swiss_army_keras.__version__`; `python_requires>=3.9`; corrected classifiers and URL; declared `tensorflow_hub`; dropped unused `typeguard`; EfficientNet-Lite moved to an `[efficientnet-lite]` extra so the metadata has no direct VCS URL; `[porting]`, `[docs]`, `[test]` extras | `setup.py`, `swiss_army_keras/__init__.py`, `requirements.txt`, `README.md` |
+| Fail-fast guard: importing the package in a process where `tf.keras` is Keras 3 now raises an explicit `ImportError` with the fix, instead of an opaque tfmot error later | `swiss_army_keras/_compat.py` (new), `layer_utils.py` |
+| Data loaders: optional `seed=` for a reproducible train/val/test split; `decode_image` instead of `decode_jpeg`; `__getstate__` no longer raises `KeyError` on a non-existent `pool`; `logging.warn` → `logging.warning` | `dataset_utils.py` |
+| Training driver: `freeze_layers` mutable-default bug; `callbacks=()`; timezone-aware timestamp | `training_utils.py` |
+| PP-LiteSeg: explicit minimum-input-size `ValueError` in `sppm_module` | `_model_pp_liteseg.py` |
+| New `slow`-marked TFLite export tests: QAT decoder → full-int8 TFLite (`TFLITE_BUILTINS_INT8`, uint8 I/O) → interpreter run, non-constant output. LR-ASPP and PP-LiteSeg on MobileOne-S0 both pass. | `tests/test_tflite_export.py`, `pytest.ini` |
+
+Not done here (still open from §3): weight hosting, CI, benchmark harness,
+per-tensor quantization switch, reparameterize-before-export, detection data
+path, docs for the post-Phase-5 modules, Keras 3 decision record.
+
+### 8.2 Test run
+
+Environment: project `.venv`, Python 3.12.3, TensorFlow 2.21.0, tf-keras
+2.21.0, CPU only. No training jobs were run; every test builds
+randomly-initialised models.
+
+| Chunk | Files | Result | Time |
+|---|---|---|---|
+| A | `test_activations`, `test_backbone_*` (6 files) | 131 passed | 4m08s |
+| B | `test_classifiers`, `test_decoders` | 66 passed | 6m33s |
+| C | `test_detection`, `test_inference_utils`, `test_iqa_utils`, `test_layer_utils`, `test_losses` | 118 passed after the flaky-test fix below (117 + 1 on the first pass) | 3m43s |
+| D | `test_metrics`, `test_mixed_precision_qat`, `test_model_depth`, `test_ood_utils`, `test_optimizers`, `test_reparam_utils`, `test_utils` | 96 passed | 3m19s |
+| slow | `test_tflite_export` (new) | 2 passed | 2m27s |
+
+The suite was run in four foreground chunks because a single run takes about
+16 minutes. One earlier uninterrupted single-process run reached 84% with no
+failures before it was cut off, so nothing suggests cross-file order
+dependence, but a clean single-process run of the whole suite is still worth
+doing once in CI.
+
+Two things worth knowing:
+
+- **Flaky test, fixed.**
+  `test_coordatt_lite_gives_different_rows_different_attention_unlike_eca`
+  failed once in chunk C and passed 6/6 when rerun alone. It built an unseeded
+  random-init `CoordAttLite` and asserted two gates differ by more than 0.1%.
+  It now pins the seed. Other tests that compare values from random-init
+  layers without a seed are candidates for the same treatment.
+- **Do not edit package sources while the suite is running.** A run that
+  overlapped with an edit to `layer_utils.py` reported 18 failures in the
+  GeM/ECA/CoordAtt tests (`KeyError: '__class__'`, `math.log` on a symbolic
+  tensor). Cause: Keras autograph-converts a custom layer's `call` lazily by
+  re-reading its source from disk, so lines shifted by the edit made it
+  convert the wrong function. All 18 pass on an undisturbed tree. Not a code
+  defect, but it will confuse anyone using a file-watcher test loop.
+
+Runtime note for CI planning: the ten slowest tests take 12 to 25 seconds
+each (depth heads, static-batch detection, PIDNet). A `-m "not slow"` PR job
+of about 15 to 20 minutes on a 4-core runner is realistic; splitting by file
+across 3 or 4 jobs brings it under 7 minutes.

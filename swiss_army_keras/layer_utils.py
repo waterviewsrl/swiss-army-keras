@@ -6,6 +6,12 @@ import math
 import tensorflow as tf
 import tensorflow_model_optimization as tfmot
 
+from swiss_army_keras._compat import ensure_legacy_keras
+
+# Every decoder/head/backbone module imports this file, so this is the one
+# place a Keras-3-active process is caught before any QAT wrapping happens.
+ensure_legacy_keras()
+
 from swiss_army_keras.activations import GELU, Snake
 from tensorflow import expand_dims
 from tensorflow.compat.v1 import image

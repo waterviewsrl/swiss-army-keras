@@ -126,6 +126,10 @@ def test_coordatt_lite_gives_different_rows_different_attention_unlike_eca():
     CoordAtt losing positional information. Different content within the
     *same* image is the property that actually distinguishes it from ECA.)
     '''
+    # Seeded: with unseeded random-init weights the two row gates below
+    # occasionally land within the 0.1% tolerance by chance (e.g. the hidden
+    # ReLU dead for both rows), failing ~1 run in several (ASSESSMENT.md §8.2).
+    tf.keras.utils.set_random_seed(0)
     top_value, bottom_value = 3.0, 1.0
     x = np.zeros((1, HEIGHT, WIDTH, CHANNELS), dtype="float32")
     x[:, : HEIGHT // 2, :, :] = top_value
