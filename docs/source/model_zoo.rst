@@ -129,11 +129,14 @@ Semantic segmentation
        resolution.
    * - ``lr_aspp``
      - any registered backbone, or built-in
-     - The lightest decoder; optional ``iqa_head=True`` side output.
+     - The lightest decoder; optional ``iqa_head=True`` side output;
+       ``gate=False`` builds it without the sigmoid gate (see
+       :doc:`deployment`).
    * - ``pp_liteseg``
      - any registered backbone, or built-in
      - SPPM + UAFM fusion over three taps (``feature_levels``); input of at
-       least 128 x 128 and a multiple of 128 with the default bin sizes.
+       least 128 x 128 and a multiple of 128 with the default bin sizes;
+       ``fusion='add'`` replaces the attention fusion by an addition.
    * - ``pp_mobileseg``
      - a 3-tap backbone (designed for StrideFormer)
      - AAM fusion; ``feature_levels=(1, 2, 3)``.
@@ -280,8 +283,9 @@ Auxiliary utilities
    * - ``deploy_utils``
      - Deployment profiles, ``reparameterize_model`` (fuses the
        training-time branches of a MobileOne / FastViT / RepViT backbone
-       inside any model), ``strip_qat``, ``convert_to_tflite`` and
-       ``lint_tflite`` (see :doc:`deployment`).
+       inside any model), ``strip_qat``, ``equalize_cross_layer``,
+       ``convert_to_tflite``, ``lint_tflite`` and ``quantization_error``
+       (see :doc:`deployment`).
    * - ``reparam_utils`` and ``reparameterize_*``
      - The per-family fusion functions and kernel arithmetic that
        ``deploy_utils.reparameterize_model`` builds on.

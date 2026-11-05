@@ -29,15 +29,25 @@ Still open:
 | On-device benchmark harness and a published latency table | M |
 | Decide the future of QAT wrapping: it no longer contributes activation ranges for accelerator exports. Options: keep it as a training regularizer, make it optional per builder, or drop it in favour of post-training quantization (see section 7) | M |
 
-## 2. Make per-tensor quantization accurate
+## 2. Make quantized models accurate
+
+Done on 2026-11-05: cross-layer equalization (`equalize_cross_layer`, used by
+`Quantizer` for per-tensor profiles), an error measurement
+(`quantization_error`), gate-free options for LR-ASPP and PP-LiteSeg, and the
+root cause of the all-zero QAT output (an untrained output quantizer rounding
+tiny values; not a defect). Measurements on pretrained backbones are in
+`docs/source/deployment.rst`.
+
+Still open, in the order the measurements suggest:
 
 | Item | Effort |
 |---|---|
-| Cross-layer equalization and bias correction | M |
-| Quantization debugger report (per-layer error) | S |
-| Edge-clean builder switches: ReLU6 instead of GELU, hard-swish and swish; no squeeze-excite; channel rounding; SAME padding | M |
-| Gate-free decoder, and gate-free options for LR-ASPP and PP-LiteSeg | S |
-| Root-cause the all-zero output of QAT-wrapped linear output layers on randomly initialized MobileNetV2 | S |
+| Validate on task accuracy: train one segmentation and one classification model, export per channel and per tensor, compare with the float model (the SQNR figures are only a proxy) | M |
+| Fix post-training quantization of fused MobileOne and RepViT (noise as large as signal at the deepest tap): percentile or MSE activation calibration, bias correction, QARepVGG-style blocks, or QAT of the fused backbone | L |
+| Equalization through ReLU6 (per-channel clipping), or a ReLU variant of MobileNetV2 / EfficientNet-Lite with fine-tuning, so those backbones work per tensor | M |
+| Per-layer quantization error report (wrap `tf.lite.experimental.QuantizationDebugger`) | S |
+| Edge-clean builder switches: ReLU6 or ReLU instead of GELU, hard-swish and swish; no squeeze-excite; channel rounding; SAME padding | M |
+| A gate-free decoder designed for accelerators (feature pyramid with convolutions, 2x resizes and additions only); gate-free variants of PIDNet and PP-MobileSeg | S to M |
 
 ## 3. Ship pretrained weights
 

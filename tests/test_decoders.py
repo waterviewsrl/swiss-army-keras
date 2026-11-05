@@ -660,3 +660,35 @@ def test_aam_full_and_simplified_output_different_resolutions():
 
     simplified_out = aam_simplified(t8, t16, t32, out_channels=8, name='simplified_test')
     assert simplified_out.shape[1:3] == (32, 32), "aam_simplified should output at t8's (the finest) resolution"
+
+
+# Gate-free variants for accelerators without sigmoid / tensor-by-tensor
+# multiplication (docs/source/deployment.rst).
+
+
+def test_lr_aspp_without_gate_has_no_multiply_or_sigmoid():
+    inp = tf.keras.Input((INPUT_SIZE, INPUT_SIZE, 3))
+    model = lr_aspp(inp, n_labels=N_LABELS, backbone="MobileNetV4-Conv-S", weights=None, freeze_backbone=False, gate=False)
+    names = [l.name for l in model.layers]
+    assert not any("gate" in n or "gap" in n for n in names), names
+    assert not any(isinstance(l, tf.keras.layers.Multiply) for l in model.layers)
+    out = model.predict(_random_batch(), verbose=0)
+    assert out.shape == (2, INPUT_SIZE, INPUT_SIZE, N_LABELS)
+    assert np.all(np.isfinite(out))
+    # the default keeps the gate
+    gated = lr_aspp(tf.keras.Input((INPUT_SIZE, INPUT_SIZE, 3)), n_labels=N_LABELS, backbone="MobileNetV4-Conv-S", weights=None)
+    assert any(isinstance(l, tf.keras.layers.Multiply) for l in gated.layers)
+
+
+def test_pp_liteseg_additive_fusion_builds_without_attention_layers():
+    inp = tf.keras.Input((INPUT_SIZE, INPUT_SIZE, 3))
+    model = pp_liteseg(inp, n_labels=N_LABELS, backbone="MobileNetV4-Conv-S", weights=None, freeze_backbone=False, fusion="add")
+    names = [l.name for l in model.layers]
+    assert not any("atten" in n or "blend" in n for n in names), names
+    assert any(n.endswith("uafm16_add") for n in names) and any(n.endswith("uafm8_add") for n in names)
+    out = model.predict(_random_batch(), verbose=0)
+    assert out.shape == (2, INPUT_SIZE, INPUT_SIZE, N_LABELS)
+    assert np.all(np.isfinite(out))
+    with pytest.raises(ValueError, match="fusion"):
+        pp_liteseg(tf.keras.Input((INPUT_SIZE, INPUT_SIZE, 3)), n_labels=N_LABELS, backbone="MobileNetV4-Conv-S", weights=None, fusion="concat")
+

@@ -23,6 +23,10 @@ Always `import swiss_army_keras` before `import tensorflow` (see the README).
   values produced by randomly initialized layers.
 - Assert more than finiteness: a degenerate all-zero output is finite.
   Prefer "output is not constant" or a numeric reference.
+- An untrained QAT-wrapped model can legitimately output exact zeros (its
+  output quantizer rounds to steps of 12/255). When a test needs
+  non-degenerate values from a random model, assert on
+  `deploy_utils.strip_qat(model)` or on the nested backbone.
 - Every new head or backbone family gets a case in
   `tests/test_tflite_export.py`.
 - Export behaviour (profiles, lint, QAT stripping, reparameterization) is

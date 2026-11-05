@@ -8,6 +8,7 @@ Typical use (also what `quantization_utils.Quantizer` does)::
     from swiss_army_keras import deploy_utils
 
     plain = deploy_utils.strip_qat(deploy_utils.reparameterize_model(model))
+    deploy_utils.equalize_cross_layer(plain)          # for per-tensor targets
     tflite = deploy_utils.convert_to_tflite(plain, representative_dataset, profile='artpec8')
     report = deploy_utils.lint_tflite(tflite, profile='artpec8')
     print(report)
@@ -396,6 +397,296 @@ def strip_qat(model):
     if hasattr(model, 'preprocessing'):
         stripped.preprocessing = model.preprocessing
     return stripped
+
+
+# ========================= #
+# Cross-layer equalization
+
+@dataclass
+class EqualizationResult:
+    '''Outcome of `equalize_cross_layer`.
+
+    `pairs` is the number of consecutive layer pairs that were equalized,
+    `iterations` how many sweeps were run, `max_scale` the largest
+    per-channel rescaling factor applied (or its inverse, whichever is
+    larger), and `restore()` puts the original weights back.
+    '''
+    pairs: int
+    iterations: int
+    max_scale: float
+    _saved: list = field(default_factory=list, repr=False)
+
+    def restore(self):
+        '''Put back the weights the model had before equalization.'''
+        for layer, weights in self._saved:
+            layer.set_weights(weights)
+        self._saved = []
+
+
+def _is_plain_relu_or_identity(layer):
+    L = tf.keras.layers
+    if isinstance(layer, (L.ZeroPadding2D, L.Dropout)):
+        return True
+    if isinstance(layer, L.Activation):
+        return layer.activation in (tf.keras.activations.relu, tf.keras.activations.linear)
+    if isinstance(layer, L.ReLU):
+        return layer.max_value is None and not layer.negative_slope and not layer.threshold
+    return False
+
+
+def _is_equalizable_conv(layer):
+    L = tf.keras.layers
+    if isinstance(layer, L.DepthwiseConv2D):
+        return layer.depth_multiplier == 1
+    if type(layer) is L.Conv2D:
+        return layer.groups == 1
+    return False
+
+
+def _equalization_pairs(model, pairs=None):
+    '''Find `conv -> [batch norm] -> [relu / padding]* -> conv` chains in
+    which every intermediate tensor has exactly one consumer.'''
+    L = tf.keras.layers
+    pairs = [] if pairs is None else pairs
+    if not hasattr(model, '_nodes_by_depth'):
+        return pairs
+
+    consumers = collections.defaultdict(list)
+    for nodes in model._nodes_by_depth.values():
+        for node in nodes:
+            for tensor in tf.nest.flatten(node.keras_inputs):
+                consumers[id(tensor)].append(node)
+    external = {id(t) for t in tf.nest.flatten(model.outputs)}
+
+    def single_consumer(tensor):
+        users = consumers.get(id(tensor), [])
+        if id(tensor) in external or len(users) != 1:
+            return None
+        node = users[0]
+        if len(tf.nest.flatten(node.keras_inputs)) != 1:
+            return None
+        return node
+
+    for nodes in model._nodes_by_depth.values():
+        for node in nodes:
+            layer = node.layer
+            if not _is_equalizable_conv(layer):
+                continue
+            if layer.activation not in (tf.keras.activations.relu, tf.keras.activations.linear):
+                continue
+            outputs = tf.nest.flatten(node.outputs)
+            if len(outputs) != 1:
+                continue
+            nxt = single_consumer(outputs[0])
+            bn = None
+            if nxt is not None and isinstance(nxt.layer, L.BatchNormalization):
+                bn = nxt.layer
+                if not bn.scale:
+                    continue
+                nxt = single_consumer(tf.nest.flatten(nxt.outputs)[0])
+            while nxt is not None and _is_plain_relu_or_identity(nxt.layer):
+                nxt = single_consumer(tf.nest.flatten(nxt.outputs)[0])
+            if nxt is None or not _is_equalizable_conv(nxt.layer):
+                continue
+            pairs.append((layer, bn, nxt.layer))
+
+    for layer in model.layers:
+        if isinstance(layer, tf.keras.Model):
+            _equalization_pairs(layer, pairs)
+    return pairs
+
+
+def _bn_gain(bn):
+    '''Per-channel multiplier a batch norm applies at inference.'''
+    return bn.gamma.numpy() / np.sqrt(bn.moving_variance.numpy() + bn.epsilon)
+
+
+def equalize_cross_layer(model, max_iterations=40, tolerance=1e-3):
+    '''
+    Cross-layer equalization (Nagel et al., 2019, "Data-Free Quantization
+    Through Weight Equalization and Bias Correction").
+
+    For two consecutive convolutions separated only by a ReLU, output
+    channel `i` of the first can be divided by any positive `s_i` and input
+    channel `i` of the second multiplied by `s_i` without changing what the
+    network computes. Choosing `s_i` so that both layers end up with the
+    same weight range in that channel evens out the per-channel ranges
+    inside each weight tensor, which is what **per-tensor** quantization
+    needs: with one scale for the whole tensor, a single channel with large
+    weights would otherwise cost every other channel its resolution.
+    Depthwise and reparameterized (fused) networks are the typical victims.
+
+    What is equalized: every chain
+    `Conv2D | DepthwiseConv2D -> [BatchNormalization] -> [ReLU | ZeroPadding2D]* -> Conv2D | DepthwiseConv2D`
+    whose intermediate tensors have a single consumer and are not model
+    outputs (so backbone feature taps, residual branches, squeeze-excite
+    gates and concatenations are left alone), inside the model and any
+    nested sub-model. Chains through ReLU6 or other non-homogeneous
+    activations are skipped. Weights are modified **in place**; the model
+    must not contain QAT wrappers (apply `strip_qat` first).
+
+    Input
+    ----------
+        model: a plain float `tf.keras.Model` (functional).
+        max_iterations: maximum number of sweeps over all pairs.
+        tolerance: stop when no scaling factor differs from 1 by more than
+                   this (relative).
+
+    Output
+    ----------
+        an `EqualizationResult`. Its `restore()` method puts the original
+        weights back, which matters when layers are shared with a model
+        that is still being trained.
+    '''
+    if has_qat_layers(model):
+        raise ValueError('equalize_cross_layer needs a plain model; apply strip_qat() first.')
+    L = tf.keras.layers
+    pairs = _equalization_pairs(model)
+    result = EqualizationResult(pairs=len(pairs), iterations=0, max_scale=1.0)
+    if not pairs:
+        return result
+
+    # the batch norm (if any) that follows each convolution, for its effective weight range
+    bn_after = {id(first): bn for first, bn, _ in pairs if bn is not None}
+    touched = {}
+    for first, bn, second in pairs:
+        for layer in (first, bn, second):
+            if layer is not None and id(layer) not in touched:
+                touched[id(layer)] = (layer, layer.get_weights())
+    result._saved = list(touched.values())
+
+    def kernel_of(layer):
+        return layer.depthwise_kernel if isinstance(layer, L.DepthwiseConv2D) else layer.kernel
+
+    def out_range(layer, bn):
+        kernel = np.abs(kernel_of(layer).numpy())
+        r = kernel.max(axis=(0, 1, 3)) if isinstance(layer, L.DepthwiseConv2D) else kernel.max(axis=(0, 1, 2))
+        return r if bn is None else r * np.abs(_bn_gain(bn))
+
+    def in_range(layer):
+        kernel = np.abs(kernel_of(layer).numpy())
+        bn = bn_after.get(id(layer))
+        if bn is not None:
+            gain = np.abs(_bn_gain(bn))
+            # depthwise: (kh, kw, c, 1), output channel = input channel; regular: (kh, kw, cin, cout)
+            kernel = kernel * (gain[None, None, :, None] if isinstance(layer, L.DepthwiseConv2D) else gain[None, None, None, :])
+        return kernel.max(axis=(0, 1, 3))
+
+    for iteration in range(max_iterations):
+        worst = 0.0
+        for first, bn, second in pairs:
+            r1, r2 = out_range(first, bn), in_range(second)
+            valid = (r1 > 1e-12) & (r2 > 1e-12)
+            scale = np.ones_like(r1)
+            scale[valid] = np.sqrt(r1[valid] / r2[valid])
+            deviation = float(np.abs(np.log(scale)).max())
+            worst = max(worst, deviation)
+            result.max_scale = max(result.max_scale, float(np.exp(deviation)))
+
+            # first layer: divide output channel i by scale_i
+            if bn is not None:
+                bn.gamma.assign(bn.gamma.numpy() / scale)
+                if bn.center:
+                    bn.beta.assign(bn.beta.numpy() / scale)
+            else:
+                if isinstance(first, L.DepthwiseConv2D):
+                    first.depthwise_kernel.assign(first.depthwise_kernel.numpy() / scale[None, None, :, None])
+                else:
+                    first.kernel.assign(first.kernel.numpy() / scale[None, None, None, :])
+                if first.use_bias:
+                    first.bias.assign(first.bias.numpy() / scale)
+            # second layer: multiply input channel i by scale_i
+            kernel = kernel_of(second)
+            kernel.assign(kernel.numpy() * scale[None, None, :, None])
+        result.iterations = iteration + 1
+        if worst < tolerance:
+            break
+    return result
+
+
+# ========================= #
+# Measuring quantization error
+
+def quantization_error(model, tflite_model, inputs):
+    '''
+    Compare a float Keras model with its quantized TFLite export on the same
+    inputs.
+
+    Input
+    ----------
+        model: the float `tf.keras.Model` the flatbuffer was converted from
+               (single input).
+        tflite_model: the flatbuffer `bytes` (integer or float input/output).
+        inputs: a float array `(N, H, W, C)` in the model's input domain
+                (already normalized).
+
+    Output
+    ----------
+        a list with one dict per model output, in the order of
+        `model.outputs`: `sqnr_db` (signal-to-quantization-noise ratio,
+        higher is better; each 6 dB is roughly one more bit of precision),
+        `rmse`, `max_abs_error`, and `float_std` (spread of the reference
+        output, for scale).
+    '''
+    # Called directly, in chunks, rather than through `model.predict`: predict
+    # caches a traced function that would not see weights or layer attributes
+    # changed since the last call (e.g. by `equalize_cross_layer`).
+    inputs = np.asarray(inputs, dtype=np.float32)
+    chunks = []
+    for start in range(0, len(inputs), 16):
+        out = model(inputs[start:start + 16], training=False)
+        chunks.append([np.asarray(t) for t in (out if isinstance(out, (list, tuple)) else [out])])
+    reference = [np.concatenate([c[k] for c in chunks]) for k in range(len(chunks[0]))]
+
+    interpreter = _interpreter(tflite_model)
+    interpreter.allocate_tensors()
+    in_detail = interpreter.get_input_details()[0]
+    out_details = interpreter.get_output_details()
+
+    def to_input(x):
+        if in_detail['dtype'] in (np.uint8, np.int8):
+            scale, zero = in_detail['quantization']
+            info = np.iinfo(in_detail['dtype'])
+            return np.clip(np.round(x / scale + zero), info.min, info.max).astype(in_detail['dtype'])
+        return x.astype(in_detail['dtype'])
+
+    def from_output(detail):
+        y = interpreter.get_tensor(detail['index'])
+        if detail['dtype'] in (np.uint8, np.int8):
+            scale, zero = detail['quantization']
+            return (y.astype(np.float32) - zero) * scale
+        return y.astype(np.float32)
+
+    collected = [[] for _ in out_details]
+    for sample in inputs:
+        interpreter.set_tensor(in_detail['index'], to_input(sample[None]))
+        interpreter.invoke()
+        for k, detail in enumerate(out_details):
+            collected[k].append(from_output(detail)[0])
+    quantized = [np.stack(c) for c in collected]
+
+    # TFLite does not guarantee the Keras output order: match by shape.
+    order, used = [], set()
+    for ref in reference:
+        match = next((k for k, q in enumerate(quantized) if k not in used and q.shape == ref.shape), None)
+        if match is None:
+            raise ValueError('Cannot match TFLite outputs {} to Keras outputs {}'.format(
+                [q.shape for q in quantized], [r.shape for r in reference]))
+        used.add(match)
+        order.append(match)
+
+    report = []
+    for ref, k in zip(reference, order):
+        err = quantized[k] - ref
+        signal = float(np.sum(ref.astype(np.float64) ** 2))
+        noise = float(np.sum(err.astype(np.float64) ** 2))
+        report.append({
+            'sqnr_db': float('inf') if noise == 0 else float(10.0 * np.log10(max(signal, 1e-30) / noise)),
+            'rmse': float(np.sqrt(np.mean(err ** 2))),
+            'max_abs_error': float(np.abs(err).max()),
+            'float_std': float(ref.std()),
+        })
+    return report
 
 
 # ========================= #

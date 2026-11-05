@@ -160,7 +160,7 @@ def sppm_module(x, out_channels=128, bin_sizes=(1, 2, 4), name='sppm'):
     return _conv_bn_act(summed, out_channels, kernel_size=3, name=f'{name}_out')
 
 
-def uafm_block(low_feature, high_feature, out_channels, name='uafm'):
+def uafm_block(low_feature, high_feature, out_channels, name='uafm', attention=True):
     '''One UAFM (`UAFM_SpAtten`) stage: fuses a high-resolution "detail"
     skip feature (`low_feature`) with an already-fused, lower-resolution
     "semantic" feature (`high_feature`, upsampled here to match) via a
@@ -175,6 +175,12 @@ def uafm_block(low_feature, high_feature, out_channels, name='uafm'):
               low_feature.shape[2] // high_feature.shape[2]),
         interpolation='bilinear', name=f'{name}_prepare_y',
     ))(high_feature)
+
+    if not attention:
+        # Plain additive fusion: no channel statistics, sigmoid or blending,
+        # so only convolutions, a resize and an addition are exported.
+        fused = Add(name=f'{name}_add')([x_proj, y_up])
+        return _conv_bn_act(fused, out_channels, kernel_size=3, name=f'{name}_conv_out')
 
     atten_maps = ChannelMeanMaxConcat(name=f'{name}_atten_maps')([x_proj, y_up])
     atten = _conv_bn_act(atten_maps, 2, kernel_size=3, name=f'{name}_atten_conv1')
@@ -196,7 +202,7 @@ def pp_liteseg(input_tensor, n_labels, filter_num_down=[64, 128, 256, 512, 1024]
                arm_out_channels=(64, 96), seg_head_mid_channels=64,
                stack_num_down=2, activation='ReLU', batch_norm=False, pool=True,
                backbone=None, weights='imagenet', freeze_backbone=True, freeze_batch_norm=True,
-               name='pp_liteseg'):
+               name='pp_liteseg', fusion='uafm'):
     '''PP-LiteSeg with UAFM (Liu et al., 2022) segmentation decoder.
 
     Input
@@ -237,12 +243,21 @@ def pp_liteseg(input_tensor, n_labels, filter_num_down=[64, 128, 256, 512, 1024]
         freeze_backbone: `True` to freeze the backbone's weights.
         freeze_batch_norm: `True` to also freeze the backbone's BN layers.
         name: prefix of the created Keras model and its layers.
+        fusion: `'uafm'` (default) for the paper's attention fusion (channel
+                mean/max statistics, sigmoid, blending), or `'add'` for a
+                plain additive fusion of the two features. `'add'` exports
+                only convolutions, resizes and additions in the fusion
+                stages, for accelerators that do not run the attention
+                operators (see the deployment guide). It is a different
+                architecture and has to be trained as such.
 
     Output
     ----------
         A `tf.keras.Model` with a `.preprocessing` attribute, producing an
         `(H, W, n_labels)` logit map at the input's spatial resolution.
     '''
+    if fusion not in ('uafm', 'add'):
+        raise ValueError("`fusion` must be 'uafm' or 'add', got {!r}".format(fusion))
 
     depth_ = len(filter_num_down)
     X_encoder = []
@@ -269,8 +284,10 @@ def pp_liteseg(input_tensor, n_labels, filter_num_down=[64, 128, 256, 512, 1024]
 
     high_feat = sppm_module(x32, out_channels=sppm_out_channels, bin_sizes=sppm_bin_sizes,
                             name='{}_sppm'.format(name))
-    high_feat = uafm_block(x16, high_feat, out_channels=arm_out_channels[1], name='{}_uafm16'.format(name))
-    high_feat = uafm_block(x8, high_feat, out_channels=arm_out_channels[0], name='{}_uafm8'.format(name))
+    high_feat = uafm_block(x16, high_feat, out_channels=arm_out_channels[1], name='{}_uafm16'.format(name),
+                           attention=(fusion == 'uafm'))
+    high_feat = uafm_block(x8, high_feat, out_channels=arm_out_channels[0], name='{}_uafm8'.format(name),
+                           attention=(fusion == 'uafm'))
 
     x = seg_head(high_feat, n_labels, mid_channels=seg_head_mid_channels, name='{}_seghead'.format(name))
 

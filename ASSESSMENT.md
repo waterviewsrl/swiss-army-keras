@@ -507,3 +507,40 @@ Findings made while building it:
 - Not verified: accuracy of the per-tensor post-training export on a trained
   model. No training was run. This needs a real dataset and, for ARTPEC
   targets, a device.
+
+---
+
+## 11. Follow-up on 2026-11-05: quantization accuracy
+
+| Change | Where |
+|---|---|
+| `equalize_cross_layer`: cross-layer equalization on plain models, through batch norm, ReLU and padding, inside nested backbones; in place, with `restore()` | `swiss_army_keras/deploy_utils.py` |
+| `quantization_error`: SQNR, RMSE and maximum error of a TFLite export against the float model, per output | same |
+| `Quantizer(equalize=)`: on by default for per-tensor profiles after stripping; original weights restored after conversion | `quantization_utils.py`, `training_utils.py` |
+| `lr_aspp(gate=False)`, `pp_liteseg(fusion='add')`: variants without sigmoid gating | `_model_lr_aspp.py`, `_model_pp_liteseg.py` |
+| Tests: 5 new fast tests for equalization and error measurement, 2 decoder tests, 2 slow export tests | `tests/` |
+
+Findings:
+
+- **Critical point C5 is explained, and is not a defect.** The all-zero
+  output of QAT-wrapped heads on a randomly initialized MobileNetV2 comes
+  from the untrained output quantizer: its initial range of -6 to 6 rounds
+  to steps of 12/255, and that model's float logits are around 0.001. The
+  stripped float model produces the expected small, non-constant values.
+- **Measured on ImageNet-pretrained weights** (Pets images, feature-level
+  SQNR; full table in `docs/source/deployment.rst`):
+  - Equalization preserves the float function (relative change about 1e-5)
+    and lifts per-tensor MobileNetV4-Conv-S from 6.7 to 14.6 dB at the
+    deepest tap, close to its per-channel 19.2 dB.
+  - Fusing MobileOne improves its quantization quality, so fusing by default
+    is right. But fused MobileOne and RepViT stay near 3 dB at the deepest
+    tap even per channel: post-training quantization of the reparameterized
+    families is poor.
+  - MobileNetV2 falls to about -3 dB per tensor and cannot be equalized
+    because of ReLU6. Replacing ReLU6 by ReLU is not an option for the Keras
+    weights: it changes the features by 50 to 110%.
+- **Practical consequence for Axis ARTPEC-8:** MobileNetV4-Conv with
+  equalization is the best-measured backbone in the library today.
+- **Not verified:** task accuracy. These are feature-level proxies on 48
+  images with no trained head. A trained model per profile is the next
+  measurement to make (roadmap section 2).

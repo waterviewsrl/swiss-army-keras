@@ -167,3 +167,43 @@ def test_quantizer_end_to_end_for_an_accelerator_profile(tmp_path):
     # default profile keeps the historical behaviour (QAT wrappers kept)
     assert Quantizer(dataset, model, str(tmp_path / "d"), append_datetime=False).strip_qat is False
 
+
+@pytest.mark.slow
+def test_gate_free_lr_aspp_export_has_no_gate_operators():
+    """`lr_aspp(gate=False)` exists for accelerators that do not run global
+    pooling, sigmoid or tensor-by-tensor multiplication."""
+    from swiss_army_keras import deploy_utils as du
+
+    inp = tf.keras.Input((INPUT_SIZE, INPUT_SIZE, 3))
+    model = lr_aspp(inp, n_labels=N_LABELS, backbone="MobileNetV4-Conv-S", weights=None, freeze_backbone=False, gate=False)
+    export_model = du.strip_qat(model)
+    report = du.lint_tflite(du.convert_to_tflite(export_model, _ptq_representative, profile="artpec9"), profile="artpec9")
+    assert report.errors == [], str(report)
+    for op in ("LOGISTIC", "MUL", "AVERAGE_POOL_2D", "MEAN"):
+        assert op not in report.ops, str(report)
+    assert not any("MUL" in w for w in report.warnings), str(report)
+
+
+@pytest.mark.slow
+def test_quantizer_equalizes_for_per_tensor_profiles_and_restores_weights(tmp_path):
+    from swiss_army_keras.quantization_utils import Quantizer
+
+    inp = tf.keras.Input((INPUT_SIZE, INPUT_SIZE, 3))
+    model = lr_aspp(inp, n_labels=N_LABELS, backbone="MobileNetV4-Conv-S", weights=None, freeze_backbone=False)
+    weights_before = [w.copy() for w in model.get_weights()]
+    images = np.random.rand(4, INPUT_SIZE, INPUT_SIZE, 3).astype("float32")
+    labels = np.zeros((4, INPUT_SIZE, INPUT_SIZE, N_LABELS), dtype="float32")
+    dataset = tf.data.Dataset.from_tensor_slices((images, labels)).batch(2)
+
+    per_tensor = Quantizer(dataset, model, str(tmp_path / "a8"), append_datetime=False, profile="artpec8")
+    assert per_tensor.equalize is True
+    per_tensor.quantize()
+    assert per_tensor.equalization is not None and per_tensor.equalization.pairs > 10
+    assert per_tensor.lint_report.errors == [], str(per_tensor.lint_report)
+    # MobileNetV4's backbone is shared with the training model: its weights must be back
+    for a, b in zip(weights_before, model.get_weights()):
+        np.testing.assert_array_equal(a, b)
+
+    assert Quantizer(dataset, model, str(tmp_path / "a9"), append_datetime=False, profile="artpec9").equalize is False
+    assert Quantizer(dataset, model, str(tmp_path / "d"), append_datetime=False).equalize is False
+

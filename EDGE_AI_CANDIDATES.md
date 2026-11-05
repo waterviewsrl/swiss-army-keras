@@ -73,6 +73,19 @@ The recommended order is in section 6.
 > pipeline evaluation" of section 4.1 more pressing: on Axis targets the
 > library already is a PTQ pipeline. Sections 3 and 4 describe the state
 > before this change.
+>
+> **Second update, same day.** Cross-layer equalization, an error
+> measurement and gate-free variants of LR-ASPP and PP-LiteSeg are
+> implemented. Measurements on ImageNet-pretrained backbones (table in
+> `docs/source/deployment.rst`) refine section 3: MobileNetV4-Conv-S is the
+> only custom backbone that keeps good feature quality after post-training
+> quantization, and with equalization it is the best per-tensor choice.
+> Fused MobileOne and RepViT have the right operators but quantize poorly
+> (noise as large as signal at the deepest tap, even per channel), and
+> MobileNetV2 collapses per tensor because ReLU6 blocks equalization. This
+> raises the priority of QARepVGG-style blocks and of better activation
+> calibration, and it means the "Good" ratings of fused MobileOne and
+> MobileNetV2 in the section 3 table hold for operator support only.
 
 ---
 

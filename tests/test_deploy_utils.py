@@ -252,3 +252,115 @@ def test_reparameterize_model_accepts_a_standalone_backbone():
     a, b = backbone.predict(x, verbose=0), fused.predict(x, verbose=0)
     assert np.abs(a - b).max() <= 2e-3 * np.abs(a).max()
     assert du.reparameterize_model(fused) is fused
+
+
+# --------------------------------------------------------------------------- #
+# cross-layer equalization and quantization error
+
+
+def _unbalanced_chain(final_relu6=False):
+    """conv -> BN -> ReLU -> depthwise -> ReLU -> conv, where some channels
+    of the first two layers are deliberately 100x larger than others (and
+    the next layer compensates), the situation per-tensor quantization
+    cannot represent."""
+    tf.keras.utils.set_random_seed(0)
+    rng = np.random.default_rng(0)
+    inp = tf.keras.Input((SIZE, SIZE, 3))
+    x = L.Conv2D(16, 3, padding="same", use_bias=False, name="c1")(inp)
+    x = L.BatchNormalization(name="bn1")(x)
+    x = L.ReLU(6.0, name="r1")(x) if final_relu6 else L.Activation("relu", name="r1")(x)
+    x = L.ZeroPadding2D(1, name="pad")(x)
+    x = L.DepthwiseConv2D(3, padding="valid", name="dw")(x)
+    x = L.Activation("relu", name="r2")(x)
+    out = L.Conv2D(8, 1, name="c3")(x)
+    model = tf.keras.Model(inp, out)
+
+    spread = np.where(np.arange(16) % 4 == 0, 30.0, 0.3).astype("float32")
+    bn = model.get_layer("bn1")
+    bn.set_weights([spread, rng.normal(0, 0.1, 16).astype("float32"),
+                    rng.normal(0, 0.1, 16).astype("float32"), np.ones(16, "float32")])
+    dw = model.get_layer("dw")
+    k, b = dw.get_weights()
+    dw.set_weights([k / spread[None, None, :, None] * spread[::-1][None, None, :, None], b])
+    c3 = model.get_layer("c3")
+    k, b = c3.get_weights()
+    c3.set_weights([k / spread[::-1][None, None, :, None], b])
+    return model
+
+
+def test_equalization_preserves_the_function_and_can_be_restored():
+    model = _unbalanced_chain()
+    x = np.random.default_rng(1).random((4, SIZE, SIZE, 3), dtype=np.float32)
+    before = model(x, training=False).numpy()
+    original = [w.copy() for w in model.get_weights()]
+
+    result = du.equalize_cross_layer(model)
+    assert result.pairs == 2                      # (c1+bn1 -> dw) and (dw -> c3)
+    assert result.iterations >= 1 and result.max_scale > 5
+    after = model(x, training=False).numpy()
+    np.testing.assert_allclose(after, before, rtol=1e-3, atol=1e-4 * np.abs(before).max())
+    assert any(not np.allclose(a, b) for a, b in zip(original, model.get_weights()))
+
+    # per-channel weight ranges inside the depthwise kernel are now similar
+    dw_range = np.abs(model.get_layer("dw").get_weights()[0]).max(axis=(0, 1, 3))
+    assert dw_range.max() / dw_range.min() < 30
+
+    result.restore()
+    for a, b in zip(original, model.get_weights()):
+        np.testing.assert_array_equal(a, b)
+
+
+def test_equalization_improves_per_tensor_quantization():
+    x = np.random.default_rng(2).random((8, SIZE, SIZE, 3), dtype=np.float32)
+
+    def sqnr(model):
+        tflite = du.convert_to_tflite(model, _representative, profile="artpec8")
+        return du.quantization_error(model, tflite, x)[0]["sqnr_db"]
+
+    plain = sqnr(_unbalanced_chain())
+    model = _unbalanced_chain()
+    du.equalize_cross_layer(model)
+    equalized = sqnr(model)
+    assert equalized > plain + 6, (plain, equalized)     # at least one more bit of precision
+
+
+def test_equalization_skips_relu6_shared_tensors_and_qat_models():
+    # ReLU6 is not positively homogeneous: the first pair must be skipped
+    relu6 = _unbalanced_chain(final_relu6=True)
+    assert du.equalize_cross_layer(relu6).pairs == 1
+
+    # a tensor with two consumers (here: also a model output) cannot be rescaled
+    inp = tf.keras.Input((SIZE, SIZE, 3))
+    a = L.Conv2D(8, 3, padding="same", activation="relu")(inp)
+    b = L.Conv2D(8, 3, padding="same")(a)
+    assert du.equalize_cross_layer(tf.keras.Model(inp, [a, b])).pairs == 0
+
+    with pytest.raises(ValueError, match="strip_qat"):
+        du.equalize_cross_layer(_toy_qat_model())
+
+
+def test_equalization_reaches_into_nested_backbones_but_not_across_their_taps():
+    model = du.strip_qat(du.reparameterize_model(
+        lr_aspp(tf.keras.Input((64, 64, 3)), n_labels=3, backbone="MobileOne-S0", weights=None, freeze_backbone=False)))
+    x = np.random.default_rng(3).random((2, 64, 64, 3), dtype=np.float32)
+    backbone = _nested_backbone(model)
+    taps_before = [t.numpy() for t in backbone(x, training=False)]
+    out_before = model(x, training=False).numpy()
+
+    result = du.equalize_cross_layer(model)
+    assert result.pairs > 20
+    # the feature taps the head consumes are untouched, hence so is the output
+    for a, b in zip(taps_before, backbone(x, training=False)):
+        assert np.abs(a - b.numpy()).max() <= 2e-3 * np.abs(a).max()
+    assert np.abs(out_before - model(x, training=False).numpy()).max() <= 2e-3 * np.abs(out_before).max()
+
+
+def test_quantization_error_reports_one_entry_per_output():
+    model = _toy_model()
+    x = np.random.default_rng(4).random((4, SIZE, SIZE, 3), dtype=np.float32)
+    float16 = du.quantization_error(model, du.convert_to_tflite(model, float16=True), x)
+    int8 = du.quantization_error(model, du.convert_to_tflite(model, _representative, profile="default"), x)
+    assert len(float16) == len(int8) == 1
+    assert set(int8[0]) == {"sqnr_db", "rmse", "max_abs_error", "float_std"}
+    assert float16[0]["sqnr_db"] > 40           # float16 weights are nearly exact
+    assert 5 < int8[0]["sqnr_db"] < float16[0]["sqnr_db"]

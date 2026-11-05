@@ -18,12 +18,13 @@ on its own:
    q.quantize()
    print(q.lint_report)
 
-``quantize()`` performs four steps:
+``quantize()`` performs these steps:
 
 1. **Reparameterize.** The training-time branches of a MobileOne, RepViT or
    FastViT backbone are fused into plain convolutions.
 2. **Strip the QAT wrappers** (for integer-only targets, see below).
-3. **Convert** for the chosen deployment profile, and write
+3. **Equalize** consecutive layers (for per-tensor targets, see below).
+4. **Convert** for the chosen deployment profile, and write
 
    * ``<name>_quant_ui8.tflite``: full-integer model. Only
      ``TFLITE_BUILTINS_INT8`` operators are allowed, so conversion fails if
@@ -31,7 +32,7 @@ on its own:
    * ``<name>_quant_f16.tflite``: float16 weights with float32 input and
      output, for GPU delegates and as an accuracy reference.
 
-4. **Check** the full-integer file against the profile. The report is logged
+5. **Check** the full-integer file against the profile. The report is logged
    and kept in ``q.lint_report``; pass ``strict=True`` to make a failed check
    raise.
 
@@ -50,8 +51,10 @@ The individual steps are available in ``swiss_army_keras.deploy_utils``:
    from swiss_army_keras import deploy_utils
 
    export_model = deploy_utils.strip_qat(deploy_utils.reparameterize_model(model))
+   deploy_utils.equalize_cross_layer(export_model)        # per-tensor targets
    tflite_bytes = deploy_utils.convert_to_tflite(export_model, representative_data_gen, profile="artpec8")
    print(deploy_utils.lint_tflite(tflite_bytes, profile="artpec8"))
+   print(deploy_utils.quantization_error(export_model, tflite_bytes, some_normalized_images))
 
 Deployment profiles
 *******************
@@ -163,6 +166,151 @@ The consequence to be aware of: for accelerator profiles, activation ranges
 come from the calibration batches, not from training. Use enough
 representative batches (``batches=`` / ``quant_batches=``), and compare the
 exported model's accuracy with the float model before deploying.
+
+Per-tensor quantization and cross-layer equalization
+****************************************************
+
+With one scale per weight tensor (ARTPEC-8), a single channel with large
+weights costs every other channel of that tensor its resolution. Depthwise
+and fused convolutions are the usual victims.
+``deploy_utils.equalize_cross_layer`` implements cross-layer equalization
+(Nagel et al., 2019): for two consecutive convolutions separated only by a
+ReLU, an output channel of the first is divided by a factor and the matching
+input channel of the second multiplied by it, chosen so both layers end up
+with the same weight range in that channel. The network computes exactly the
+same function; only the distribution of the weights changes.
+
+It applies to chains
+``conv -> [batch norm] -> [ReLU / padding] -> conv`` whose intermediate
+tensors have a single consumer, inside the model and its nested backbone.
+Feature taps, residual branches and gates are left alone. Chains through
+**ReLU6 are skipped**: ReLU6 does not commute with rescaling, and replacing
+it by ReLU changed the features of the Keras MobileNetV2 weights by 50 to
+110% when it was tried.
+
+``Quantizer`` equalizes automatically when the profile quantizes weights per
+tensor and the QAT wrappers were stripped (``equalize=None``), and restores
+the original weights after conversion, since layers may be shared with the
+model being trained.
+
+Measured quantization quality
+-----------------------------
+
+Signal-to-quantization-noise ratio (SQNR, in dB, higher is better; 6 dB is
+roughly one bit) of the backbone feature maps, quantized TFLite against the
+float model. ImageNet-pretrained weights, 224 x 224, 32 calibration and 16
+test images from Oxford-IIIT Pets, measured with this repository.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 28 12 14 14 16 16
+
+   * - Backbone
+     - Tap
+     - Per channel
+     - Per tensor
+     - Per tensor, equalized
+     - Pairs equalized
+   * - MobileNetV4-Conv-S
+     - stride 16
+     - 14.9
+     - 1.4
+     - 7.7
+     - 29
+   * - MobileNetV4-Conv-S
+     - stride 32
+     - 19.2
+     - 6.7
+     - 14.6
+     -
+   * - MobileNetV2
+     - stride 16
+     - 16.9
+     - 3.0
+     - 2.9
+     - 2 (ReLU6)
+   * - MobileNetV2
+     - stride 32
+     - 10.9
+     - -3.3
+     - -3.2
+     -
+   * - MobileOne-S0, fused
+     - stride 16
+     - 10.3
+     - 5.7
+     - 7.8
+     - 38
+   * - MobileOne-S0, fused
+     - stride 32
+     - 3.5
+     - -3.6
+     - 1.2
+     -
+   * - MobileOne-S0, not fused
+     - stride 32
+     - -5.1
+     - -5.3
+     - n/a
+     -
+   * - MobileOne-S1, fused
+     - stride 32
+     - -0.9
+     - -4.0
+     - -3.0
+     - 38
+   * - RepViT-M0.9, fused
+     - stride 32
+     - 3.1
+     - 1.5
+     - not measured
+     -
+
+What this says:
+
+* **Fusing helps quantization** as well as speed (MobileOne-S0: -5.1 dB
+  unfused against 3.5 dB fused at the deepest tap).
+* **Equalization recovers a large part of the per-tensor loss** where it can
+  act: MobileNetV4-Conv-S gains 8 dB at the deepest tap and ends above
+  per-channel MobileNetV2.
+* **MobileNetV2 collapses under per-tensor post-training quantization** and
+  cannot be equalized because of ReLU6. On a per-tensor target use a ReLU
+  backbone.
+* **Fused MobileOne and RepViT quantize poorly post-training even per
+  channel**: at the deepest tap the noise is as large as the signal. This is
+  the known weakness of reparameterized networks, and nothing in the library
+  addresses it yet.
+* For a per-tensor accelerator, **MobileNetV4-Conv with equalization is the
+  best-measured choice** among the library's backbones today.
+
+These are feature-level measurements on a small image set, a proxy for task
+accuracy, not a substitute: no trained head was evaluated. Measure your own
+model with ``deploy_utils.quantization_error`` before deploying.
+
+Measuring quantization error
+****************************
+
+.. code-block:: python
+
+   errors = deploy_utils.quantization_error(export_model, tflite_bytes, images)   # images: float, normalized
+   # one dict per model output: sqnr_db, rmse, max_abs_error, float_std
+
+Run it on a multi-output model (for example the nested backbone, whose
+outputs are the feature taps) to see where along the network the error
+grows.
+
+Architectures without gates
+***************************
+
+Several decoders fuse features with a sigmoid gate (a tensor multiplied by
+a tensor), which the published ARTPEC-9 operator list does not cover. Two
+builders offer a plain variant, to be chosen before training:
+
+* ``lr_aspp(..., gate=False)``: no global pooling, sigmoid or
+  multiplication; the exported head is convolutions, two resizes and a
+  concatenation.
+* ``pp_liteseg(..., fusion='add')``: the two features are added instead of
+  blended by the UAFM attention.
 
 Checking an exported model
 **************************
@@ -283,8 +431,10 @@ Known limitations
 *****************
 
 * For accelerator profiles the QAT ranges are discarded at export (see
-  above); per-tensor quantization of depthwise and fused convolutions can
-  cost accuracy, and the library has no cross-layer equalization yet.
+  above).
+* Post-training quantization of fused MobileOne and RepViT backbones is
+  poor (see the measurements above); equalization does not cover ReLU6
+  networks; there is no bias correction and no per-layer error report yet.
 * Several architectures use operators outside the published Axis lists
   (sigmoid gates, explicit padding, GELU, squeeze-excite, dilated
   convolutions). The lint reports them; it does not rewrite the model.
@@ -294,9 +444,12 @@ Known limitations
   it is usually better to export the ``*_base`` model and decode on the CPU.
 * ``tf.lite.Interpreter`` is deprecated upstream in favour of the LiteRT
   package (``ai_edge_litert``); the library still uses the TensorFlow one.
-* A known issue affects QAT-wrapped output layers without activation on a
-  randomly initialized ``MobileNetV2`` backbone (all-zero outputs); it does
-  not appear with pretrained weights or with the library's own backbones.
+* An untrained QAT-wrapped model can output exact zeros. The output
+  quantizer starts with a range of -6 to 6, so it rounds to steps of 12/255;
+  a randomly initialized ``MobileNetV2`` produces logits around 0.001, which
+  all round to zero. It is not a defect and disappears once the outputs have
+  a normal magnitude (pretrained weights, or training). To inspect an
+  untrained model, look at ``deploy_utils.strip_qat(model)``.
 
 Export tests
 ************

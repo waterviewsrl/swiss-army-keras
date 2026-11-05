@@ -82,6 +82,14 @@ class Quantizer():
        the wrappers are stripped for profiles marked `integer_only`
        (`artpec7`, `artpec8`, `artpec9`) and kept otherwise.
 
+    3. **Cross-layer equalization** (`equalize`): for per-tensor profiles,
+       consecutive convolutions are rescaled so each weight tensor has
+       similar ranges in all its channels
+       (`deploy_utils.equalize_cross_layer`). It does not change what the
+       model computes; the original weights are restored after conversion.
+       By default (`equalize=None`) it is applied when the wrappers were
+       stripped and the profile quantizes weights per tensor (`artpec8`).
+
     After converting, the flatbuffer is checked against the profile
     (`deploy_utils.lint_tflite`); the report is logged and kept in
     `self.lint_report`.
@@ -110,9 +118,11 @@ class Quantizer():
         strict: raise `RuntimeError` if the lint report has errors or
                operators outside the profile's operator list, instead of
                only logging a warning.
+        equalize: True / False to force cross-layer equalization, None for
+               the profile-dependent default described above.
     '''
     def __init__(self, dataset, model, name, append_datetime=True, batches=1, weights_checkpoint_name=None,
-                 profile='default', reparameterize=True, strip_qat=None, strict=False):
+                 profile='default', reparameterize=True, strip_qat=None, strict=False, equalize=None):
         self.dataset = dataset
         self.model = model
         if append_datetime:
@@ -131,6 +141,10 @@ class Quantizer():
         self.reparameterize = reparameterize
         self.strip_qat = self.profile.integer_only if strip_qat is None else strip_qat
         self.strict = strict
+        # Cross-layer equalization only makes sense on a plain (stripped)
+        # model, and measurably helps per-tensor exports only.
+        self.equalize = (self.strip_qat and not self.profile.per_channel) if equalize is None else equalize
+        self.equalization = None
         self.export_model = None
         self.lint_report = None
         self.tflite_int_path = None
@@ -178,6 +192,24 @@ class Quantizer():
 
         self.export_model = self._prepare_export_model()
 
+        self.equalization = None
+        if self.equalize:
+            if deploy_utils.has_qat_layers(self.export_model):
+                logging.warning('Cross-layer equalization skipped: the model still has QAT wrappers '
+                                '(it needs `strip_qat=True`).')
+            else:
+                self.equalization = deploy_utils.equalize_cross_layer(self.export_model)
+                logging.info('Cross-layer equalization: %d layer pairs, %d sweeps.',
+                             self.equalization.pairs, self.equalization.iterations)
+        try:
+            self._convert_and_write(representative_data_gen)
+        finally:
+            # Layers may be shared with the model being trained: leave its
+            # weights as they were.
+            if self.equalization is not None:
+                self.equalization.restore()
+
+    def _convert_and_write(self, representative_data_gen):
         self.tflite_ui8_model = deploy_utils.convert_to_tflite(
             self.export_model, representative_data_gen, profile=self.profile)
         suffix = 'i8' if self.profile.io_dtype == 'int8' else 'ui8'

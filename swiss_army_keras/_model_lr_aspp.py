@@ -53,7 +53,7 @@ def _conv_bn_act(x, num_filters, kernel_size=1, use_bias=False, activation=relu,
     return x
 
 
-def lr_aspp_module(deep_feature, num_filters=128, name='lr_aspp_module'):
+def lr_aspp_module(deep_feature, num_filters=128, name='lr_aspp_module', gate=True):
     '''The LR-ASPP branch itself: `1x1 Conv+BN+ReLU` gated by
     `sigmoid(1x1 Conv(GlobalAvgPool))`, upsampled back to the deep
     feature's own spatial size before the elementwise gate (a `Multiply`,
@@ -63,6 +63,10 @@ def lr_aspp_module(deep_feature, num_filters=128, name='lr_aspp_module'):
     dims = deep_feature.shape
 
     branch_1x1 = _conv_bn_act(deep_feature, num_filters, kernel_size=1, name=f'{name}_branch1x1')
+    if not gate:
+        # Gate-free variant: no global pooling, sigmoid or tensor-by-tensor
+        # multiplication, which several NPUs do not accelerate.
+        return branch_1x1
 
     pooled = qat_annotate_layer(AveragePooling2D(
         pool_size=(dims[-3], dims[-2]), name=f'{name}_gap',
@@ -88,7 +92,7 @@ def lr_aspp(input_tensor, n_labels, filter_num_down=[64, 128, 256, 512, 1024],
             deep_layer=5, shallow_layer=2, num_filters=128, num_filters_shallow=48,
             stack_num_down=2, activation='ReLU', batch_norm=False, pool=True,
             backbone=None, weights='imagenet', freeze_backbone=True, freeze_batch_norm=True,
-            name='lr_aspp', iqa_head=False):
+            name='lr_aspp', iqa_head=False, gate=True):
     '''LR-ASPP (Lite Reduced ASPP) segmentation decoder, from the
     MobileNetV3 paper (Howard et al., 2019).
 
@@ -128,6 +132,14 @@ def lr_aspp(input_tensor, n_labels, filter_num_down=[64, 128, 256, 512, 1024],
             exported model carries both heads off one shared encoder.
             Appends its `[0, 1]` score as a second output:
             `[logit_map, iqa_score]`.
+        gate: `True` (default) for the original LR-ASPP module, in which
+            the 1x1 branch is multiplied by a sigmoid gate computed from
+            the globally pooled feature. `False` drops the gate, leaving
+            only convolutions, resizes and a concatenation in the exported
+            graph: use it for accelerators that do not run global pooling,
+            sigmoid or tensor-by-tensor multiplication (see the deployment
+            guide). The gate-free model is a different architecture and has
+            to be trained as such.
 
     Output
     ----------
@@ -162,7 +174,7 @@ def lr_aspp(input_tensor, n_labels, filter_num_down=[64, 128, 256, 512, 1024],
     deep_feature = X_encoder[deep_layer - 1]
     shallow_feature = X_encoder[shallow_layer - 1]
 
-    x = lr_aspp_module(deep_feature, num_filters=num_filters, name='{}_module'.format(name))
+    x = lr_aspp_module(deep_feature, num_filters=num_filters, name='{}_module'.format(name), gate=gate)
 
     x = qat_annotate_layer(UpSampling2D(
         size=(shallow_feature.shape[1] // x.shape[1],
