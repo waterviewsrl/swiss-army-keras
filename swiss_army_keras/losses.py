@@ -700,7 +700,7 @@ def scale_invariant_log_loss(y_true, y_pred, lam=0.5):
     return tf.reduce_sum(tf.square(e)) / n - lam * tf.square(tf.reduce_sum(e) / n)
 
 
-def berhu_loss(y_true, y_pred):
+def berhu_loss(y_true, y_pred, mask_invalid=False):
     '''
     BerHu (reverse Huber) loss for monocular depth regression — L1 near
     zero error (preserves gradient signal on the many small-error pixels
@@ -708,7 +708,7 @@ def berhu_loss(y_true, y_pred):
     (down-weights the gradient contribution of large outlier errors rather
     than letting them dominate, the way plain L1 would).
 
-    berhu_loss(y_true, y_pred)
+    berhu_loss(y_true, y_pred, mask_invalid=False)
 
     ----------
     Laina, I., Rupprecht, C., Belagiannis, V., Tombari, F. and Navab, N.,
@@ -719,6 +719,11 @@ def berhu_loss(y_true, y_pred):
     ----------
         y_true: ground-truth depth, same shape as `y_pred`.
         y_pred: predicted depth.
+        mask_invalid: `False` (default) averages over every pixel. `True`
+                      leaves out pixels with `y_true <= 0`, the convention
+                      for missing depth that `scale_invariant_log_loss` and
+                      `DepthAlbumentationsDataLoader` use. Pass it with
+                      `functools.partial(berhu_loss, mask_invalid=True)`.
 
     * The threshold `c = 0.2 * max(|y_pred - y_true|)` is computed fresh
       per batch and `tf.stop_gradient`'d — a fixed, target-derived scalar
@@ -734,12 +739,17 @@ def berhu_loss(y_true, y_pred):
     y_true = tf.cast(y_true, y_pred.dtype)
 
     x = y_pred - y_true
+    if mask_invalid:
+        valid_mask = tf.cast(y_true > 0, y_pred.dtype)
+        x = x * valid_mask
     abs_x = tf.abs(x)
     c = tf.stop_gradient(0.2 * tf.reduce_max(abs_x))
 
     quadratic = (tf.square(x) + tf.square(c)) / (2.0 * c + K.epsilon())
     loss = tf.where(abs_x <= c, abs_x, quadratic)
 
+    if mask_invalid:
+        return tf.reduce_sum(loss) / tf.maximum(tf.reduce_sum(valid_mask), 1.0)
     return tf.reduce_mean(loss)
 
 

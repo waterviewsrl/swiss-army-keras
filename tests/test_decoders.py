@@ -692,3 +692,24 @@ def test_pp_liteseg_additive_fusion_builds_without_attention_layers():
     with pytest.raises(ValueError, match="fusion"):
         pp_liteseg(tf.keras.Input((INPUT_SIZE, INPUT_SIZE, 3)), n_labels=N_LABELS, backbone="MobileNetV4-Conv-S", weights=None, fusion="concat")
 
+
+
+# LR-ASPP feature levels: the defaults follow the backbone, and a level the
+# backbone does not have is a clear error instead of an IndexError.
+
+
+def test_lr_aspp_default_levels_follow_the_backbone():
+    inp = tf.keras.Input((INPUT_SIZE, INPUT_SIZE, 3))
+    model = lr_aspp(inp, n_labels=N_LABELS, backbone="RepViT-M0.9", weights=None, freeze_backbone=False)
+    assert model.output_shape == (None, INPUT_SIZE, INPUT_SIZE, N_LABELS)
+    # four levels: the module sits on the stride-32 feature, the skip on stride 4
+    assert model.get_layer("quant_lr_aspp_module_branch1x1_conv").output_shape[1] == INPUT_SIZE // 32
+    assert model.get_layer("quant_lr_aspp_shallow_proj_conv").output_shape[1] == INPUT_SIZE // 4
+
+
+def test_lr_aspp_rejects_a_level_the_backbone_does_not_have():
+    inp = tf.keras.Input((INPUT_SIZE, INPUT_SIZE, 3))
+    with pytest.raises(ValueError, match="4 feature levels"):
+        lr_aspp(inp, n_labels=N_LABELS, backbone="RepViT-M0.9", weights=None, deep_layer=5)
+    with pytest.raises(ValueError, match="shallow_layer"):
+        lr_aspp(inp, n_labels=N_LABELS, backbone="MobileNetV2", weights=None, deep_layer=3, shallow_layer=4)

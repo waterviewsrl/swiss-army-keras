@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 import tensorflow as tf
 
-from swiss_army_keras.metrics import BoundaryFScore, MeanAveragePrecision
+from swiss_army_keras.metrics import BoundaryFScore, DepthAbsRel, DepthDeltaAccuracy, DepthRMSE, MeanAveragePrecision
 
 
 def _rect_mask(shape, box):
@@ -232,3 +232,78 @@ def test_map_output_matches_fcos_lite_detection_shape():
         (gt_boxes, gt_classes, gt_valid), (pred_boxes, pred_scores, pred_classes, valid_detections),
     )
     assert np.isfinite(float(metric.result()))
+
+
+# Monocular depth metrics: hand-computed values, the missing-depth mask and
+# the median alignment used for depth predicted up to scale.
+
+
+def _depth_pair():
+    # one image, four pixels; the last target is 0 = missing
+    y_true = tf.constant([[[[2.0], [4.0]], [[8.0], [0.0]]]])
+    y_pred = tf.constant([[[[2.0], [5.0]], [[4.0], [100.0]]]])
+    return y_true, y_pred
+
+
+def test_depth_metrics_hand_computed_and_ignore_missing_pixels():
+    y_true, y_pred = _depth_pair()
+
+    abs_rel = DepthAbsRel()
+    abs_rel.update_state(y_true, y_pred)
+    np.testing.assert_allclose(float(abs_rel.result()), (0.0 + 0.25 + 0.5) / 3, rtol=1e-6)
+
+    rmse = DepthRMSE()
+    rmse.update_state(y_true, y_pred)
+    np.testing.assert_allclose(float(rmse.result()), np.sqrt((0.0 + 1.0 + 16.0) / 3), rtol=1e-6)
+
+    rmse_log = DepthRMSE(log=True)
+    rmse_log.update_state(y_true, y_pred)
+    expected = np.sqrt((0.0 + np.log(5 / 4) ** 2 + np.log(4 / 8) ** 2) / 3)
+    np.testing.assert_allclose(float(rmse_log.result()), expected, rtol=1e-5)
+    assert rmse_log.name == "depth_rmse_log"
+
+    # ratios: 1.0, 1.25, 2.0 -> only the first is strictly below 1.25
+    delta = DepthDeltaAccuracy(threshold=1.25)
+    delta.update_state(y_true, y_pred)
+    np.testing.assert_allclose(float(delta.result()), 1 / 3, rtol=1e-6)
+    delta2 = DepthDeltaAccuracy(threshold=1.25 ** 2)
+    delta2.update_state(y_true, y_pred)
+    np.testing.assert_allclose(float(delta2.result()), 2 / 3, rtol=1e-6)
+
+
+def test_depth_metrics_accumulate_over_pixels_and_reset():
+    y_true, y_pred = _depth_pair()
+    metric = DepthAbsRel()
+    metric.update_state(y_true, y_pred)
+    metric.update_state(tf.constant([[[[1.0]]]]), tf.constant([[[[2.0]]]]))  # one more valid pixel, error 1.0
+    np.testing.assert_allclose(float(metric.result()), (0.0 + 0.25 + 0.5 + 1.0) / 4, rtol=1e-6)
+    metric.reset_state()
+    assert float(metric.result()) == 0.0
+
+
+def test_depth_median_alignment_removes_a_global_scale():
+    rng = np.random.default_rng(0)
+    y_true = rng.uniform(1.0, 10.0, size=(3, 8, 8, 1)).astype("float32")
+    y_true[:, 0] = 0.0  # a row of missing depth
+    y_pred = y_true * np.array([0.1, 3.0, 7.0], dtype="float32").reshape(3, 1, 1, 1)
+    y_pred[:, 0] = 55.0  # garbage where depth is missing must not matter
+
+    raw = DepthAbsRel()
+    raw.update_state(y_true, y_pred)
+    aligned = DepthAbsRel(align="median")
+    aligned.update_state(y_true, y_pred)
+    assert float(raw.result()) > 0.5
+    assert float(aligned.result()) < 1e-5
+
+    delta = DepthDeltaAccuracy(align="median")
+    delta.update_state(y_true, y_pred)
+    assert float(delta.result()) == 1.0
+
+
+def test_depth_metric_config_roundtrip_and_bad_align():
+    metric = DepthDeltaAccuracy(threshold=1.5, align="median")
+    clone = DepthDeltaAccuracy.from_config(metric.get_config())
+    assert clone.threshold == 1.5 and clone.align == "median"
+    assert DepthRMSE.from_config(DepthRMSE(log=True).get_config()).log is True
+    with pytest.raises(ValueError, match="align"):
+        DepthAbsRel(align="mean")

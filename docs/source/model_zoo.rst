@@ -210,7 +210,12 @@ Classification, regression and embeddings
    * - ``reid_embedding_head``
      - L2-normalized embedding for re-identification / metric learning.
    * - ``lr_aspp_depth``, ``fastdepth_head``
-     - Dense monocular depth map (sigmoid-bounded or linear).
+     - Dense monocular depth map (sigmoid-bounded or linear). Both adapt to
+       backbones with five, four or three feature levels.
+   * - ``multi_task``
+     - Several heads on one shared backbone, one named output per head.
+       Head types: ``lr_aspp``, ``lr_aspp_depth``, ``fastdepth``,
+       ``classifier``, ``iqa``, or a callable.
 
 The classifier heads accept ``pre_pool_attention='gem' | 'eca' | 'coordatt'``
 and ``pooling='avg' | 'max'``.
@@ -256,7 +261,19 @@ Optimizers and metrics
   drop-in for ``model.fit``) and the ``SAM`` sharpness-aware wrapper around
   any base optimizer.
 * ``swiss_army_keras.metrics``: ``MeanIOU`` (one-hot aware),
-  ``BoundaryFScore``, ``MeanAveragePrecision``.
+  ``BoundaryFScore``, ``MeanAveragePrecision``, and for depth
+  ``DepthAbsRel``, ``DepthRMSE`` and ``DepthDeltaAccuracy`` (pixels with a
+  target of 0 are left out; ``align='median'`` for depth known up to scale).
+
+Data loaders
+************
+
+``swiss_army_keras.dataset_utils``:
+``SegmentationAlbumentationsDataLoader`` (image and class mask),
+``DepthAlbumentationsDataLoader`` (image and depth map, 16-bit PNG or
+``.npy``) and ``ClassificationAlbumentationsDataLoader`` (one directory per
+class). All three run albumentations pipelines in a pool of worker
+processes.
 
 Auxiliary utilities
 *******************
@@ -272,9 +289,15 @@ Auxiliary utilities
        deployed model takes raw ``uint8`` frames.
    * - ``layer_utils.add_energy_score_output``, ``layer_utils.energy_score``
      - Adds an energy-based confidence output computed from the logits.
+   * - ``layer_utils.add_embedding_output``
+     - Adds the feature that feeds a head as an extra output of a trained
+       model: the embedding the Mahalanobis statistics are fitted on.
    * - ``ood_utils``
      - Mahalanobis-distance out-of-distribution scores (image level and
-       dense), anomaly-map aggregation, threshold calibration.
+       dense), a NumPy-only form for devices (``whiten_statistics``,
+       ``whitened_distance``), sampling of dense embeddings, anomaly-map
+       aggregation, threshold calibration, and ``ood_detection_metrics``
+       (AUROC, false positive rate at 95% true positive rate).
    * - ``iqa_utils``
      - Teacher-labelled image-quality side task
        (``add_teacher_iqa_labels``, ``laplacian_variance_quality``).
@@ -283,9 +306,10 @@ Auxiliary utilities
    * - ``deploy_utils``
      - Deployment profiles, ``reparameterize_model`` (fuses the
        training-time branches of a MobileOne / FastViT / RepViT backbone
-       inside any model), ``strip_qat``, ``equalize_cross_layer``,
-       ``convert_to_tflite``, ``lint_tflite`` and ``quantization_error``
-       (see :doc:`deployment`).
+       inside any model), ``strip_qat``, ``drop_output_activations``,
+       ``equalize_cross_layer``, ``convert_to_tflite``, ``lint_tflite``,
+       ``tflite_outputs`` and ``quantization_error`` (see
+       :doc:`deployment`).
    * - ``reparam_utils`` and ``reparameterize_*``
      - The per-family fusion functions and kernel arithmetic that
        ``deploy_utils.reparameterize_model`` builds on.

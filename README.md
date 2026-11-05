@@ -14,14 +14,14 @@ experiment.
 
 | Area | Content | Module |
 |---|---|---|
-| Dataset pipelines | `tf.data` loaders for segmentation and classification with [albumentations](https://albumentations.ai/) augmentation in worker processes | `dataset_utils` |
+| Dataset pipelines | `tf.data` loaders for segmentation, monocular depth and classification with [albumentations](https://albumentations.ai/) augmentation in worker processes | `dataset_utils` |
 | Training | Frozen-backbone training, optional unfrozen fine-tuning, callbacks, TFLite export at the end | `training_utils` |
 | Backbones | `tf.keras.applications` families, EfficientNet-Lite, and five edge-oriented families implemented here: MobileOne, MobileNetV4, FastViT, RepViT, StrideFormer | `_backbone_zoo` |
 | Segmentation | DeepLabV3+, LR-ASPP, PP-LiteSeg, DDRNet, PIDNet, PP-MobileSeg, plus the inherited U-Net family | `models` |
 | Detection | Anchor-free FCOS-lite and GFL-lite detectors, YOLACT-style instance segmentation | `models` |
-| Other heads | Single-label, multi-label and ordinal classifiers, keypoint regression, re-identification embeddings, monocular depth, image-quality side head | `models` |
-| Losses, optimizers, metrics | Region, boundary and focal losses; detection and depth losses; Lion, SAM, AdaBelief and others; boundary F-score, mean average precision | `losses`, `optimizers`, `metrics` |
-| Deployment | Target profiles (Axis ARTPEC-8/9, CPU), full-integer and float16 TFLite export with automatic backbone reparameterization, export check against the target's operator list, uint8 input wrapper, out-of-distribution scores, test-time augmentation | `quantization_utils`, `deploy_utils`, `layer_utils`, `ood_utils`, `inference_utils` |
+| Other heads | Single-label, multi-label and ordinal classifiers, keypoint regression, re-identification embeddings, monocular depth, image-quality side head; `multi_task` puts several heads on one shared backbone | `models` |
+| Losses, optimizers, metrics | Region, boundary and focal losses; detection and depth losses; Lion, SAM, AdaBelief and others; boundary F-score, mean average precision, depth metrics | `losses`, `optimizers`, `metrics` |
+| Deployment | Target profiles (Axis ARTPEC-8/9, CPU), full-integer and float16 TFLite export with automatic backbone reparameterization, export check against the target's operator list, export without the final sigmoid or softmax, uint8 input wrapper, out-of-distribution scores with a NumPy-only device form, test-time augmentation | `quantization_utils`, `deploy_utils`, `layer_utils`, `ood_utils`, `inference_utils` |
 
 The complete inventory, with registry names and limitations, is in
 [docs/source/model_zoo.rst](docs/source/model_zoo.rst).

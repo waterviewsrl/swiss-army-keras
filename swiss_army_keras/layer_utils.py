@@ -965,3 +965,100 @@ def add_energy_score_output(model, logit_output_indices=(0,), temperature=1.0, c
     wrapped = Model(model.input, outputs + energy_outputs, name=name or f'{model.name}_energy')
     wrapped.preprocessing = model.preprocessing
     return wrapped
+
+
+_EMBEDDING_HEAD_LAYERS = ('Conv2D', 'Dense', 'DepthwiseConv2D', 'SeparableConv2D', 'Conv2DTranspose')
+_EMBEDDING_PASS_THROUGH = ('Dropout', 'UpSampling2D', 'Resizing')
+
+
+def _unwrapped(layer):
+    '''The layer inside a QAT wrapper, or the layer itself.'''
+    return layer.layer if type(layer).__name__.startswith('QuantizeWrapper') else layer
+
+
+def _embedding_tensor(model, output_index):
+    '''Find the tensor that feeds the last layer with weights before an output.'''
+    def producer(tensor):
+        layer, node_index, _ = tensor._keras_history
+        return layer, tf.nest.flatten(layer._inbound_nodes[node_index].keras_inputs)
+
+    hint = ' Pass `layer=` with the name of the layer whose output is the embedding.'
+    tensor = model.outputs[output_index]
+    for _ in range(16):
+        layer, inputs = producer(tensor)
+        kind = type(_unwrapped(layer)).__name__
+        if kind in _EMBEDDING_HEAD_LAYERS:
+            tensor = inputs[0]
+            break
+        if len(inputs) != 1 or kind in ('InputLayer', 'Functional', 'Model'):
+            raise ValueError(
+                "add_embedding_output: cannot find the head of output {} automatically (stopped at layer '{}').{}".format(
+                    output_index, layer.name, hint))
+        tensor = inputs[0]
+    else:
+        raise ValueError('add_embedding_output: no head layer found for output {}.{}'.format(output_index, hint))
+
+    for _ in range(16):
+        layer, inputs = producer(tensor)
+        if type(_unwrapped(layer)).__name__ not in _EMBEDDING_PASS_THROUGH or len(inputs) != 1:
+            break
+        tensor = inputs[0]
+    return tensor
+
+
+def add_embedding_output(model, layer=None, output_index=0, name=None):
+    '''Wraps an already-built model, appending the feature that feeds one
+    of its heads as an extra output: the embedding that
+    `swiss_army_keras.ood_utils` fits Mahalanobis statistics on.
+
+    No layer is added and no weight changes, so this works on a trained
+    model (the new model shares its layers) and the extra output is carried
+    through TFLite export like any other.
+
+    With `layer=None` the embedding is found from the graph: walking back
+    from output `output_index`, it is the input of the last layer with
+    weights (the head's final `Dense` or convolution), taken before any
+    dropout or resize that precedes that layer. This gives:
+
+    * `classifier`: the output of the hidden `Dense` layer, `(batch, size)`.
+    * `lr_aspp`: the concatenated decoder feature at the resolution of the
+      shallow skip, `(batch, H/4, W/4, 176)` with the defaults. It is taken
+      before the final resize on purpose: the full-resolution tensor holds
+      the same information in sixteen times the memory.
+    * other single-path decoders and `multi_task` heads: the same rule.
+
+    Input
+    ----------
+        model: an already-built functional `tf.keras.Model`.
+        layer: `None` for the automatic choice, or the name of the layer
+               whose output is the embedding (the name is also tried with
+               the `quant_` prefix that quantization-aware training adds),
+               or a Keras tensor of the model's graph.
+        output_index: which output's head to look behind when `layer=None`.
+        name: name of the returned model.
+
+    Output
+    ----------
+        A new `tf.keras.Model` with the outputs of `model` followed by the
+        embedding. `embedding_output_index` holds the position of the
+        embedding in the output list; `.preprocessing` and `.head_names`
+        are carried over.
+    '''
+    if layer is None:
+        embedding = _embedding_tensor(model, output_index)
+    elif isinstance(layer, str):
+        names = {l.name for l in model.layers}
+        found = next((n for n in (layer, 'quant_' + layer) if n in names), None)
+        if found is None:
+            raise ValueError("add_embedding_output: the model has no layer named '{}'.".format(layer))
+        embedding = model.get_layer(found).output
+    else:
+        embedding = layer
+
+    outputs = list(model.outputs)
+    wrapped = Model(model.inputs, outputs + [embedding], name=name or f'{model.name}_embedding')
+    for attribute in ('preprocessing', 'head_names'):
+        if hasattr(model, attribute):
+            setattr(wrapped, attribute, getattr(model, attribute))
+    wrapped.embedding_output_index = len(outputs)
+    return wrapped

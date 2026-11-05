@@ -26,6 +26,7 @@ Still open:
 | Cover the remaining published per-operator constraints in the lint (pooling windows, kernel sizes, padding amounts) | S |
 | Export detectors without in-graph decoding and NMS, with a reference decoder | S |
 | Extend `tests/test_tflite_export.py` to every decoder, head and backbone family | M |
+| Intermittent failure of the PP-LiteSeg + fused MobileOne-S0 export test for `artpec9`: the LiteRT CPU delegate (XNNPACK) could not prepare the file in 1 of 7 runs on 2026-11-05. The test uses unseeded random weights and calibration data; find the degenerate case and seed the test | S |
 | On-device benchmark harness and a published latency table | M |
 | Decide the future of QAT wrapping: it no longer contributes activation ranges for accelerator exports. Options: keep it as a training regularizer, make it optional per builder, or drop it in favour of post-training quantization (see section 7) | M |
 
@@ -48,6 +49,24 @@ Still open, in the order the measurements suggest:
 | Per-layer quantization error report (wrap `tf.lite.experimental.QuantizationDebugger`) | S |
 | Edge-clean builder switches: ReLU6 or ReLU instead of GELU, hard-swish and swish; no squeeze-excite; channel rounding; SAME padding | M |
 | A gate-free decoder designed for accelerators (feature pyramid with convolutions, 2x resizes and additions only); gate-free variants of PIDNet and PP-MobileSeg | S to M |
+
+## 2b. Depth and out-of-distribution analysis
+
+Done on 2026-11-05: depth heads on every backbone family, a depth data
+loader and depth metrics, export of depth models for ARTPEC-8 without the
+final sigmoid, an embedding output for Mahalanobis statistics, a NumPy-only
+distance for devices, and out-of-distribution evaluation metrics. None of
+it has been trained or evaluated on a real dataset.
+
+Still open:
+
+| Item | Effort |
+|---|---|
+| Train one depth model (teacher pseudo-labels or NYU) and one model with out-of-distribution scoring; report the depth metrics and AUROC for float and exported files | M |
+| Example notebooks for depth and for out-of-distribution scoring | S |
+| Depth: scale-and-shift invariant loss and gradient-matching loss for teacher pseudo-labels; affine alignment in the metrics | S |
+| Out-of-distribution: per-location statistics (PaDiM style) for fixed cameras; embedding choice helper for decoders with several branches (DDRNet, PIDNet) | S to M |
+| An image-quality head that exports to integer (GeM pooling stays in floating point) | S |
 
 ## 3. Ship pretrained weights
 
@@ -76,7 +95,8 @@ Still open, in the order the measurements suggest:
 | Vendored EfficientNet-Lite; MobileNetV3Small | S |
 | MobileDet-style and QARepVGG-style backbones | M |
 | Detection end to end: data loader, training loop, NMS-free head | L |
-| Multi-task model builder; temporal (multi-frame) input | M |
+| Multi-task: the builder exists (`multi_task`, 2026-11-05). Open: more head types (PP-LiteSeg, detection), a loss-balancing helper (uncertainty weighting), a data loader that yields one target per head, `TrainingDriver` support for several outputs | M |
+| Temporal (multi-frame) input | M |
 
 ## 6. Project hygiene
 

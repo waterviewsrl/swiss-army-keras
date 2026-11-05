@@ -120,9 +120,16 @@ class Quantizer():
                only logging a warning.
         equalize: True / False to force cross-layer equalization, None for
                the profile-dependent default described above.
+        drop_output_activations: export the model without its final sigmoid
+               or softmax (`deploy_utils.drop_output_activations`), for
+               accelerators that do not run them. The exported outputs are
+               then logits and the application applies the activation.
+               `self.export_model.dropped_output_activations` lists what was
+               dropped. Works best together with `strip_qat`.
     '''
     def __init__(self, dataset, model, name, append_datetime=True, batches=1, weights_checkpoint_name=None,
-                 profile='default', reparameterize=True, strip_qat=None, strict=False, equalize=None):
+                 profile='default', reparameterize=True, strip_qat=None, strict=False, equalize=None,
+                 drop_output_activations=False):
         self.dataset = dataset
         self.model = model
         if append_datetime:
@@ -145,6 +152,7 @@ class Quantizer():
         # model, and measurably helps per-tensor exports only.
         self.equalize = (self.strip_qat and not self.profile.per_channel) if equalize is None else equalize
         self.equalization = None
+        self.drop_output_activations = drop_output_activations
         self.export_model = None
         self.lint_report = None
         self.tflite_int_path = None
@@ -170,6 +178,8 @@ class Quantizer():
                                 type(e).__name__, e)
         if self.strip_qat:
             model = deploy_utils.strip_qat(model)
+        if self.drop_output_activations:
+            model = deploy_utils.drop_output_activations(model)
         return model
 
     def quantize(self):

@@ -207,3 +207,60 @@ def test_quantizer_equalizes_for_per_tensor_profiles_and_restores_weights(tmp_pa
     assert Quantizer(dataset, model, str(tmp_path / "a9"), append_datetime=False, profile="artpec9").equalize is False
     assert Quantizer(dataset, model, str(tmp_path / "d"), append_datetime=False).equalize is False
 
+
+
+@pytest.mark.slow
+def test_depth_export_for_artpec8_drops_the_sigmoid(tmp_path):
+    """The sigmoid operator is not on the ARTPEC-8 list. `Quantizer` can
+    export the depth model without it: the file then passes the check and
+    returns the value the sigmoid would have been applied to.
+    """
+    from swiss_army_keras.models import fastdepth_head
+    from swiss_army_keras.quantization_utils import Quantizer
+
+    inp = tf.keras.Input((INPUT_SIZE, INPUT_SIZE, 3))
+    model = fastdepth_head(inp, backbone="MobileNetV2", weights=None, freeze_backbone=False)
+    images = np.random.rand(4, INPUT_SIZE, INPUT_SIZE, 3).astype("float32")
+    dataset = tf.data.Dataset.from_tensor_slices((images, np.zeros((4, 1), dtype="float32"))).batch(2)
+
+    kept = Quantizer(dataset, model, str(tmp_path / "kept"), append_datetime=False, profile="artpec8")
+    kept.quantize()
+    assert "LOGISTIC" in kept.lint_report.unsupported_ops
+
+    dropped = Quantizer(dataset, model, str(tmp_path / "dropped"), append_datetime=False, profile="artpec8",
+                        drop_output_activations=True)
+    dropped.quantize()
+    assert dropped.export_model.dropped_output_activations == ["sigmoid"]
+    assert dropped.lint_report.ok, str(dropped.lint_report)
+    out = _run_tflite(dropped.tflite_ui8_model, (images[:1] * 255).astype(np.uint8))
+    assert out.shape == (1, INPUT_SIZE, INPUT_SIZE, 1)
+
+
+@pytest.mark.slow
+def test_multi_task_exports_one_integer_file_with_named_outputs():
+    """One backbone, three heads, one file. The converter reorders the
+    outputs, so `tflite_outputs` is what tells the application which
+    position holds which head.
+    """
+    from swiss_army_keras import deploy_utils
+    from swiss_army_keras.models import multi_task
+
+    inp = tf.keras.Input((INPUT_SIZE, INPUT_SIZE, 3))
+    model = multi_task(inp, {
+        "seg": dict(type="lr_aspp", n_labels=N_LABELS, gate=False),
+        "depth": dict(type="fastdepth"),
+        "cls": dict(type="classifier", n_classes=4, size=32, activation="relu"),
+    }, backbone="MobileNetV4-Conv-S", weights=None, freeze_backbone=False)
+
+    plain = deploy_utils.drop_output_activations(deploy_utils.strip_qat(deploy_utils.reparameterize_model(model)))
+    tflite = deploy_utils.convert_to_tflite(plain, _ptq_representative, profile="artpec9")
+    report = deploy_utils.lint_tflite(tflite, profile="artpec9")
+    assert report.errors == [], str(report)
+    assert not {"LOGISTIC", "SOFTMAX"} & set(report.ops)
+
+    outputs = {d["name"]: d for d in deploy_utils.tflite_outputs(tflite)}
+    assert set(outputs) == {"seg", "depth", "cls"}
+    assert outputs["seg"]["shape"] == (1, INPUT_SIZE, INPUT_SIZE, N_LABELS)
+    assert outputs["depth"]["shape"] == (1, INPUT_SIZE, INPUT_SIZE, 1)
+    assert outputs["cls"]["shape"] == (1, 4)
+    assert sorted(d["position"] for d in outputs.values()) == [0, 1, 2]

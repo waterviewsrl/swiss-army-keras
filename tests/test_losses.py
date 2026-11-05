@@ -495,6 +495,19 @@ def test_berhu_loss_exact_value_straddling_threshold():
     np.testing.assert_allclose(float(loss), expected, atol=1e-4)
 
 
+def test_berhu_loss_can_leave_out_missing_depth():
+    """With `mask_invalid=True`, pixels whose target is 0 neither set the
+    threshold nor enter the mean; the default keeps the unmasked behaviour.
+    """
+    y_true = tf.constant([[1.0, 2.0, 0.0, 0.0]])
+    y_pred = tf.constant([[1.1, 2.1, 9.0, 9.0]])
+    # valid errors: [0.1, 0.1], c = 0.02 -> both on the L2 branch:
+    # (0.1^2 + 0.02^2) / (2 * 0.02) = 0.26
+    masked = berhu_loss(y_true, y_pred, mask_invalid=True)
+    np.testing.assert_allclose(float(masked), 0.26, atol=1e-4)
+    assert float(berhu_loss(y_true, y_pred)) > 1.0
+
+
 # YOLACT-style instance mask loss (plan.md §13.6, Phase 11) - a separate
 # fixture again: per-instance area-normalized BCE over an assembled
 # `(..., H, W)` mask, not a per-pixel-only or one-hot-classification shape.

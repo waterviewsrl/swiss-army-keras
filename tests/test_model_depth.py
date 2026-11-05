@@ -138,3 +138,35 @@ class TestFastDepthHead:
         inp = tf.keras.Input((INPUT_SIZE, INPUT_SIZE, 3))
         with pytest.raises(ValueError, match="output_mode"):
             fastdepth_head(inp, output_mode='bogus', backbone="MobileOne-S0", weights=None)
+
+    def test_sigmoid_is_the_last_layer_so_it_can_be_dropped_at_export(self):
+        from swiss_army_keras import deploy_utils
+
+        inp = tf.keras.Input((INPUT_SIZE, INPUT_SIZE, 3))
+        model = fastdepth_head(inp, backbone="MobileNetV2", weights=None, freeze_backbone=False)
+        plain = deploy_utils.strip_qat(model)
+        logits_model = deploy_utils.drop_output_activations(plain)
+        assert logits_model.dropped_output_activations == ['sigmoid']
+
+        x = _random_batch()
+        np.testing.assert_allclose(
+            tf.sigmoid(logits_model.predict(x, verbose=0)).numpy(), plain.predict(x, verbose=0), atol=1e-6)
+
+
+# Backbones that expose fewer than five feature levels: RepViT (four,
+# strides 4 to 32) and StrideFormer (three, strides 8 to 32). Both heads
+# used to fail on them with their default arguments.
+@pytest.mark.parametrize("backbone,n_skips", [("RepViT-M0.9", 3), ("StrideFormer-Tiny", 2)])
+def test_depth_heads_adapt_to_backbones_with_fewer_feature_levels(backbone, n_skips):
+    size = 128  # StrideFormer needs an input that stays even down to stride 32
+    inp = tf.keras.Input((size, size, 3))
+    model = lr_aspp_depth(inp, backbone=backbone, weights=None, freeze_backbone=False)
+    assert model.output_shape == (None, size, size, 1)
+
+    inp = tf.keras.Input((size, size, 3))
+    model = fastdepth_head(inp, backbone=backbone, weights=None, freeze_backbone=False)
+    out = model.predict(np.random.rand(2, size, size, 3).astype("float32"), verbose=0)
+    assert out.shape == (2, size, size, 1)
+    assert out.min() >= 0.0 and out.max() <= 1.0
+    skip_adds = [l.name for l in model.layers if l.name.endswith('_add') and 'skip' in l.name]
+    assert len(skip_adds) == n_skips

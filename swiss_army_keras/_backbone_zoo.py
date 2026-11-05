@@ -386,6 +386,33 @@ def _get_layer(model, layer_ref):
     return model.get_layer(index=layer_ref)
 
 
+def backbone_num_levels(backbone_name):
+    '''Number of feature levels (taps) that a backbone exposes.
+
+    Most backbones expose five levels; RepViT and FastViT expose four and
+    StrideFormer three. Builders use this to pick default taps that exist
+    for the requested backbone.
+
+    Input
+    ----------
+        backbone_name: a key of `BACKBONE_REGISTRY`, or a `'hub://<name>'`
+                       backbone.
+
+    Output
+    ----------
+        The number of feature levels, as an int.
+    '''
+    if backbone_name.startswith('hub://'):
+        return len(hub_layer_candidates[backbone_name[6:]])
+    if backbone_name not in BACKBONE_REGISTRY:
+        raise ValueError(
+            "Unknown backbone '{}'. Available backbones: {}".format(
+                backbone_name, sorted(BACKBONE_REGISTRY)
+            )
+        )
+    return len(BACKBONE_REGISTRY[backbone_name].layers)
+
+
 def backbone_zoo(backbone_name, weights, input_tensor, depth, freeze_backbone, freeze_batch_norm, return_outputs=False):
     '''
     Configuring a user specified encoder model based on `BACKBONE_REGISTRY`

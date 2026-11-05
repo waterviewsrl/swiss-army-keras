@@ -31,6 +31,21 @@ trigger false alarms on their own. `calibrate_threshold(...)` turns a set
 of validation scores into the percentile-based threshold both aggregation
 paths need — a real, data-dependent calibration step, not something
 bakeable into a model's architecture.
+
+The pieces around those: `layer_utils.add_embedding_output` exposes the
+embedding of a trained classifier or decoder as an extra model output;
+`sample_dense_embeddings` turns dense feature maps and label maps into the
+`(embeddings, labels)` pair the fit needs; `whiten_statistics` and
+`whitened_distance` give a NumPy-only form of the distance for a device
+without SciPy; `ood_detection_metrics` reports AUROC and the false positive
+rate at 95% true positive rate on held-out scores.
+
+Scoring runs on the host processor, not on the accelerator: neither the
+energy score nor the distance uses operators that the Axis DLPUs list. On a
+camera, export the model with its logits (and, for Mahalanobis, the
+embedding output) and compute the score from the returned tensors. Fit the
+statistics on embeddings from the exported TFLite model where possible, so
+that they include its quantization error.
 '''
 
 from __future__ import absolute_import
@@ -236,3 +251,160 @@ def calibrate_threshold(scores, percentile=95.0):
         compare a global (non-dense) score against directly.
     '''
     return float(np.percentile(np.asarray(scores), percentile))
+
+
+def whiten_statistics(class_means, covariance_cholesky):
+    '''Turn `fit_class_statistics`'s output into a form that needs only a
+    matrix product at inference, for scoring on a device without SciPy.
+
+    With `W = L^-1` (the inverse of the Cholesky factor), the Mahalanobis
+    distance to class `c` is the Euclidean distance between `W x` and
+    `W mu_c`. `W x` is one fully connected layer (or one 1x1 convolution
+    for a dense feature map), so the device code reduces to a matrix
+    product, a subtraction and a norm.
+
+    Input
+    ----------
+        class_means, covariance_cholesky: `fit_class_statistics`'s own output.
+
+    Output
+    ----------
+        `(projection, whitened_means)` as float32 arrays: `projection` is
+        `(C, C)`, to be applied as `x @ projection.T`; `whitened_means` is
+        `(n_classes, C)`. Pass both to `whitened_distance`, or save them
+        with `np.savez` for the device.
+    '''
+    covariance_cholesky = np.asarray(covariance_cholesky, dtype=np.float64)
+    identity = np.eye(covariance_cholesky.shape[0])
+    projection = solve_triangular(covariance_cholesky, identity, lower=True)
+    whitened_means = np.asarray(class_means, dtype=np.float64) @ projection.T
+    return projection.astype(np.float32), whitened_means.astype(np.float32)
+
+
+def whitened_distance(x, projection, whitened_means, predicted_class=None):
+    '''Mahalanobis distance from `whiten_statistics`'s output, NumPy only.
+
+    Gives the same result as `mahalanobis_distance` (to float32 precision)
+    and accepts any leading shape, so it covers both a batch of embeddings
+    and a dense feature map.
+
+    Input
+    ----------
+        x: array of shape `(..., C)`: `(C,)`, `(N, C)`, `(H, W, C)` or
+           `(N, H, W, C)`.
+        projection, whitened_means: `whiten_statistics`'s own output.
+        predicted_class: `None` for the distance to the closest class, or
+            an integer array broadcastable to the leading shape of `x` for
+            the distance to that class (same meaning as in
+            `mahalanobis_distance`).
+
+    Output
+    ----------
+        Array with the leading shape of `x` (a scalar for a single `(C,)`
+        vector); higher values indicate a more out-of-distribution input.
+    '''
+    x = np.asarray(x, dtype=np.float32)
+    z = x @ np.asarray(projection, dtype=np.float32).T
+    whitened_means = np.asarray(whitened_means, dtype=np.float32)
+
+    if predicted_class is not None:
+        predicted_class = np.broadcast_to(np.asarray(predicted_class), z.shape[:-1])
+        return np.sqrt(np.sum((z - whitened_means[predicted_class]) ** 2, axis=-1))
+
+    best = None
+    for mean in whitened_means:  # one class at a time keeps memory at the size of `x`
+        distance = np.sum((z - mean) ** 2, axis=-1)
+        best = distance if best is None else np.minimum(best, distance)
+    return np.sqrt(best)
+
+
+def sample_dense_embeddings(feature_maps, label_maps, max_per_class=2000, ignore_label=None, seed=0):
+    '''Collect per-pixel embeddings and labels from dense feature maps, for
+    `fit_class_statistics` on a segmentation model.
+
+    A decoder feature map has thousands of locations per image, far more
+    than the statistics need, and usually a lower resolution than the label
+    map. This reads the label at the centre of each feature location
+    (nearest-neighbour) and keeps at most `max_per_class` random locations
+    of each class.
+
+    Input
+    ----------
+        feature_maps: `(N, h, w, C)` array, e.g. the embedding output of a
+                      model wrapped with `layer_utils.add_embedding_output`.
+        label_maps: `(N, H, W)` integer class ids, or `(N, H, W, K)` one-hot
+                    masks as the segmentation data loader yields them.
+        max_per_class: cap on the number of locations kept per class over
+                       the whole call, or `None` to keep all.
+        ignore_label: class id to leave out (e.g. a void label).
+        seed: seed of the random selection.
+
+    Output
+    ----------
+        `(embeddings, labels)`: `(M, C)` and `(M,)` arrays. Call this once
+        per batch and concatenate the results, or once on a whole
+        calibration set.
+    '''
+    feature_maps = np.asarray(feature_maps)
+    label_maps = np.asarray(label_maps)
+    if label_maps.ndim == 4:
+        label_maps = label_maps.argmax(axis=-1)
+    n, h, w, channels = feature_maps.shape
+    rows = ((np.arange(h) + 0.5) * label_maps.shape[1] / h).astype(int)
+    cols = ((np.arange(w) + 0.5) * label_maps.shape[2] / w).astype(int)
+    labels = label_maps[:, rows][:, :, cols].reshape(-1)
+    embeddings = feature_maps.reshape(-1, channels)
+
+    rng = np.random.default_rng(seed)
+    keep = []
+    for c in np.unique(labels):
+        if ignore_label is not None and c == ignore_label:
+            continue
+        index = np.flatnonzero(labels == c)
+        if max_per_class is not None and len(index) > max_per_class:
+            index = rng.choice(index, size=max_per_class, replace=False)
+        keep.append(index)
+    keep = np.sort(np.concatenate(keep)) if keep else np.zeros((0,), dtype=int)
+    return embeddings[keep], labels[keep]
+
+
+def ood_detection_metrics(in_scores, ood_scores):
+    '''How well a score separates in-distribution from out-of-distribution
+    inputs, with the two figures the literature reports.
+
+    Both arrays use this module's convention: a higher score means more
+    out-of-distribution (Mahalanobis distance, or the energy score).
+
+    Input
+    ----------
+        in_scores: scores of held-out in-distribution inputs.
+        ood_scores: scores of inputs known to be out-of-distribution.
+
+    Output
+    ----------
+        A dict:
+            `auroc`: probability that a random out-of-distribution input
+                scores higher than a random in-distribution one (0.5 is
+                chance, 1.0 is perfect separation). Ties count one half.
+            `fpr_at_95_tpr`: fraction of out-of-distribution inputs that
+                are accepted when the threshold accepts 95% of the
+                in-distribution inputs (lower is better).
+            `threshold`: that threshold, the 95th percentile of
+                `in_scores` (what `calibrate_threshold` returns).
+    '''
+    in_scores = np.asarray(in_scores, dtype=np.float64).reshape(-1)
+    ood_scores = np.asarray(ood_scores, dtype=np.float64).reshape(-1)
+    if in_scores.size == 0 or ood_scores.size == 0:
+        raise ValueError('ood_detection_metrics needs at least one score of each kind.')
+
+    ordered = np.sort(in_scores)
+    below = np.searchsorted(ordered, ood_scores, side='left')
+    not_above = np.searchsorted(ordered, ood_scores, side='right')
+    auroc = float((below + 0.5 * (not_above - below)).sum() / (in_scores.size * ood_scores.size))
+
+    threshold = calibrate_threshold(in_scores, 95.0)
+    return {
+        'auroc': auroc,
+        'fpr_at_95_tpr': float(np.mean(ood_scores <= threshold)),
+        'threshold': threshold,
+    }

@@ -8,6 +8,7 @@ Typical use (also what `quantization_utils.Quantizer` does)::
     from swiss_army_keras import deploy_utils
 
     plain = deploy_utils.strip_qat(deploy_utils.reparameterize_model(model))
+    plain = deploy_utils.drop_output_activations(plain)   # optional: no final sigmoid/softmax
     deploy_utils.equalize_cross_layer(plain)          # for per-tensor targets
     tflite = deploy_utils.convert_to_tflite(plain, representative_dataset, profile='artpec8')
     report = deploy_utils.lint_tflite(tflite, profile='artpec8')
@@ -400,6 +401,124 @@ def strip_qat(model):
 
 
 # ========================= #
+# Output activations
+
+def _carry_attributes(source, target):
+    '''Copy the attributes this library attaches to its models.'''
+    for attribute in ('preprocessing', 'head_names', '_sak_reparameterized'):
+        if hasattr(source, attribute):
+            setattr(target, attribute, getattr(source, attribute))
+    return target
+
+
+def _output_activation(layer):
+    '''Classify the activation a layer applies.
+
+    Returns `(kind, name)`: kind is 'standalone' for a layer that only
+    applies an activation, 'fused' for a layer with weights and a built-in
+    activation, None otherwise. Looks inside a QAT wrapper.
+    '''
+    QuantizeWrapper, _, _ = _qat_classes()
+    inner = layer.layer if isinstance(layer, QuantizeWrapper) else layer
+    if type(inner).__name__ == 'TFOpLambda':
+        symbol = (getattr(inner, 'symbol', '') or '').split('.')[-1]
+        return ('standalone', symbol) if symbol else (None, None)
+    if isinstance(inner, tf.keras.layers.Softmax):
+        return 'standalone', 'softmax'
+    if isinstance(inner, tf.keras.layers.Activation):
+        return 'standalone', getattr(_real_activation(inner.activation), '__name__', None)
+    if hasattr(inner, 'activation') and inner.activation is not None:
+        return 'fused', getattr(_real_activation(inner.activation), '__name__', None)
+    return None, None
+
+
+def _producer(tensor):
+    '''The layer that produced a Keras tensor, and that layer's inputs.'''
+    layer, node_index, _ = tensor._keras_history
+    inputs = tf.nest.flatten(layer._inbound_nodes[node_index].keras_inputs)
+    return layer, inputs
+
+
+def drop_output_activations(model, activations=('sigmoid', 'softmax')):
+    '''
+    Return a model whose outputs are taken before their final sigmoid or
+    softmax, for accelerators that do not run those operators.
+
+    A final sigmoid or softmax has no weights, so dropping it at export
+    needs no retraining: the exported model returns the value that fed the
+    activation (the logits) and the application applies the activation
+    itself. On a uint8 output that is a 256-entry lookup table for a
+    sigmoid. The operator lists that motivate this: `LOGISTIC` is not listed
+    for the Axis ARTPEC-8 DLPU, `SOFTMAX` is not listed for ARTPEC-9.
+
+    Handled cases, per output: a standalone activation layer (plain or
+    QAT-wrapped, or a `tf.sigmoid` call), reached through any identity
+    layers that follow it; and a plain `Dense` or convolution with the
+    activation built in, which is replaced by a copy without activation
+    (weights copied). A QAT-wrapped layer with a built-in activation is
+    left unchanged with a warning: pass the model through `strip_qat` first.
+
+    Input
+    ----------
+        model: a functional `tf.keras.Model`.
+        activations: names of the activations to drop.
+
+    Output
+    ----------
+        A new model sharing the layers of `model`, or `model` itself if no
+        output ends with one of `activations`. The attribute
+        `dropped_output_activations` lists, per output, the name of the
+        activation that the application now has to apply (None where the
+        output is unchanged). `preprocessing` is carried over. An output
+        that was named by an identity layer, as the heads of `multi_task`
+        are, keeps its name.
+    '''
+    QuantizeWrapper, _, _ = _qat_classes()
+    outputs, dropped = [], []
+    for tensor in model.outputs:
+        current = tensor
+        new_output, name = tensor, None
+        label = None
+        for _ in range(8):
+            layer, inputs = _producer(current)
+            kind, activation = _output_activation(layer)
+            if len(inputs) != 1:
+                break
+            if kind == 'standalone' and activation == 'linear':
+                # an identity layer that names the output (see `multi_task`)
+                label = label or layer.name
+                current = inputs[0]
+                continue
+            if kind == 'standalone' and activation in activations:
+                new_output, name = inputs[0], activation
+            elif kind == 'fused' and activation in activations:
+                if isinstance(layer, QuantizeWrapper):
+                    warnings.warn(
+                        "drop_output_activations: output '{}' ends with a QAT-wrapped layer whose {} is built in; "
+                        "it is left unchanged. Pass the model through strip_qat first.".format(layer.name, activation))
+                else:
+                    config = layer.get_config()
+                    config['activation'] = 'linear'
+                    config['name'] = layer.name + '_logits'
+                    plain = type(layer).from_config(config)
+                    new_output, name = plain(inputs[0]), activation
+                    plain.set_weights(layer.get_weights())
+            break
+        if name is not None and label is not None:
+            # keep the name the output had, so that a head is still found by name
+            new_output = tf.keras.layers.Activation('linear', name=label)(new_output)
+        outputs.append(new_output)
+        dropped.append(name)
+
+    if not any(dropped):
+        return model
+    result = tf.keras.Model(model.inputs, outputs if len(outputs) > 1 else outputs[0], name=model.name)
+    _carry_attributes(model, result)
+    result.dropped_output_activations = dropped
+    return result
+
+
+# ========================= #
 # Cross-layer equalization
 
 @dataclass
@@ -764,6 +883,56 @@ def _graph(tflite_model):
     inputs = [d['index'] for d in interpreter.get_input_details()]
     outputs = [d['index'] for d in interpreter.get_output_details()]
     return interpreter, ops, tensors, inputs, outputs
+
+
+def tflite_outputs(tflite_model):
+    '''
+    Describe the outputs of a TFLite model in the order the file stores them.
+
+    The converter does not keep the output order of the Keras model, and
+    the tensor names in the file (`StatefulPartitionedCall:0`, ...) do not
+    say which head an output belongs to. A runtime that returns outputs by
+    position, as an accelerator's inference service does, needs this
+    mapping for any model with more than one output.
+
+    Input
+    ----------
+        tflite_model: the flatbuffer as `bytes`, or the path of a `.tflite`
+                      file.
+
+    Output
+    ----------
+        A list with one dict per output, in file order: `position`, `name`
+        (the name of the Keras output, e.g. the head name of a `multi_task`
+        model; the tensor name if the file has no signature), `shape`,
+        `dtype`, `scale` and `zero_point` (real value = scale * (stored
+        value - zero_point); scale 0 for a float output).
+    '''
+    if isinstance(tflite_model, (bytes, bytearray)):
+        interpreter = tf.lite.Interpreter(model_content=bytes(tflite_model))
+    else:
+        interpreter = tf.lite.Interpreter(model_path=str(tflite_model))
+
+    names = {}
+    try:
+        signatures = interpreter._get_full_signature_list()
+        signature = signatures.get('serving_default') or next(iter(signatures.values()))
+        names = {tensor_index: name for name, tensor_index in signature['outputs'].items()}
+    except Exception:  # no signature in the file, or a private API that moved
+        names = {}
+
+    described = []
+    for position, detail in enumerate(interpreter.get_output_details()):
+        scale, zero_point = detail.get('quantization', (0.0, 0))
+        described.append({
+            'position': position,
+            'name': names.get(detail['index'], detail['name']),
+            'shape': tuple(int(d) for d in detail['shape']),
+            'dtype': np.dtype(detail['dtype']).name,
+            'scale': float(scale),
+            'zero_point': int(zero_point),
+        })
+    return described
 
 
 def list_tflite_ops(tflite_model):

@@ -26,4 +26,5 @@ from swiss_army_keras._model_pp_mobileseg import pp_mobileseg
 from swiss_army_keras._model_detection import fcos_lite_detection, gfl_lite_detection
 from swiss_army_keras._model_detection import fcos_lite_instance_segmentation
 from swiss_army_keras._model_depth import lr_aspp_depth, fastdepth_head
+from swiss_army_keras._model_multi_task import multi_task
 from swiss_army_keras._model_classifier import classifier, wise_srnet_classifier, distiller_classifier, learnable_resizer_classifier, multilabel_classifier, ordinal_classifier, pose_regression_head, reid_embedding_head

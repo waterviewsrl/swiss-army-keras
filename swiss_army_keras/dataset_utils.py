@@ -1,6 +1,7 @@
-'''Dataset pipelines: `SegmentationAlbumentationsDataLoader` and
-`ClassificationAlbumentationsDataLoader` build `tf.data` datasets with
-albumentations augmentation executed in a pool of worker processes.
+'''Dataset pipelines: `SegmentationAlbumentationsDataLoader`,
+`DepthAlbumentationsDataLoader` and `ClassificationAlbumentationsDataLoader`
+build `tf.data` datasets with albumentations augmentation executed in a pool
+of worker processes.
 '''
 from codecs import ignore_errors
 from swiss_army_keras import __path__ as mypath
@@ -136,6 +137,21 @@ class WorkerProcess(Process):
                 except Exception as e:
                     logging.error(f'Augmentation error: {e}')
                     return [img.data, lbl.data, idx]
+            elif self.mode == 'depth':
+
+                # Same round trip as a segmentation mask, with a float32
+                # depth map. Geometric transforms move it with the image.
+                lbl = np.frombuffer(request[2], dtype=np.float32).reshape(
+                    (self.output_width, self.output_height))
+                try:
+                    data = {'image': img, 'mask': lbl}
+
+                    aug_data = self.augmentations[dset](**data)
+                    depth = np.ascontiguousarray(aug_data['mask'], dtype=np.float32)
+                    return [aug_data['image'].data, depth.data, idx]
+                except Exception as e:
+                    logging.error(f'Augmentation error: {e}')
+                    return [img.data, lbl.data, idx]
             elif self.mode == 'classification':
 
                 data = {'image': img}
@@ -229,6 +245,14 @@ class SegmentationAlbumentationsDataLoader:
               split. `None` gives a different split in every process; pass
               an int for a reproducible split.
     '''
+    # Type of the label array exchanged with the augmentation workers, the
+    # worker mode, and the extension of the label files. Subclasses with
+    # another kind of dense target override them
+    # (`DepthAlbumentationsDataLoader`).
+    _mask_dtype = np.uint8
+    _worker_mode = 'segmentation'
+    _label_extension = 'png'
+
     def __init__(self, dataset_path, precache=False, train_augmentations=None, val_augmentations=None, test_augmentations=None, images_dir='images', masks_dir='annotations', resize=True, width=512, height=512, batch_size=16, num_classes=2, mask_downsample=1, train_val_test_split=[0.8, 0.1, 0.1], buffer_size=4, label_shift=0, normalization=(0, 1), dinamic_range=255, ignore_errors=False, seed=None):
 
         self.ids = os.listdir(os.path.join(dataset_path, images_dir))
@@ -237,7 +261,7 @@ class SegmentationAlbumentationsDataLoader:
         images_frames = [os.path.join(dataset_path, images_dir, image_id)
                          for image_id in self.ids]
         labels_frames = [os.path.join(dataset_path, masks_dir, image_id.split(
-            image_id.split('.')[-1])[0]+'png') for image_id in self.ids]
+            image_id.split('.')[-1])[0]+self._label_extension) for image_id in self.ids]
 
         self.precache = precache
 
@@ -326,7 +350,7 @@ class SegmentationAlbumentationsDataLoader:
         for i in range(int(cpu_count()/2)):
             p = WorkerProcess(i, self.augmentations_serialized, self.width,
                               self.height, self.output_width, self.output_height,
-                              clear_url=self.socket_clear)
+                              clear_url=self.socket_clear, mode=self._worker_mode)
             p.daemon = True
             p.start()
 
@@ -373,7 +397,7 @@ class SegmentationAlbumentationsDataLoader:
         num_workers = max(1, int(cpu_count() / 2))
         dummy_img = np.zeros((self.width, self.height, 3), dtype=np.uint8)
         dummy_mask = np.zeros(
-            (self.output_width, self.output_height), dtype=np.uint8)
+            (self.output_width, self.output_height), dtype=self._mask_dtype)
         for attempt in range(attempts):
             try:
                 for i in range(num_workers):
@@ -386,7 +410,7 @@ class SegmentationAlbumentationsDataLoader:
                         raise RuntimeError(
                             'worker pool not ready yet (no/short reply)')
                     got_img = np.frombuffer(reply[0], dtype=np.uint8)
-                    got_mask = np.frombuffer(reply[1], dtype=np.uint8)
+                    got_mask = np.frombuffer(reply[1], dtype=self._mask_dtype)
                     got_idx = np.frombuffer(reply[2], dtype=np.int32)
                     if got_img.size != dummy_img.size or got_mask.size != dummy_mask.size or got_idx.size != 1:
                         raise RuntimeError(
@@ -492,7 +516,7 @@ class SegmentationAlbumentationsDataLoader:
                     if idx not in pending:
                         continue
                     got_img = np.frombuffer(aug_data[0], dtype=np.uint8)
-                    got_msk = np.frombuffer(aug_data[1], dtype=np.uint8)
+                    got_msk = np.frombuffer(aug_data[1], dtype=self._mask_dtype)
                     if got_img.size != img_size or got_msk.size != mask_size:
                         continue
                 except Exception:
@@ -507,7 +531,7 @@ class SegmentationAlbumentationsDataLoader:
                     f'aug_function_parallel: {len(pending)} sample(s) never '
                     f'got a valid reply: {sorted(pending)}')
 
-        return aug_img, aug_msk.astype(np.uint8)
+        return aug_img, aug_msk.astype(self._mask_dtype)
 
     @tf.function(input_signature=[tf.TensorSpec(None, tf.uint8), tf.TensorSpec(None, tf.uint8), tf.TensorSpec(None, tf.string)])
     def augment_data(self, image, label, dset):
@@ -523,8 +547,8 @@ class SegmentationAlbumentationsDataLoader:
         # `expand_animations=False` keeps the output rank-3 for GIFs.
         img = tf.image.decode_image(tf.io.read_file(image), channels=3, expand_animations=False)
 
-        lbl = tf.image.decode_png(tf.io.read_file(label), channels=1)
-        
+        lbl = self._open_label(label)
+
         def fmaker(m):
             def f(): 
                 # tf.print(f'Resizing: {m}')
@@ -545,11 +569,13 @@ class SegmentationAlbumentationsDataLoader:
             name='switch_case'
         )
 
-
-        lbl = tf.cast(tf.image.resize(
-            lbl, [int(self.height/self.mask_downsample), int(self.width/self.mask_downsample)], antialias=False, method=tf.image.ResizeMethod.NEAREST_NEIGHBOR), np.uint8)[:, :, 0]
-
         return img, lbl
+
+    def _open_label(self, label):
+        '''Read one label file and resize it to the target resolution.'''
+        lbl = tf.image.decode_png(tf.io.read_file(label), channels=1)
+        return tf.cast(tf.image.resize(
+            lbl, [int(self.height/self.mask_downsample), int(self.width/self.mask_downsample)], antialias=False, method=tf.image.ResizeMethod.NEAREST_NEIGHBOR), np.uint8)[:, :, 0]
 
     def set_shapes(self, img, label):
 
@@ -571,12 +597,16 @@ class SegmentationAlbumentationsDataLoader:
 
         img.set_shape((self.batch_size, self.width, self.height, 3))
 
+        return img, self._prepare_label(label)
+
+    def _prepare_label(self, label):
+        '''Turn a batch of label maps into the training target.'''
         label = tf.cast(tf.one_hot(tf.cast(label-self.label_shift, tf.uint8),
                                    self.num_classes), tf.float32)
 
         label.set_shape((self.batch_size,  int(self.width/self.mask_downsample),
                         int(self.height/self.mask_downsample), self.num_classes))
-        return img, label
+        return label
 
     def prepare_dataset(self, dataset, dset):
 
@@ -684,6 +714,194 @@ class SegmentationAlbumentationsDataLoader:
                 image=tf.cast(image, tf.uint8),
                 predicted_mask=np.argmax(preds[i], axis=-1)*255,
                 reference_mask=np.argmax(labels[i], axis=-1)*255,
+            )
+
+
+class DepthAlbumentationsDataLoader(SegmentationAlbumentationsDataLoader):
+
+    '''`tf.data` input pipeline for monocular depth estimation with
+    albumentations augmentation.
+
+    Expected layout::
+
+        dataset_path/
+            <images_dir>/   xxx.jpg, yyy.png, ...   (any format `tf.image.decode_image` reads)
+            <depths_dir>/   xxx.png, yyy.png, ...   (same file stem, one depth map per image)
+
+    Depth maps are 16-bit single-channel PNG files (the KITTI and NYU
+    convention: depth = stored value / `depth_divisor`, 0 for a missing
+    measurement) or `.npy` arrays of shape `(H, W)` already in depth units
+    (`depth_extension='npy'`, `depth_divisor=1`). Teacher pseudo-labels
+    from a large depth model can be stored either way.
+
+    `build_datasets()` returns `(train, val, test)` datasets of
+    `(image, depth)` batches. Images are handled exactly as in
+    `SegmentationAlbumentationsDataLoader`. Depth targets are float32 of
+    shape `(batch, height / depth_downsample, width / depth_downsample, 1)`,
+    resized with nearest-neighbour so that missing pixels are not blended
+    into their neighbours. **A target of 0 means "no depth here"**: the
+    depth losses (`losses.scale_invariant_log_loss`,
+    `losses.berhu_loss(mask_invalid=True)`) and the depth metrics
+    (`metrics.DepthAbsRel` and the others) leave those pixels out.
+
+    The augmentation pipeline receives the depth map as the `mask` of the
+    albumentations call, so geometric transforms (flips, crops, rotations)
+    move image and depth together and colour transforms leave the depth
+    untouched. Transforms that rescale the scene (zoom, random scale)
+    change the apparent distance of objects; leave them out when training
+    metric depth.
+
+    The worker pool and its limitations are those of the segmentation
+    loader (square sizes, static batch size, remainder batch dropped).
+
+    Input
+    ----------
+        dataset_path: root directory of the dataset.
+        precache: decode and resize the whole dataset once and cache it in
+                  memory before training.
+        train_augmentations, val_augmentations, test_augmentations: an
+                  `albumentations.Compose` per split, or `None` for no
+                  augmentation.
+        images_dir, depths_dir: sub-directories of `dataset_path`.
+        depth_extension: `'png'` (16-bit) or `'npy'`.
+        depth_divisor: stored value divided by this gives the depth in the
+                  unit of `min_depth` and `max_depth` (256 for KITTI, 1000
+                  for NYU and most depth cameras, which store millimetres).
+        min_depth, max_depth: valid range. Measurements outside it are
+                  marked missing.
+        target: what the dataset yields for a valid pixel:
+                `'depth'` the depth itself, for a model with a linear output;
+                `'normalized'` depth / `max_depth`, in `(0, 1]`;
+                `'inverse'` `min_depth` / depth, in `(0, 1]`, 1 being the
+                nearest. The last two suit the default sigmoid output of
+                `lr_aspp_depth` and `fastdepth_head`.
+        width, height: network input size.
+        batch_size: batch size (static; the last partial batch is dropped).
+        depth_downsample: integer factor between input and target
+                  resolution.
+        train_val_test_split: three fractions of the dataset.
+        buffer_size: shuffle buffer size, in batches.
+        normalization: either a `(min, max)` tuple (linear rescale of
+                  `[0, dinamic_range]`) or a callable such as
+                  `model.preprocessing`.
+        dinamic_range: maximum raw pixel value (255 for 8-bit images).
+        ignore_errors: skip files that fail to decode instead of raising.
+        seed: seed of the one-off shuffle that defines the train/val/test
+              split.
+    '''
+
+    _mask_dtype = np.float32
+    _worker_mode = 'depth'
+
+    def __init__(self, dataset_path, precache=False, train_augmentations=None, val_augmentations=None, test_augmentations=None, images_dir='images', depths_dir='depth', depth_extension='png', depth_divisor=256.0, min_depth=1e-3, max_depth=80.0, target='depth', width=512, height=512, batch_size=16, depth_downsample=1, train_val_test_split=[0.8, 0.1, 0.1], buffer_size=4, normalization=(0, 1), dinamic_range=255, ignore_errors=False, seed=None):
+
+        if target not in ('depth', 'normalized', 'inverse'):
+            raise ValueError(f"Unknown target '{target}' - expected 'depth', 'normalized' or 'inverse'.")
+        if depth_extension not in ('png', 'npy'):
+            raise ValueError(f"Unknown depth_extension '{depth_extension}' - expected 'png' or 'npy'.")
+        if not 0 < min_depth < max_depth:
+            raise ValueError('min_depth and max_depth must satisfy 0 < min_depth < max_depth.')
+
+        self._label_extension = depth_extension
+        self.depth_divisor = float(depth_divisor)
+        self.min_depth = float(min_depth)
+        self.max_depth = float(max_depth)
+        self.target = target
+
+        super().__init__(
+            dataset_path, precache=precache, train_augmentations=train_augmentations,
+            val_augmentations=val_augmentations, test_augmentations=test_augmentations,
+            images_dir=images_dir, masks_dir=depths_dir, width=width, height=height,
+            batch_size=batch_size, num_classes=1, mask_downsample=depth_downsample,
+            train_val_test_split=train_val_test_split, buffer_size=buffer_size,
+            normalization=normalization, dinamic_range=dinamic_range,
+            ignore_errors=ignore_errors, seed=seed)
+
+    def get_class_weights(self):
+        raise NotImplementedError('Depth targets have no classes.')
+
+    @staticmethod
+    def _load_npy(path):
+        depth = np.load(path.decode()).astype(np.float32)
+        return depth.reshape(depth.shape[0], depth.shape[1], 1)
+
+    def _open_label(self, label):
+        if self._label_extension == 'npy':
+            raw = tf.numpy_function(self._load_npy, [label], tf.float32)
+            raw.set_shape((None, None, 1))
+        else:
+            raw = tf.cast(tf.image.decode_png(tf.io.read_file(label), channels=1, dtype=tf.uint16), tf.float32)
+
+        depth = raw / self.depth_divisor
+        depth = tf.image.resize(
+            depth, [int(self.height/self.mask_downsample), int(self.width/self.mask_downsample)],
+            antialias=False, method=tf.image.ResizeMethod.NEAREST_NEIGHBOR)[:, :, 0]
+
+        valid = tf.logical_and(depth >= self.min_depth, depth <= self.max_depth)
+        safe = tf.where(valid, depth, tf.ones_like(depth))
+        if self.target == 'normalized':
+            value = safe / self.max_depth
+        elif self.target == 'inverse':
+            value = self.min_depth / safe
+        else:
+            value = safe
+        return tf.where(valid, value, tf.zeros_like(depth))
+
+    @tf.function(input_signature=[tf.TensorSpec(None, tf.uint8), tf.TensorSpec(None, tf.float32), tf.TensorSpec(None, tf.string)])
+    def augment_data(self, image, label, dset):
+
+        aug_img, aug_msk = tf.numpy_function(func=self.aug_function_parallel, inp=[
+                                             image, label, dset], Tout=[tf.uint8, tf.float32])
+
+        return aug_img, aug_msk
+
+    def _prepare_label(self, label):
+        label = tf.cast(label, tf.float32)[..., tf.newaxis]
+        label.set_shape((self.batch_size, int(self.width/self.mask_downsample),
+                        int(self.height/self.mask_downsample), 1))
+        return label
+
+    def show_images(self, num_images=4, dset='train'):
+        '''Plot `num_images` samples (image and depth target) of one batch of
+        split `dset`. Call `build_datasets()` first.
+        '''
+        res = next(self.datasets[dset].__iter__())
+
+        images = (res[0] - self.normalized_dynamic_range[0]) * \
+            255.0 / \
+            (self.normalized_dynamic_range[1] -
+             self.normalized_dynamic_range[0])
+
+        for i in range(num_images):
+            visualize(
+                image=tf.cast(images[i], tf.uint8),
+                depth=res[1][i][..., 0],
+            )
+
+    def show_results(self, model, num_images=4, dset='test', output=None):
+        '''Plot predictions of `model` against the reference depth for
+        `num_images` samples of one batch of split `dset`. For multi-output
+        models pass the index of the output to show as `output`.
+        '''
+        res = next(self.datasets[dset].__iter__())
+
+        images = res[0]
+        labels = res[1]
+
+        preds = model.predict([images])
+
+        if output is not None:
+            preds = preds[output]
+
+        for i in range(num_images):
+            image = (images[i] - self.normalized_dynamic_range[0]) * \
+                255.0 / \
+                (self.normalized_dynamic_range[1] -
+                 self.normalized_dynamic_range[0])
+            visualize(
+                image=tf.cast(image, tf.uint8),
+                predicted_depth=preds[i][..., 0],
+                reference_depth=labels[i][..., 0],
             )
 
 

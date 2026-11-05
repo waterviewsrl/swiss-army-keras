@@ -66,6 +66,12 @@ Monocular depth
 .. automodule:: swiss_army_keras._model_depth
    :members:
 
+Several heads on one backbone
+-----------------------------
+
+.. automodule:: swiss_army_keras._model_multi_task
+   :members: multi_task
+
 Object detection and instance segmentation
 ------------------------------------------
 
@@ -94,7 +100,7 @@ Data loading
 ------------
 
 .. automodule:: swiss_army_keras.dataset_utils
-   :members: SegmentationAlbumentationsDataLoader, ClassificationAlbumentationsDataLoader
+   :members: SegmentationAlbumentationsDataLoader, DepthAlbumentationsDataLoader, ClassificationAlbumentationsDataLoader
 
 Training
 --------

@@ -12,6 +12,7 @@ from swiss_army_keras.layer_utils import (
     CoordAttLite,
     ECABlock,
     GeMPooling2D,
+    add_embedding_output,
     add_energy_score_output,
     apply_pre_pool_attention,
     energy_score,
@@ -397,3 +398,57 @@ class TestIqaRegressionHead:
         preds = model.predict(np.random.rand(2, HEIGHT, WIDTH, CHANNELS).astype("float32"), verbose=0)
         assert preds.shape == (2, 1)
         assert preds.min() >= 0.0 and preds.max() <= 1.0
+
+
+# `add_embedding_output`: the feature feeding a head as an extra output, for
+# Mahalanobis out-of-distribution statistics (`ood_utils`).
+
+
+class TestAddEmbeddingOutput:
+    def _dense_model(self):
+        L = tf.keras.layers
+        inp = tf.keras.Input((16, 16, 3))
+        x = L.Conv2D(8, 3, strides=2, padding="same", activation="relu", name="feat")(inp)
+        x = L.Dropout(0.1, name="drop")(x)
+        x = L.UpSampling2D(2, name="up")(x)
+        x = L.Conv2D(4, 1, name="head")(x)
+        out = L.Activation("softmax", name="probs")(x)
+        model = tf.keras.Model(inp, out)
+        model.preprocessing = "sentinel"
+        return model
+
+    def test_automatic_choice_skips_the_resize_and_dropout_before_the_head(self):
+        model = self._dense_model()
+        wrapped = add_embedding_output(model)
+
+        assert wrapped.embedding_output_index == 1
+        assert wrapped.preprocessing == "sentinel"
+        assert [tuple(t.shape[1:]) for t in wrapped.outputs] == [(16, 16, 4), (8, 8, 8)]
+
+        x = np.random.rand(2, 16, 16, 3).astype("float32")
+        probabilities, embedding = wrapped.predict(x, verbose=0)
+        np.testing.assert_allclose(probabilities, model.predict(x, verbose=0), atol=1e-6)
+        feature = tf.keras.Model(model.input, model.get_layer("feat").output).predict(x, verbose=0)
+        np.testing.assert_allclose(embedding, feature, atol=1e-6)
+
+    def test_layer_can_be_named_and_unknown_names_are_rejected(self):
+        model = self._dense_model()
+        wrapped = add_embedding_output(model, layer="up")
+        assert tuple(wrapped.outputs[1].shape[1:]) == (16, 16, 8)
+        with pytest.raises(ValueError, match="no layer named"):
+            add_embedding_output(model, layer="nope")
+
+    def test_classifier_embedding_is_the_hidden_dense_output(self):
+        inp = tf.keras.Input((64, 64, 3))
+        model = classifier(inp, 5, backbone="MobileNetV2", weights=None, freeze_backbone=False, size=32)
+        wrapped = add_embedding_output(model)
+        assert [tuple(t.shape[1:]) for t in wrapped.outputs] == [(5,), (32,)]
+
+    def test_lr_aspp_embedding_is_the_decoder_feature_before_the_final_resize(self):
+        inp = tf.keras.Input((64, 64, 3))
+        model = lr_aspp(inp, n_labels=3, backbone="MobileNetV2", weights=None, freeze_backbone=False)
+        wrapped = add_embedding_output(model)
+        assert tuple(wrapped.outputs[1].shape[1:]) == (16, 16, 128 + 48)
+        # the QAT prefix is tried for a layer given by its builder name
+        by_name = add_embedding_output(model, layer="lr_aspp_shallow_proj_bn")
+        assert tuple(by_name.outputs[1].shape[1:]) == (16, 16, 48)

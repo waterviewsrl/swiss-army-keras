@@ -139,6 +139,71 @@ and a classifier head, which returns softmax probabilities:
 Use ``"categorical_crossentropy"`` (labels are one-hot) or one of the focal
 losses, then ``TrainingDriver`` as above.
 
+Monocular depth
+***************
+
+The depth loader pairs each image with a depth map (16-bit PNG or ``.npy``)
+and yields float targets in which 0 means "no depth here". The losses and
+metrics below leave those pixels out.
+
+.. code-block:: python
+
+   from functools import partial
+
+   from swiss_army_keras.models import fastdepth_head
+   from swiss_army_keras.dataset_utils import DepthAlbumentationsDataLoader
+   from swiss_army_keras.losses import berhu_loss
+   from swiss_army_keras.metrics import DepthAbsRel, DepthDeltaAccuracy
+
+   input_tensor = tf.keras.layers.Input((256, 256, 3))
+   model = fastdepth_head(input_tensor, backbone="MobileNetV4-Conv-S", weights=None)   # sigmoid output in [0, 1]
+
+   loader = DepthAlbumentationsDataLoader(
+       dataset_path="/data/nyu", images_dir="images", depths_dir="depth",
+       depth_divisor=1000.0, min_depth=0.1, max_depth=10.0,
+       target="normalized",                 # depth / max_depth, to match the sigmoid output
+       width=256, height=256, batch_size=16,
+       normalization=model.preprocessing, seed=0,
+   )
+   train_set, val_set, test_set = loader.build_datasets()
+
+   loss = partial(berhu_loss, mask_invalid=True)
+   model_metrics = [DepthAbsRel(), DepthDeltaAccuracy(1.25)]
+
+Choose ``target`` to match the model output: ``'normalized'`` or
+``'inverse'`` for the default sigmoid output, ``'depth'`` for
+``output_mode='linear'``. For depth known only up to scale, such as
+pseudo-labels from a large teacher model, train with
+``losses.scale_invariant_log_loss`` and evaluate with
+``DepthAbsRel(align='median')``.
+
+Several heads on one backbone
+*****************************
+
+``multi_task`` builds the backbone once and attaches any number of heads,
+so two tasks on the same frame cost one backbone pass and export as one
+file:
+
+.. code-block:: python
+
+   from swiss_army_keras.models import multi_task
+
+   model = multi_task(
+       tf.keras.layers.Input((384, 384, 3)),
+       heads={
+           "seg":   dict(type="lr_aspp", n_labels=4, gate=False),
+           "depth": dict(type="fastdepth"),
+       },
+       backbone="MobileNetV4-Conv-S", weights=None,
+   )
+   model.compile(optimizer="adam", loss={"seg": seg_loss, "depth": depth_loss},
+                 loss_weights={"seg": 1.0, "depth": 0.5})
+
+Outputs are named after the heads. The data loaders yield one target per
+image, so a dataset with one target per head has to be assembled by the
+caller, and ``TrainingDriver`` assumes a single output. See
+:doc:`model_zoo` for the head types.
+
 Things to know
 **************
 
@@ -148,12 +213,13 @@ Things to know
 * **Square inputs with the data loaders.** The loaders do not treat ``width``
   and ``height`` consistently; use equal values.
 * **Feature-pyramid depth differs by backbone.** Most backbones expose five
-  taps (strides 2 to 32). RepViT and FastViT expose four (strides 4 to 32):
-  pass ``deep_layer=4`` (and ``shallow_layer=1`` or ``2``) to
-  ``lr_aspp`` / ``deeplab_v3_plus`` / the classifiers, and
-  ``feature_levels=(2, 3, 4)`` to ``pp_liteseg`` and the detectors.
-  StrideFormer exposes three (strides 8 to 32): ``feature_levels=(1, 2, 3)``,
-  ``deep_layer=3``.
+  taps (strides 2 to 32), RepViT and FastViT four (strides 4 to 32),
+  StrideFormer three (strides 8 to 32). ``lr_aspp``, the depth heads and
+  ``multi_task`` pick levels that exist for the backbone. The other builders
+  still default to five levels: for RepViT and FastViT pass ``deep_layer=4``
+  to ``deeplab_v3_plus`` and the classifiers, and
+  ``feature_levels=(2, 3, 4)`` to ``pp_liteseg`` and the detectors; for
+  StrideFormer ``deep_layer=3`` and ``feature_levels=(1, 2, 3)``.
 * **No heavy defaults.** ``weights='imagenet'`` downloads weights for the
   ``tf.keras.applications`` backbones only; see :ref:`pretrained-weights` for
   the others.

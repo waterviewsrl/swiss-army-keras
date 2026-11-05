@@ -86,6 +86,14 @@ The recommended order is in section 6.
 > raises the priority of QARepVGG-style blocks and of better activation
 > calibration, and it means the "Good" ratings of fused MobileOne and
 > MobileNetV2 in the section 3 table hold for operator support only.
+>
+> **Third update, same day.** The multi-task model builder of section 4.5
+> exists as `multi_task` (loss balancing and a multi-target data loader are
+> still open). Depth heads now build on every backbone family and export
+> for ARTPEC-8 without their final sigmoid. Out-of-distribution scoring has
+> an embedding output, a NumPy-only distance for devices and evaluation
+> metrics; the dense anomaly detection row of section 4.5 still needs
+> per-location statistics and a recipe.
 
 ---
 

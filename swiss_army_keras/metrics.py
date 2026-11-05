@@ -1,5 +1,6 @@
-'''Metrics: `MeanIOU` (one-hot aware mean IoU), `BoundaryFScore` and
-`MeanAveragePrecision`.
+'''Metrics: `MeanIOU` (one-hot aware mean IoU), `BoundaryFScore`,
+`MeanAveragePrecision`, and the monocular depth metrics `DepthAbsRel`,
+`DepthRMSE` and `DepthDeltaAccuracy`.
 '''
 import numpy as np
 import tensorflow as tf
@@ -335,4 +336,154 @@ class MeanAveragePrecision(tf.keras.metrics.Metric):
     def get_config(self):
         config = super().get_config()
         config.update({'n_classes': self.n_classes, 'iou_threshold': self.iou_threshold})
+        return config
+
+
+# ========================= #
+# Monocular depth metrics
+
+
+def _median_scale(y_true, y_pred, valid):
+    '''Per-image factor that brings the median prediction onto the median
+    target, over valid pixels. Inputs are `(batch, pixels)`.
+    '''
+    def masked_median(values):
+        count = tf.reduce_sum(tf.cast(valid, tf.int32), axis=1)
+        ordered = tf.sort(tf.where(valid, values, tf.fill(tf.shape(values), values.dtype.max)), axis=1)
+        index = tf.maximum(count - 1, 0) // 2
+        return tf.gather(ordered, index, axis=1, batch_dims=1)
+
+    scale = masked_median(y_true) / tf.maximum(masked_median(y_pred), tf.keras.backend.epsilon())
+    return scale[:, tf.newaxis]
+
+
+class _DepthMetric(tf.keras.metrics.Metric):
+    '''Base of the depth metrics: masks invalid pixels, optionally aligns
+    the prediction, and averages a per-pixel quantity over all valid pixels
+    seen. Subclasses implement `_per_pixel(y_true, y_pred)`.
+    '''
+
+    def __init__(self, align=None, name=None, **kwargs):
+        super().__init__(name=name, **kwargs)
+        if align not in (None, 'median'):
+            raise ValueError(f"Unknown align '{align}' - expected None or 'median'.")
+        self.align = align
+        self.total = self.add_weight(name='total', initializer='zeros', dtype=tf.float32)
+        self.count = self.add_weight(name='count', initializer='zeros', dtype=tf.float32)
+
+    def _per_pixel(self, y_true, y_pred):
+        raise NotImplementedError
+
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        y_pred = tf.cast(y_pred, tf.float32)
+        y_true = tf.cast(y_true, tf.float32)
+        batch = tf.shape(y_pred)[0]
+        y_pred = tf.reshape(y_pred, (batch, -1))
+        y_true = tf.reshape(y_true, (batch, -1))
+
+        valid = y_true > 0
+        y_pred = tf.maximum(y_pred, tf.keras.backend.epsilon())
+        if self.align == 'median':
+            y_pred = y_pred * _median_scale(y_true, y_pred, valid)
+
+        safe_true = tf.where(valid, y_true, tf.ones_like(y_true))
+        values = tf.where(valid, self._per_pixel(safe_true, y_pred), tf.zeros_like(y_pred))
+        self.total.assign_add(tf.reduce_sum(values))
+        self.count.assign_add(tf.reduce_sum(tf.cast(valid, tf.float32)))
+
+    def result(self):
+        return tf.math.divide_no_nan(self.total, self.count)
+
+    def reset_state(self):
+        self.total.assign(0.0)
+        self.count.assign(0.0)
+
+    def get_config(self):
+        config = super().get_config()
+        config['align'] = self.align
+        return config
+
+
+class DepthAbsRel(_DepthMetric):
+    '''Absolute relative error of a depth map, `mean(|pred - true| / true)`
+    (Eigen et al., 2014). Lower is better.
+
+    Pixels with `y_true <= 0` are missing depth and are left out, the same
+    convention as `losses.scale_invariant_log_loss`. The mean is taken over
+    all valid pixels of all batches.
+
+    Input
+    ----------
+        align: `None` (default) compares the prediction as it is, for
+               metric depth. `'median'` first multiplies each predicted
+               image by `median(true) / median(pred)`, the usual protocol
+               for models that predict depth up to an unknown scale.
+        name: metric name (`'depth_abs_rel'`).
+    '''
+
+    def __init__(self, align=None, name='depth_abs_rel', **kwargs):
+        super().__init__(align=align, name=name, **kwargs)
+
+    def _per_pixel(self, y_true, y_pred):
+        return tf.abs(y_pred - y_true) / y_true
+
+
+class DepthRMSE(_DepthMetric):
+    '''Root mean squared error of a depth map, in the unit of the targets,
+    or of its logarithm with `log=True` (Eigen et al., 2014). Lower is
+    better.
+
+    The squared error is averaged over all valid pixels (`y_true > 0`) of
+    all batches before the square root.
+
+    Input
+    ----------
+        log: `False` (default) for the error of the depth, `True` for the
+             error of `log(depth)`.
+        align: see `DepthAbsRel`.
+        name: metric name (`'depth_rmse'`, or `'depth_rmse_log'`).
+    '''
+
+    def __init__(self, log=False, align=None, name=None, **kwargs):
+        super().__init__(align=align, name=name or ('depth_rmse_log' if log else 'depth_rmse'), **kwargs)
+        self.log = log
+
+    def _per_pixel(self, y_true, y_pred):
+        if self.log:
+            return tf.square(tf.math.log(y_pred) - tf.math.log(y_true))
+        return tf.square(y_pred - y_true)
+
+    def result(self):
+        return tf.sqrt(super().result())
+
+    def get_config(self):
+        config = super().get_config()
+        config['log'] = self.log
+        return config
+
+
+class DepthDeltaAccuracy(_DepthMetric):
+    '''Threshold accuracy of a depth map: the fraction of valid pixels with
+    `max(pred / true, true / pred) < threshold` (Eigen et al., 2014).
+    Higher is better. The three figures usually reported are the thresholds
+    1.25, 1.25**2 and 1.25**3.
+
+    Input
+    ----------
+        threshold: the ratio threshold (`1.25`).
+        align: see `DepthAbsRel`.
+        name: metric name (`'depth_delta'`).
+    '''
+
+    def __init__(self, threshold=1.25, align=None, name='depth_delta', **kwargs):
+        super().__init__(align=align, name=name, **kwargs)
+        self.threshold = threshold
+
+    def _per_pixel(self, y_true, y_pred):
+        ratio = tf.maximum(y_pred / y_true, y_true / y_pred)
+        return tf.cast(ratio < self.threshold, tf.float32)
+
+    def get_config(self):
+        config = super().get_config()
+        config['threshold'] = self.threshold
         return config

@@ -16,6 +16,10 @@ from swiss_army_keras.ood_utils import (
     dense_mahalanobis_distance,
     fit_class_statistics,
     mahalanobis_distance,
+    ood_detection_metrics,
+    sample_dense_embeddings,
+    whiten_statistics,
+    whitened_distance,
 )
 
 
@@ -165,3 +169,80 @@ def test_calibrate_threshold_matches_numpy_percentile():
     scores = np.arange(100)
     threshold = calibrate_threshold(scores, percentile=95.0)
     np.testing.assert_allclose(threshold, np.percentile(scores, 95.0))
+
+
+class TestWhitenedDistance:
+    def _statistics(self):
+        rng = np.random.default_rng(0)
+        mixing = rng.normal(size=(6, 6))
+        embeddings = np.concatenate([rng.normal(size=(200, 6)) @ mixing + offset for offset in (0.0, 4.0, -3.0)])
+        labels = np.repeat(np.arange(3), 200)
+        return fit_class_statistics(embeddings, labels, 3), rng
+
+    def test_matches_mahalanobis_distance_for_both_class_options(self):
+        (means, cholesky), rng = self._statistics()
+        projection, whitened_means = whiten_statistics(means, cholesky)
+        assert projection.dtype == np.float32 and whitened_means.shape == (3, 6)
+
+        x = rng.normal(size=(50, 6)) * 3
+        np.testing.assert_allclose(
+            whitened_distance(x, projection, whitened_means), mahalanobis_distance(x, means, cholesky), rtol=1e-3)
+        predicted = rng.integers(0, 3, size=50)
+        np.testing.assert_allclose(
+            whitened_distance(x, projection, whitened_means, predicted_class=predicted),
+            mahalanobis_distance(x, means, cholesky, predicted_class=predicted), rtol=1e-3)
+
+    def test_accepts_single_vectors_and_dense_maps(self):
+        (means, cholesky), rng = self._statistics()
+        projection, whitened_means = whiten_statistics(means, cholesky)
+
+        vector = rng.normal(size=6)
+        assert np.ndim(whitened_distance(vector, projection, whitened_means)) == 0
+
+        feature_map = rng.normal(size=(5, 7, 6))
+        np.testing.assert_allclose(
+            whitened_distance(feature_map, projection, whitened_means),
+            dense_mahalanobis_distance(feature_map, means, cholesky), rtol=1e-3)
+        batch = rng.normal(size=(2, 5, 7, 6))
+        assert whitened_distance(batch, projection, whitened_means).shape == (2, 5, 7)
+
+
+class TestSampleDenseEmbeddings:
+    def test_reads_the_label_under_each_feature_location(self):
+        # 2x2 feature map over a 4x4 label map whose quadrants are classes 0..3
+        labels = np.zeros((1, 4, 4), dtype=int)
+        labels[0, :2, 2:], labels[0, 2:, :2], labels[0, 2:, 2:] = 1, 2, 3
+        features = np.arange(4, dtype=np.float32).reshape(1, 2, 2, 1)
+
+        embeddings, sampled = sample_dense_embeddings(features, labels, max_per_class=None)
+        np.testing.assert_array_equal(sampled, [0, 1, 2, 3])
+        np.testing.assert_array_equal(embeddings[:, 0], [0, 1, 2, 3])
+
+    def test_caps_per_class_accepts_one_hot_and_ignores_a_label(self):
+        rng = np.random.default_rng(0)
+        labels = rng.integers(0, 3, size=(2, 16, 16))
+        one_hot = np.eye(3)[labels]
+        features = rng.normal(size=(2, 16, 16, 5))
+
+        embeddings, sampled = sample_dense_embeddings(features, one_hot, max_per_class=10, ignore_label=2)
+        assert embeddings.shape == (20, 5)
+        assert sorted(np.unique(sampled)) == [0, 1]
+        assert (np.bincount(sampled) == 10).all()
+
+
+class TestOodDetectionMetrics:
+    def test_perfect_separation(self):
+        result = ood_detection_metrics([0.0, 1.0, 2.0], [5.0, 6.0])
+        assert result["auroc"] == 1.0 and result["fpr_at_95_tpr"] == 0.0
+
+    def test_hand_computed_values(self):
+        # pairs (ood, in): 2.5 beats 1 and 2 (2 wins); 0.5 beats none; ties: none -> 2 / 6
+        result = ood_detection_metrics([1.0, 2.0, 3.0], [2.5, 0.5])
+        assert result["auroc"] == pytest.approx(2.0 / 6.0)
+        assert result["threshold"] == pytest.approx(np.percentile([1.0, 2.0, 3.0], 95))
+        assert result["fpr_at_95_tpr"] == 1.0  # both below the threshold, so both are accepted
+
+    def test_ties_count_one_half_and_empty_input_is_rejected(self):
+        assert ood_detection_metrics([1.0, 1.0], [1.0])["auroc"] == 0.5
+        with pytest.raises(ValueError):
+            ood_detection_metrics([], [1.0])

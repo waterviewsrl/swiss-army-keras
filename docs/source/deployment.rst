@@ -312,6 +312,94 @@ builders offer a plain variant, to be chosen before training:
 * ``pp_liteseg(..., fusion='add')``: the two features are added instead of
   blended by the UAFM attention.
 
+Final sigmoid and softmax
+*************************
+
+The operator lists differ on the two activations that usually end a model:
+``LOGISTIC`` (sigmoid) is not listed for ARTPEC-8 and ``SOFTMAX`` is not
+listed for ARTPEC-9. Both are weightless, so they can be left out of the
+exported file without retraining. The file then returns the logits and the
+application applies the activation, which on a uint8 output is a 256-entry
+lookup table for a sigmoid, or an ``argmax`` if only the class is needed.
+
+.. code-block:: python
+
+   Quantizer(dataset, model, "depth", profile="artpec8", drop_output_activations=True).quantize()
+   # or, by hand, on the stripped model:
+   plain = deploy_utils.drop_output_activations(deploy_utils.strip_qat(model))
+   plain.dropped_output_activations      # e.g. ['sigmoid']: what the application now applies
+
+This is what makes the depth heads pass the ARTPEC-8 check with their
+default sigmoid output, and ``classifier`` pass the ARTPEC-9 check.
+Activations inside the network are not touched: the hidden layer of
+``classifier`` uses swish by default, which also needs a sigmoid, so pass
+``activation='relu'`` when building a classifier for these targets.
+
+Models with several outputs
+***************************
+
+A model with an image-quality side head, an embedding output or several
+``multi_task`` heads exports as one file with several outputs. The
+converter does not keep the Keras output order, and the tensor names in
+the file do not identify the heads. ``deploy_utils.tflite_outputs`` returns
+the mapping an application needs when the runtime hands back outputs by
+position:
+
+.. code-block:: python
+
+   for output in deploy_utils.tflite_outputs("model_quant_ui8.tflite"):
+       print(output)
+   # {'position': 0, 'name': 'cls',   'shape': (1, 4),           'dtype': 'uint8', 'scale': ..., 'zero_point': ...}
+   # {'position': 1, 'name': 'depth', 'shape': (1, 384, 384, 1), 'dtype': 'uint8', 'scale': ..., 'zero_point': ...}
+   # {'position': 2, 'name': 'seg',   'shape': (1, 384, 384, 4), 'dtype': 'uint8', 'scale': ..., 'zero_point': ...}
+
+The real value of a stored value ``q`` is ``scale * (q - zero_point)``.
+
+Out-of-distribution scores on a device
+**************************************
+
+Neither score runs on the accelerator: the energy score needs ``EXP``,
+``LOG`` and ``SUM``, and the Mahalanobis distance a matrix product, a
+square and a minimum over classes, none of which the Axis lists cover as a
+whole. Export the plain model and compute the score on the host processor
+from the returned tensors.
+
+* **Energy score.** Export with the logits as an output (a segmentation
+  decoder already returns logits; for a classifier use
+  ``return_logits=True`` or ``drop_output_activations``). Dequantize the
+  logits and apply ``-logsumexp``. Do not export a model wrapped with
+  ``add_energy_score_output`` for an accelerator: the check rejects it.
+* **Mahalanobis distance.** Wrap the trained model with
+  ``layer_utils.add_embedding_output`` before export, so the file returns
+  the embedding next to the prediction. Fit the statistics offline, turn
+  them into the matrix-product form, and ship the two arrays:
+
+  .. code-block:: python
+
+     from swiss_army_keras import ood_utils
+     from swiss_army_keras.layer_utils import add_embedding_output
+
+     model = add_embedding_output(trained_classifier)             # outputs: probabilities, embedding
+     _, embeddings = model.predict(calibration_images)
+     means, cholesky = ood_utils.fit_class_statistics(embeddings, labels, n_classes)
+     projection, whitened_means = ood_utils.whiten_statistics(means, cholesky)
+     np.savez("ood_statistics.npz", projection=projection, whitened_means=whitened_means)
+
+     # on the device, NumPy only:
+     score = ood_utils.whitened_distance(embedding, projection, whitened_means)
+
+  For a segmentation model the embedding is a feature map at a quarter of
+  the input resolution; ``ood_utils.sample_dense_embeddings`` draws the
+  per-pixel embeddings and labels for the fit, and ``whitened_distance``
+  scores a whole map. Prefer embeddings read from the exported file for the
+  fit, so the statistics include its quantization error.
+* **Threshold and evaluation.** ``ood_utils.calibrate_threshold`` sets the
+  threshold from in-distribution scores; ``ood_utils.ood_detection_metrics``
+  reports AUROC and the false positive rate at 95% true positive rate when
+  a set of known out-of-distribution inputs is available.
+
+None of this has been evaluated on a trained model in this repository yet.
+
 Checking an exported model
 **************************
 
@@ -438,6 +526,10 @@ Known limitations
 * Several architectures use operators outside the published Axis lists
   (sigmoid gates, explicit padding, GELU, squeeze-excite, dilated
   convolutions). The lint reports them; it does not rewrite the model.
+  ``drop_output_activations`` only removes a final sigmoid or softmax.
+* The image-quality head pools with GeM by default, which the converter
+  leaves in floating point. Use ``pooling='avg'`` for an integer-only
+  target (in ``multi_task``: ``dict(type='iqa', pooling='avg')``).
 * The lint checks only part of the published per-operator constraints (for
   example not the pooling window limits of ARTPEC-9).
 * The detectors run box decoding and NMS inside the graph; on an accelerator

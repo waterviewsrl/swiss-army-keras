@@ -10,6 +10,71 @@ from swiss_army_keras.layer_utils import GeMPooling2D, apply_pre_pool_attention,
 import tensorflow_model_optimization as tfmot
 
 
+def classification_head(feature, n_classes, pooling='avg', pre_pool_attention=None, size=1024, activation="swish",
+                        kernel_regularizer=l2(0.001), bias_regularizer=l2(0.001), dropout=0.3,
+                        return_logits=False, name='classifier', named_layers=False):
+    '''The pooling and dense tail of `classifier` on an existing feature map.
+
+    This is the part of `classifier` that follows the backbone. It is
+    exposed so that several heads can share one backbone (see `multi_task`).
+    The layers are annotated for quantization-aware training but
+    `quantize_apply` is left to the caller.
+
+    Input
+    ----------
+        feature: the backbone feature map to classify.
+        n_classes, pooling, pre_pool_attention, size, activation,
+        kernel_regularizer, bias_regularizer, dropout, return_logits: see
+            `classifier`.
+        name: prefix of the attention and pooling layers.
+        named_layers: `False` (default) leaves the dense layers with the
+            automatic names `classifier` has always given them. `True`
+            names every layer after `name` (`<name>_pool`, `<name>_fc`,
+            `<name>_dropout`, `<name>_logits`, `<name>_probs`), which a
+            model with several heads needs.
+
+    Output
+    ----------
+        The probabilities tensor, or `[probabilities, logits]` when
+        `return_logits=True`.
+    '''
+    def layer_name(suffix):
+        return '{}_{}'.format(name, suffix) if named_layers else None
+
+    feature = apply_pre_pool_attention(feature, pre_pool_attention, name='{}_attn'.format(name))
+
+    if pre_pool_attention == 'gem':
+        pool = GeMPooling2D(name='{}_gem'.format(name))(feature)
+    elif pooling == 'avg':
+        pool = qat_annotate_layer(tf.keras.layers.GlobalAveragePooling2D(name=layer_name('pool')))(feature)
+    else:
+        pool = qat_annotate_layer(tf.keras.layers.GlobalMaxPool2D(name=layer_name('pool')))(feature)
+
+    pre_classifier = qat_annotate_layer(tf.keras.layers.Dense(
+        size,
+        activation=activation,
+        kernel_regularizer=kernel_regularizer,
+        bias_regularizer=bias_regularizer,
+        name=layer_name('fc'),
+    ))(
+        pool
+    )  # was 128
+
+    drop_out_class = qat_annotate_layer(
+        tf.keras.layers.Dropout(dropout, name=layer_name('dropout')))(pre_classifier)
+
+    if return_logits:
+        logits = qat_annotate_layer(tf.keras.layers.Dense(
+            n_classes, activation=None, kernel_regularizer=kernel_regularizer, bias_regularizer=bias_regularizer,
+            name=layer_name('logits')))(drop_out_class)
+        probabilities = qat_annotate_layer(tf.keras.layers.Activation('softmax', name=layer_name('probs')))(logits)
+        return [probabilities, logits]
+
+    return qat_annotate_layer(tf.keras.layers.Dense(
+        n_classes, activation='softmax', kernel_regularizer=kernel_regularizer, bias_regularizer=bias_regularizer,
+        name=layer_name('probs')))(drop_out_class)
+
+
 def classifier(input_tensor, n_classes, backbone='MobileNetV3Large', weights='imagenet', freeze_backbone=True, freeze_batch_norm=True, name='classifier', deep_layer=5, pooling='avg', pre_pool_attention=None, size=1024, activation="swish", kernel_regularizer=l2(0.001), bias_regularizer=l2(0.001), dropout=0.3, return_logits=False, iqa_head=False):
     '''
     ---------- (`pre_pool_attention`, plan.md §9.1) ----------
@@ -50,35 +115,11 @@ def classifier(input_tensor, n_classes, backbone='MobileNetV3Large', weights='im
         backbone, weights, input_tensor, deep_layer, freeze_backbone, freeze_batch_norm)
 
     base_model = backbone_([input_tensor, ])[deep_layer-1]
-    base_model = apply_pre_pool_attention(base_model, pre_pool_attention, name='{}_attn'.format(name))
 
-    if pre_pool_attention == 'gem':
-        pool = GeMPooling2D(name='{}_gem'.format(name))(base_model)
-    else:
-        pool = qat_annotate_layer(tf.keras.layers.GlobalAveragePooling2D())(
-            base_model) if pooling == 'avg' else qat_annotate_layer(tf.keras.layers.GlobalMaxPool2D())(base_model)
-
-    pre_classifier = qat_annotate_layer(tf.keras.layers.Dense(
-        size,
-        activation=activation,
-        kernel_regularizer=kernel_regularizer,
-        bias_regularizer=bias_regularizer,
-    ))(
-        pool
-    )  # was 128
-
-    drop_out_class = qat_annotate_layer(
-        tf.keras.layers.Dropout(dropout))(pre_classifier)
-
-    if return_logits:
-        logits = qat_annotate_layer(tf.keras.layers.Dense(
-            n_classes, activation=None, kernel_regularizer=kernel_regularizer, bias_regularizer=bias_regularizer))(drop_out_class)
-        classifier = qat_annotate_layer(tf.keras.layers.Activation('softmax'))(logits)
-        outputs = [classifier, logits]
-    else:
-        classifier = qat_annotate_layer(tf.keras.layers.Dense(
-            n_classes, activation='softmax', kernel_regularizer=kernel_regularizer, bias_regularizer=bias_regularizer))(drop_out_class)
-        outputs = classifier
+    outputs = classification_head(
+        base_model, n_classes, pooling=pooling, pre_pool_attention=pre_pool_attention, size=size,
+        activation=activation, kernel_regularizer=kernel_regularizer, bias_regularizer=bias_regularizer,
+        dropout=dropout, return_logits=return_logits, name=name)
 
     if iqa_head:
         iqa_score = iqa_regression_head(base_model, name='{}_iqa'.format(name))

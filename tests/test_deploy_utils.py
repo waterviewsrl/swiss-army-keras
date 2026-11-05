@@ -364,3 +364,82 @@ def test_quantization_error_reports_one_entry_per_output():
     assert set(int8[0]) == {"sqnr_db", "rmse", "max_abs_error", "float_std"}
     assert float16[0]["sqnr_db"] > 40           # float16 weights are nearly exact
     assert 5 < int8[0]["sqnr_db"] < float16[0]["sqnr_db"]
+
+
+# --------------------------------------------------------------------------- #
+# Output activations and output description
+
+def _two_output_model():
+    """A sigmoid map named by an identity layer, and a fused-softmax vector."""
+    tf.keras.utils.set_random_seed(0)
+    inp = tf.keras.Input((SIZE, SIZE, 3))
+    x = L.Conv2D(8, 3, strides=2, padding="same", activation="relu")(inp)
+    depth = L.Conv2D(1, 1, name="depth_conv")(x)
+    depth = L.Activation("sigmoid", name="depth_sigmoid")(depth)
+    depth = L.Activation("linear", name="depth")(depth)
+    cls = L.Dense(3, activation="softmax", name="cls")(L.GlobalAveragePooling2D()(x))
+    model = tf.keras.Model(inp, [depth, cls])
+    model.preprocessing = "sentinel"
+    return model
+
+
+def test_drop_output_activations_returns_logits_and_keeps_names():
+    model = _two_output_model()
+    dropped = du.drop_output_activations(model)
+
+    assert dropped is not model
+    assert dropped.dropped_output_activations == ["sigmoid", "softmax"]
+    assert dropped.preprocessing == "sentinel"
+    assert dropped.output_names[0] == "depth"  # the naming layer is kept
+
+    x = np.random.default_rng(0).random((2, SIZE, SIZE, 3), dtype=np.float32)
+    depth, probabilities = model.predict(x, verbose=0)
+    depth_logits, logits = dropped.predict(x, verbose=0)
+    np.testing.assert_allclose(tf.sigmoid(depth_logits).numpy(), depth, atol=1e-6)
+    np.testing.assert_allclose(tf.nn.softmax(logits).numpy(), probabilities, atol=1e-6)
+
+
+def test_drop_output_activations_is_selective_and_a_no_op_without_activations():
+    model = _two_output_model()
+    only_sigmoid = du.drop_output_activations(model, activations=("sigmoid",))
+    assert only_sigmoid.dropped_output_activations == ["sigmoid", None]
+
+    plain = _toy_model()
+    assert du.drop_output_activations(plain) is plain
+
+
+def test_drop_output_activations_handles_qat_wrapped_and_tf_op_sigmoids():
+    tf.keras.utils.set_random_seed(0)
+    inp = tf.keras.Input((SIZE, SIZE, 3))
+    x = qat_annotate_layer(L.Conv2D(1, 3, padding="same", name="h_conv"))(inp)
+    x = qat_annotate_layer(L.Activation("sigmoid", name="h_sigmoid"))(x)
+    with tfmot.quantization.keras.quantize_scope():
+        qat = tfmot.quantization.keras.quantize_apply(tf.keras.Model(inp, x))
+    assert du.drop_output_activations(qat).dropped_output_activations == ["sigmoid"]
+
+    inp = tf.keras.Input((SIZE, SIZE, 3))
+    wrapped = tf.keras.Model(inp, tf.sigmoid(L.Conv2D(1, 3, padding="same")(inp)))
+    dropped = du.drop_output_activations(wrapped)
+    assert dropped.dropped_output_activations == ["sigmoid"]
+    x = np.random.default_rng(0).random((1, SIZE, SIZE, 3), dtype=np.float32)
+    np.testing.assert_allclose(tf.sigmoid(dropped.predict(x, verbose=0)).numpy(), wrapped.predict(x, verbose=0), atol=1e-6)
+
+
+def test_dropping_the_sigmoid_removes_logistic_from_the_export():
+    model = _two_output_model()
+    with_sigmoid = du.list_tflite_ops(du.convert_to_tflite(model, _representative, profile="artpec8"))
+    without = du.list_tflite_ops(du.convert_to_tflite(du.drop_output_activations(model), _representative, profile="artpec8"))
+    assert "LOGISTIC" in with_sigmoid and "SOFTMAX" in with_sigmoid
+    assert "LOGISTIC" not in without and "SOFTMAX" not in without
+
+
+def test_tflite_outputs_maps_file_positions_to_keras_output_names():
+    model = _two_output_model()
+    described = du.tflite_outputs(du.convert_to_tflite(model, _representative, profile="artpec8"))
+
+    assert [d["position"] for d in described] == [0, 1]
+    by_name = {d["name"]: d for d in described}
+    assert set(by_name) == {"depth", "cls"}
+    assert by_name["depth"]["shape"] == (1, SIZE // 2, SIZE // 2, 1)
+    assert by_name["cls"]["shape"] == (1, 3)
+    assert all(d["dtype"] == "uint8" and d["scale"] > 0 for d in described)

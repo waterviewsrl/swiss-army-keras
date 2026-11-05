@@ -21,7 +21,7 @@ convolutions.
 from __future__ import absolute_import
 
 from swiss_army_keras.layer_utils import *
-from swiss_army_keras._backbone_zoo import backbone_zoo
+from swiss_army_keras._backbone_zoo import backbone_zoo, backbone_num_levels
 from swiss_army_keras._model_unet_2d import UNET_left
 
 from tensorflow.keras.layers import (
@@ -88,8 +88,95 @@ def lr_aspp_module(deep_feature, num_filters=128, name='lr_aspp_module', gate=Tr
     return Multiply(name=f'{name}_gate')([branch_1x1, pooled])
 
 
+def resolve_lr_aspp_levels(n_levels, deep_layer=None, shallow_layer=None, what='the encoder'):
+    '''Resolve the deep and shallow feature levels of an LR-ASPP decoder.
+
+    Input
+    ----------
+        n_levels: number of feature levels the encoder exposes.
+        deep_layer: 1-indexed level feeding the LR-ASPP module, or `None`
+                    for the deepest one.
+        shallow_layer: 1-indexed level of the skip connection, or `None`
+                       for three levels above the deep one (never above the
+                       first). On five-level and four-level backbones this
+                       is the stride-4 feature.
+        what: name used in error messages.
+
+    Output
+    ----------
+        `(deep_layer, shallow_layer)` as ints. Raises `ValueError` when a
+        requested level does not exist.
+    '''
+    if deep_layer is None:
+        deep_layer = n_levels
+    if shallow_layer is None:
+        shallow_layer = max(1, deep_layer - 3)
+    if not 1 <= deep_layer <= n_levels:
+        raise ValueError(
+            f'{what} exposes {n_levels} feature levels, got deep_layer={deep_layer}. '
+            f'Pass a value between 1 and {n_levels}, or None for the deepest level.')
+    if not 1 <= shallow_layer <= deep_layer:
+        raise ValueError(
+            f'shallow_layer must be between 1 and deep_layer ({deep_layer}), got {shallow_layer}.')
+    return deep_layer, shallow_layer
+
+
+def lr_aspp_head(features, input_tensor, n_labels, deep_layer=None, shallow_layer=None,
+                 num_filters=128, num_filters_shallow=48, name='lr_aspp', gate=True):
+    '''The LR-ASPP decoder on an existing list of encoder features.
+
+    This is the part of `lr_aspp` that follows the encoder. It is exposed so
+    that several heads can share one backbone (see `multi_task`). The layers
+    are annotated for quantization-aware training but `quantize_apply` is
+    left to the caller.
+
+    Input
+    ----------
+        features: list of encoder feature tensors, shallowest first.
+        input_tensor: the model input, used for the output resolution.
+        n_labels: number of output channels.
+        deep_layer, shallow_layer: see `resolve_lr_aspp_levels`.
+        num_filters, num_filters_shallow, name, gate: see `lr_aspp`.
+
+    Output
+    ----------
+        `(logits, deep_feature)`: the `(H, W, n_labels)` output at the input
+        resolution and the encoder feature the module was built on.
+    '''
+    deep_layer, shallow_layer = resolve_lr_aspp_levels(len(features), deep_layer, shallow_layer)
+
+    deep_feature = features[deep_layer - 1]
+    shallow_feature = features[shallow_layer - 1]
+
+    x = lr_aspp_module(deep_feature, num_filters=num_filters, name='{}_module'.format(name), gate=gate)
+
+    x = qat_annotate_layer(UpSampling2D(
+        size=(shallow_feature.shape[1] // x.shape[1],
+              shallow_feature.shape[2] // x.shape[2]),
+        interpolation='bilinear', name='{}_upsample_to_shallow'.format(name),
+    ))(x)
+
+    shallow_projected = _conv_bn_act(
+        shallow_feature, num_filters_shallow, kernel_size=1, activation=None,
+        name='{}_shallow_proj'.format(name),
+    )
+
+    x = Concatenate(axis=-1, name='{}_concat'.format(name))([x, shallow_projected])
+
+    x = qat_annotate_layer(UpSampling2D(
+        size=(input_tensor.shape[1] // x.shape[1],
+              input_tensor.shape[2] // x.shape[2]),
+        interpolation='bilinear', name='{}_upsample_to_input'.format(name),
+    ))(x)
+
+    logits = qat_annotate_layer(
+        Conv2D(n_labels, kernel_size=1, padding='same', name='{}_head'.format(name)))(x)
+
+    return logits, deep_feature
+
+
 def lr_aspp(input_tensor, n_labels, filter_num_down=[64, 128, 256, 512, 1024],
-            deep_layer=5, shallow_layer=2, num_filters=128, num_filters_shallow=48,
+            deep_layer=None, shallow_layer=None, num_filters=128, num_filters_shallow=48,
             stack_num_down=2, activation='ReLU', batch_norm=False, pool=True,
             backbone=None, weights='imagenet', freeze_backbone=True, freeze_batch_norm=True,
             name='lr_aspp', iqa_head=False, gate=True):
@@ -104,9 +191,14 @@ def lr_aspp(input_tensor, n_labels, filter_num_down=[64, 128, 256, 512, 1024],
                          fallback (`backbone=None`); ignored otherwise. The
                          network depth for that fallback is `len(filter_num_down)`.
         deep_layer: which encoder feature level (1-indexed) feeds the LR-ASPP
-                    module. Default 5 (the deepest, tuned for 5-level backbones).
+                    module. `None` (default) uses the deepest level the
+                    encoder exposes: 5 for most backbones, 4 for RepViT and
+                    FastViT, 3 for StrideFormer.
         shallow_layer: which encoder feature level (1-indexed) is the shallow
-                       skip connection concatenated back in. Default 2.
+                       skip connection concatenated back in. `None` (default)
+                       uses three levels above the deep one, never above the
+                       first: level 2 on five-level backbones, level 1 on
+                       the others.
         num_filters: channel count of the LR-ASPP module's 1x1/pooled branches.
         num_filters_shallow: channel count the shallow skip is projected to
                              before concatenation.
@@ -150,10 +242,12 @@ def lr_aspp(input_tensor, n_labels, filter_num_down=[64, 128, 256, 512, 1024],
         `(batch, 1)` quality-score output).
     '''
 
-    depth_ = len(filter_num_down)
     X_encoder = []
 
     if backbone is None:
+        deep_layer, shallow_layer = resolve_lr_aspp_levels(
+            len(filter_num_down), deep_layer, shallow_layer, what='The plain encoder')
+
         X = input_tensor
         X = CONV_stack(X, filter_num_down[0], kernel_size=3, stack_num=stack_num_down,
                        activation=activation, batch_norm=batch_norm, name='{}_down0'.format(name))
@@ -166,37 +260,17 @@ def lr_aspp(input_tensor, n_labels, filter_num_down=[64, 128, 256, 512, 1024],
 
         preprocessing = dummy_preprocessing
     else:
+        deep_layer, shallow_layer = resolve_lr_aspp_levels(
+            backbone_num_levels(backbone), deep_layer, shallow_layer, what=f"Backbone '{backbone}'")
+
         backbone_ = backbone_zoo(
             backbone, weights, input_tensor, deep_layer, freeze_backbone, freeze_batch_norm)
         X_encoder = backbone_([input_tensor, ])
         preprocessing = backbone_.preprocessing
 
-    deep_feature = X_encoder[deep_layer - 1]
-    shallow_feature = X_encoder[shallow_layer - 1]
-
-    x = lr_aspp_module(deep_feature, num_filters=num_filters, name='{}_module'.format(name), gate=gate)
-
-    x = qat_annotate_layer(UpSampling2D(
-        size=(shallow_feature.shape[1] // x.shape[1],
-              shallow_feature.shape[2] // x.shape[2]),
-        interpolation='bilinear', name='{}_upsample_to_shallow'.format(name),
-    ))(x)
-
-    shallow_projected = _conv_bn_act(
-        shallow_feature, num_filters_shallow, kernel_size=1, activation=None,
-        name='{}_shallow_proj'.format(name),
-    )
-
-    x = Concatenate(axis=-1, name='{}_concat'.format(name))([x, shallow_projected])
-
-    x = qat_annotate_layer(UpSampling2D(
-        size=(input_tensor.shape[1] // x.shape[1],
-              input_tensor.shape[2] // x.shape[2]),
-        interpolation='bilinear', name='{}_upsample_to_input'.format(name),
-    ))(x)
-
-    model_output = qat_annotate_layer(
-        Conv2D(n_labels, kernel_size=1, padding='same', name='{}_head'.format(name)))(x)
+    model_output, deep_feature = lr_aspp_head(
+        X_encoder, input_tensor, n_labels, deep_layer=deep_layer, shallow_layer=shallow_layer,
+        num_filters=num_filters, num_filters_shallow=num_filters_shallow, name=name, gate=gate)
 
     outputs = [model_output, ]
     if iqa_head:

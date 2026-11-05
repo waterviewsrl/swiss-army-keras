@@ -544,3 +544,35 @@ Findings:
 - **Not verified:** task accuracy. These are feature-level proxies on 48
   images with no trained head. A trained model per profile is the next
   measurement to make (roadmap section 2).
+
+## 12. Follow-up on 2026-11-05: depth, out-of-distribution analysis, shared backbones
+
+The question was whether out-of-distribution analysis and monocular depth
+are pluggable. Both were at the model level only. Probes with random
+weights found these gaps, all closed in this pass:
+
+| Gap found | What was added | Where |
+|---|---|---|
+| `fastdepth_head` failed on RepViT, FastViT and StrideFormer; `lr_aspp` and `lr_aspp_depth` failed on them with default arguments | Heads adapt to the number of feature levels; `lr_aspp` defaults follow the backbone and a missing level is a clear error | `_model_depth.py`, `_model_lr_aspp.py`, `_backbone_zoo.py` |
+| Depth export failed the ARTPEC-8 check: `LOGISTIC` is not on the list as read, although the docstring recommended the sigmoid output for that chip | `drop_output_activations` exports without the final sigmoid or softmax; docstring corrected | `deploy_utils.py`, `quantization_utils.py`, `training_utils.py` |
+| No training path for depth | `DepthAlbumentationsDataLoader`, depth metrics, `berhu_loss(mask_invalid=True)` | `dataset_utils.py`, `metrics.py`, `losses.py` |
+| Every builder created its own backbone | `multi_task`: several heads on one backbone, named outputs | `_model_multi_task.py` |
+| No builder exposed the embedding Mahalanobis needs | `add_embedding_output`, working on trained models | `layer_utils.py` |
+| Mahalanobis scoring needed SciPy; no evaluation | `whiten_statistics`, `whitened_distance`, `sample_dense_embeddings`, `ood_detection_metrics` | `ood_utils.py` |
+| The converter reorders the outputs of a multi-output model | `tflite_outputs` maps file positions to head names | `deploy_utils.py` |
+
+Findings that remain:
+
+- **The energy-score wrapper cannot run on the Axis accelerators** (`EXP`,
+  `LOG`, `SUM` are not listed). Scores are computed on the host from the
+  exported logits; the deployment guide says how.
+- **`PAD` is not on the ARTPEC-8 list as read**, and MobileNetV4 and
+  MobileOne exports contain it. This affects every head on those backbones.
+  It needs the device check of roadmap section 1 before anything is changed.
+- **`classifier` uses swish in its hidden layer**, which needs a sigmoid on
+  ARTPEC-8; `activation='relu'` avoids it.
+- **The image-quality head stays in floating point** with its default GeM
+  pooling.
+- **Nothing here was trained.** Builds, exports and hand-computed values
+  were tested; depth accuracy and out-of-distribution detection quality on
+  real data are unmeasured.
