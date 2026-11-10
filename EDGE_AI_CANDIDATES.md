@@ -8,6 +8,10 @@ hardware tiers:
 - **Tier B, other lightweight aarch64 stacks**: Cortex-A CPUs with LiteRT/XNNPACK, and small NPUs (Rockchip RKNN, NXP i.MX, Hailo, Edge TPU).
 - **Tier C, NVIDIA Jetson Orin class** (TensorRT, FP16 or INT8).
 
+> **Second research pass, 2026-11-10.** [CANDIDATES_BY_TASK.md](CANDIDATES_BY_TASK.md)
+> revisits backbones and heads task by task with newer evidence and replaces
+> sections 4.2 to 4.5 of this document where the two disagree.
+
 Companion documents: [ASSESSMENT.md](ASSESSMENT.md) (state of the code),
 [ROADMAP.md](ROADMAP.md) (ordered work list),
 [docs/source/deployment.rst](docs/source/deployment.rst) (what export does today).

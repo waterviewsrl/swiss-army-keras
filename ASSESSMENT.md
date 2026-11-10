@@ -576,3 +576,128 @@ Findings that remain:
 - **Nothing here was trained.** Builds, exports and hand-computed values
   were tested; depth accuracy and out-of-distribution detection quality on
   real data are unmeasured.
+
+## 13. Reassessment on 2026-11-10: PIDNet, then the rest
+
+Two questions were asked: is PIDNet implemented, and where does everything
+else stand. A third request, a new research pass on backbones and heads,
+is answered in [CANDIDATES_BY_TASK.md](CANDIDATES_BY_TASK.md).
+
+### 13.1 PIDNet
+
+**It is implemented**, as a self-contained three-branch network
+(`swiss_army_keras/_model_pidnet.py`, 546 lines): the S, M and L
+configurations, both pooling modules, both fusion modules, the two auxiliary
+heads, and the two boundary losses in `losses.py`. Six model tests and four
+loss tests pass.
+
+How faithful it is:
+
+| Check | Result |
+|---|---|
+| Structure against the official source (`XuJiacong/PIDNet`, read on 2026-11-10) | Matches: stem, the three branches, both PagFM fusions, PAPPM and DAPPM, Bag and Light-Bag, the heads and their tap points |
+| Trainable parameters against a count derived by hand from that source | S: 7,625,651 against 7,625,715. M: 28,538,387 against 28,538,515. L: 36,942,483 against 36,939,571 |
+| Explanation of the differences | S and M lack the bias of the two stem convolutions (64 and 128 values; redundant before a batch norm). L also carries a batch norm after each of the 11 convolutions of the DAPPM module that the reference does not have (the module docstring says five) |
+| Parameter counts in the paper | 7.6M, 34.4M, 36.9M. S and L agree. The 34.4M of PIDNet-M cannot be reproduced from the official configuration; the GCNet paper's reimplementation lists PIDNet-M at 28.7M, which agrees with this implementation |
+| Numerical equivalence with the PyTorch model | **Not verified.** There is no weight port, and running the downloaded official code was not permitted in this session, so the official model was read, not executed |
+
+What is wrong or missing, most important first:
+
+1. **Most input sizes do not build.** The pooling module resizes by integer
+   factors, so only sizes whose pooled maps divide the stride-64 map work:
+   128, 256, 384, 512, 512x1024 and 1024x2048 build; 192, 320, 448, 576,
+   640 and 720x1280 fail with a shape error deep inside Keras. The docstring
+   example `Input((None, None, 3))` fails too. DDRNet shares the code and
+   the limit. The reference resizes to an explicit size and has no such
+   limit.
+2. **No pretrained weights, and the model is not yet portable.** Batch-norm
+   epsilon is 1e-3 against the reference's 1e-5, momentum 0.99 against 0.9,
+   the stem biases are absent and the L variant has the extra batch norms.
+   The paper's accuracy depends on ImageNet pre-training.
+3. **The QAT export of an untrained model crashes the runtime.** With
+   untrained wrappers the two PagFM similarity tensors are constant zero
+   during calibration, the converter writes a quantization scale of 0, and
+   the LiteRT interpreter aborts the process when it prepares the sigmoid,
+   with or without XNNPACK. The lint does not look for this. The
+   post-training exports (`strip_qat`, all three accelerator profiles) run
+   correctly. The same degenerate-range mechanism is the likely cause of the
+   intermittent PP-LiteSeg export failure noted in the roadmap; that link is
+   not verified.
+4. **It is a poor fit for the Axis accelerators.** 154 operators, of which
+   11 are off the ARTPEC-8 list as read (`SUM`, `LOGISTIC`, `SUB`, `PAD`)
+   and 5 off the ARTPEC-9 list, plus eight multiplications of two tensors.
+   The gates sit in the middle of the network, so the graph would be cut
+   into several accelerator segments. DDRNet-23-slim, its ancestor, exports
+   with nothing off the ARTPEC-9 list.
+5. **Training with the auxiliary heads needs assembly.** It works through
+   `compile(loss=[ce, ce, pidnet_boundary_loss], loss_weights=[0.4, 1, 20])`
+   with the single target the loaders yield (checked with one evaluation
+   step). A single loss, which is what `TrainingDriver` is normally given,
+   fails on the one-channel boundary output; `TrainingDriver` has no loss
+   weights; the fourth term of the paper's loss takes two outputs and needs
+   a custom training step. A model trained with auxiliary heads has to be
+   cut to its main output by hand before export. There is no example.
+6. **Tests check shapes only.** No export test, no numeric reference.
+
+Verdict: structurally faithful and usable for training from scratch at the
+supported sizes on CPU and GPU targets. Not ready for pretrained use, for
+arbitrary input sizes, or for an Axis accelerator. The repair list is in
+ROADMAP.md section 2c.
+
+### 13.2 The rest of the project
+
+**Tests today.** The whole fast suite passes: 469 tests in four chunks (129 backbone tests, 79 classifier,
+decoder and multi-task tests, 111 detection, layer and loss tests, 150 others), about 16 minutes. The 20 slow
+tests were last run on 2026-11-05; one of them failed once in seven runs then (roadmap section 1).
+
+**Export of every head family.** Nineteen of twenty model families convert
+post-training to per-tensor full-integer TFLite and run; the twentieth, the
+full FCOS detector with decoding and NMS in the graph, fails in `strip_qat`.
+Four exports have nothing off the ARTPEC-9 list beyond resize factors
+(`ddrnet`, `lr_aspp(gate=False)`, `pp_liteseg(fusion='add')`,
+`fastdepth_head`). Seven heads leave the accelerator for one small reason
+each. The table is in CANDIDATES_BY_TASK.md section 2.
+
+**The original critical points, six days on.**
+
+| Point | State on 2026-11-10 |
+|---|---|
+| C1 Installation | Mostly fixed: metadata, Python floor, extras, declared dependencies. Still no `pyproject.toml`, no release built or uploaded from this tree, and EfficientNet-Lite stays unusable on Python 3.12 |
+| C2 Pretrained weights | **Unchanged, and now the largest gap.** No hosting, no download, no license review. Every custom backbone, DDRNet and PIDNet start from random weights for a user |
+| C3 Legacy Keras 2 | Fail-fast guard added. The strategic question is sharper: for accelerator profiles the QAT wrappers are stripped at export, so the dependency that pins the library to Keras 2 no longer contributes to those exports |
+| C4 Edge deployable | Largely fixed: profiles, fusion, stripping, equalization, lint, 14 slow export tests. Open: operator lists unverified on a device, no latency measurement on any target, export tests cover only LR-ASPP, PP-LiteSeg, FastDepth and `multi_task` |
+| C5 All-zero QAT output | Explained (untrained output quantizer). Its sibling is finding 3 above: the same untrained wrappers can produce a file that crashes the runtime |
+| C6 Data loaders | Seeded split, any image format, a depth loader, first tests. The worker-pool architecture, the square-input limit and the missing `close()` remain |
+| C7 Repository hygiene | Ignore rules fixed and the branch is pushed. Still tracked: notebooks with outputs up to 12 MB, duplicated between `examples/` and `docs/`; `plan.md`; debugging prints in five inherited model files; `eval()` in ten |
+
+**Points that were not on the original list.**
+
+1. **No accuracy number exists for any exported model.** Everything since
+   September was verified by building, converting and comparing features.
+   No model has been trained and evaluated after export in this period, at
+   the maintainer's instruction not to run training in these sessions. This
+   is the main unknown of the whole deployment pipeline.
+2. **Fused MobileOne and RepViT quantize poorly post-training** (section
+   11), and accelerator exports are post-training. The two families the
+   library was extended for are therefore the weakest choice for an Axis
+   camera until this is solved or measured on a trained model.
+3. **Input-size limits are scattered and undocumented**: PIDNet and DDRNet
+   (above), PP-LiteSeg below 128, StrideFormer at 96. A shared check with a
+   clear message is still missing (section 4.1).
+4. **`TrainingDriver` is still the narrowest part**: one output, one loss,
+   no loss weights, no schedule, no output directory, always exports, and
+   no test reaches it.
+5. **No continuous integration.** The suite is green only because it is run
+   by hand.
+
+**What I would do next, in order.**
+
+1. Train and export one segmentation model and one classifier, and record
+   float, per-channel and per-tensor accuracy. Everything else in the
+   deployment work rests on proxies until this exists.
+2. The export repairs and the zero-scale lint (roadmap section 1): small,
+   and they make seven more heads accelerator-clean.
+3. The DDRNet and PIDNet repairs (roadmap section 2c), then make DDRNet the
+   documented segmentation default for Axis targets.
+4. Pretrained weights: license review, hosting, download.
+5. Continuous integration for the fast suite and the docs build.

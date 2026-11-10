@@ -134,6 +134,7 @@ DLPU family and other targets.
 | [docs/source/notebooks/](docs/source/notebooks/) | Example notebooks |
 | [use_case_recipes.md](use_case_recipes.md) | Loss and hyper-parameter recipes for specific tasks |
 | [EDGE_AI_CANDIDATES.md](EDGE_AI_CANDIDATES.md) | Assessment of further networks, optimizers and deployment strategies, by target hardware |
+| [CANDIDATES_BY_TASK.md](CANDIDATES_BY_TASK.md) | Backbone and head candidates by task, with an export sweep of the current heads against the Axis operator lists |
 | [ROADMAP.md](ROADMAP.md) | Open work, in priority order |
 | [ASSESSMENT.md](ASSESSMENT.md) | Project reassessment of November 2026 |
 | [plan.md](plan.md) | Engineering log of the 0.11 development cycle |
