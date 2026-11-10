@@ -164,7 +164,7 @@ from tensorflow.keras.models import Model
 from tensorflow.keras.utils import register_keras_serializable
 
 from swiss_army_keras._backbone_zoo import backbone_zoo
-from swiss_army_keras.layer_utils import dummy_preprocessing, qat_annotate_layer
+from swiss_army_keras.layer_utils import dummy_preprocessing, qat_annotate_layer, qat_apply
 
 import tensorflow_model_optimization as tfmot
 
@@ -544,7 +544,26 @@ def _independent_depthwise_sep_stem(x, prefix, n_layers, channels):
     return x
 
 
-def fcos_lite_head(fpn_features, n_classes, strides=(8, 16, 32), stem_channels=96, stem_layers=2, name='fcos_head'):
+def _fcos_distances(reg_raw, stride, distance_activation, name):
+    '''Turn the raw regression output of one level into positive distances
+    in input pixels.
+
+    `'exp'` is the original FCOS formulation, `exp(raw) * stride`. `'relu'`
+    is the later FCOS variant that regresses stride-normalized distances,
+    `relu(raw) * stride`: it keeps the exported graph free of the `EXP`
+    operator, which the Axis accelerator lists do not contain. The two
+    train differently, so the choice has to be made before training.
+    '''
+    if distance_activation == 'exp':
+        return tf.exp(reg_raw) * float(stride)
+    if distance_activation == 'relu':
+        reg_raw = qat_annotate_layer(Activation('relu', name=f'{name}_reg_relu'))(reg_raw)
+        return reg_raw * float(stride)
+    raise ValueError(f"Unknown distance_activation '{distance_activation}' - expected 'exp' or 'relu'.")
+
+
+def fcos_lite_head(fpn_features, n_classes, strides=(8, 16, 32), stem_channels=96, stem_layers=2, name='fcos_head',
+                   distance_activation='exp'):
     '''FCOS-lite detection head applied independently to each of
     `fpn_features`'s 3 levels, each level's regression output scaled by its
     own learnable per-channel scale (`_qat_channelwise_scale`).
@@ -572,6 +591,9 @@ def fcos_lite_head(fpn_features, n_classes, strides=(8, 16, 32), stem_channels=9
                  units (`exp(raw) * stride * per_level_scale`).
         stem_channels: each level's independent stems' channel width.
         stem_layers: number of depthwise-separable conv blocks per stem.
+        distance_activation: `'exp'` (default) or `'relu'`, see
+                             `_fcos_distances`. Use `'relu'` for a model
+                             meant for an accelerator without `EXP`.
 
     Output
     ----------
@@ -607,7 +629,7 @@ def fcos_lite_head(fpn_features, n_classes, strides=(8, 16, 32), stem_channels=9
         # `tf.image.combined_non_max_suppression` downstream, which
         # hard-requires float32 boxes).
         reg_raw = _qat_channelwise_scale(reg_raw, name=f'{name}_{level_name}')
-        reg_ltrb = tf.exp(reg_raw) * float(stride)
+        reg_ltrb = _fcos_distances(reg_raw, stride, distance_activation, name=f'{name}_{level_name}')
 
         centerness = centerness_head_conv(reg_feat)
 
@@ -621,7 +643,8 @@ def fcos_lite_head(fpn_features, n_classes, strides=(8, 16, 32), stem_channels=9
 # "GFL-style upgrade" section for the full account.
 
 
-def gfl_lite_head(fpn_features, n_classes, reg_max=7, stem_channels=96, stem_layers=2, name='gfl_head'):
+def gfl_lite_head(fpn_features, n_classes, reg_max=7, stem_channels=96, stem_layers=2, name='gfl_head',
+                  flat_reg=False):
     '''GFL-style detection head (`NanoDetPlusHead`, `nanodet_plus_head.py`) -
     one shared conv tower per level (not `fcos_lite_head`'s separate cls/reg
     branches - what plan.md §9.5 flagged as PicoDet's optional
@@ -648,6 +671,18 @@ def gfl_lite_head(fpn_features, n_classes, reg_max=7, stem_channels=96, stem_lay
                  stride) - 7, the reference's own default.
         stem_channels, stem_layers: per-level independent stem config, same
                                     meaning as `fcos_lite_head`'s.
+        flat_reg: `False` (default) returns the distribution logits as a
+                  5-D `(B, H, W, 4, reg_max + 1)` tensor. `True` leaves
+                  them as the convolution produces them, `(B, H, W,
+                  4 * (reg_max + 1))`, for accelerators limited to 4-D
+                  tensors; reshape them in the application, or with
+                  `tf.reshape`, before `gfl_integral_decode`.
+
+    The classification and distribution logits come from two 1x1
+    convolutions on the shared tower (`<name>_cls_out`, `<name>_reg_out`).
+    Up to 2026-11-10 one convolution produced both and the result was
+    sliced; that is the same function, but the slices exported as
+    `STRIDED_SLICE` operators.
 
     Output
     ----------
@@ -678,18 +713,18 @@ def gfl_lite_head(fpn_features, n_classes, reg_max=7, stem_channels=96, stem_lay
         file (already self-consistently `x, y`-ordered throughout).
     '''
     n_bins = reg_max + 1
-    out_conv = qat_annotate_layer(Conv2D(
-        n_classes + 4 * n_bins, 1, padding='same', name=f'{name}_out'))
+    cls_conv = qat_annotate_layer(Conv2D(n_classes, 1, padding='same', name=f'{name}_cls_out'))
+    reg_conv = qat_annotate_layer(Conv2D(4 * n_bins, 1, padding='same', name=f'{name}_reg_out'))
 
     outputs = []
     for level_idx, feature in enumerate(fpn_features):
         level_name = f'p{level_idx}'
 
         feat = _independent_depthwise_sep_stem(feature, f'{name}_{level_name}', stem_layers, stem_channels)
-        raw = out_conv(feat)
-
-        cls_logits = raw[..., :n_classes]
-        reg_dist_logits = tf.reshape(raw[..., n_classes:], (-1, feat.shape[1], feat.shape[2], 4, n_bins))
+        cls_logits = cls_conv(feat)
+        reg_dist_logits = reg_conv(feat)
+        if not flat_reg:
+            reg_dist_logits = tf.reshape(reg_dist_logits, (-1, feat.shape[1], feat.shape[2], 4, n_bins))
 
         outputs.append((cls_logits, reg_dist_logits))
 
@@ -1357,7 +1392,7 @@ def _prototype_branch(finest_feature, k=32, proto_channels=64, name='proto'):
 
 
 def fcos_lite_instance_head(fpn_features, n_classes, k=32, strides=(8, 16, 32), stem_channels=96,
-                            stem_layers=2, name='fcos_instance_head'):
+                            stem_layers=2, name='fcos_instance_head', distance_activation='exp'):
     '''`fcos_lite_head` plus one added branch (`k`-channel, `tanh`-activated
     mask coefficients, YOLACT's own choice - "to enable subtraction"
     between prototypes, confirmed from source) - **a new function, not a
@@ -1405,7 +1440,7 @@ def fcos_lite_instance_head(fpn_features, n_classes, k=32, strides=(8, 16, 32), 
         reg_feat = _independent_depthwise_sep_stem(feature, f'{name}_reg_{level_name}', stem_layers, stem_channels)
         reg_raw = reg_head_conv(reg_feat)
         reg_raw = _qat_channelwise_scale(reg_raw, name=f'{name}_{level_name}')
-        reg_ltrb = tf.exp(reg_raw) * float(stride)
+        reg_ltrb = _fcos_distances(reg_raw, stride, distance_activation, name=f'{name}_{level_name}')
 
         centerness = centerness_head_conv(reg_feat)
         mask_coefs = mask_coef_conv(reg_feat)
@@ -1740,7 +1775,8 @@ def _nms_dispatch(input_tensor, boxes, scores, n_classes, max_output_size_per_cl
 
 def fcos_lite_detection_base(input_tensor, n_classes, feature_levels=(3, 4, 5), fpn_channels=96,
                              stem_channels=96, stem_layers=2, backbone='MobileNetV2', weights='imagenet',
-                             freeze_backbone=True, freeze_batch_norm=True, name='fcos_lite'):
+                             freeze_backbone=True, freeze_batch_norm=True, name='fcos_lite',
+                             distance_activation='exp'):
     '''Backbone -> PAFPN-lite neck -> FCOS-lite head, raw per-level
     predictions (no NMS/decoding) — the "base" half of the `base.py`/
     `models.py` split every other model in this plan uses.
@@ -1778,7 +1814,7 @@ def fcos_lite_detection_base(input_tensor, n_classes, feature_levels=(3, 4, 5), 
     strides = [int(input_tensor.shape[1] // f.shape[1]) for f in fpn_features]
     head_outputs = fcos_lite_head(
         fpn_features, n_classes, strides=strides, stem_channels=stem_channels,
-        stem_layers=stem_layers, name='{}_head'.format(name),
+        stem_layers=stem_layers, name='{}_head'.format(name), distance_activation=distance_activation,
     )
 
     flat_outputs = []
@@ -1788,7 +1824,7 @@ def fcos_lite_detection_base(input_tensor, n_classes, feature_levels=(3, 4, 5), 
     m = Model([input_tensor, ], flat_outputs)
 
     with tfmot.quantization.keras.quantize_scope():
-        m = tfmot.quantization.keras.quantize_apply(m)
+        m = qat_apply(m)
 
     m.preprocessing = backbone_.preprocessing
     m.strides = strides
@@ -1799,7 +1835,7 @@ def fcos_lite_detection_base(input_tensor, n_classes, feature_levels=(3, 4, 5), 
 def fcos_lite_detection(input_tensor, n_classes, feature_levels=(3, 4, 5), fpn_channels=96,
                         stem_channels=96, stem_layers=2, backbone='MobileNetV2', weights='imagenet',
                         freeze_backbone=True, freeze_batch_norm=True, score_threshold=0.05,
-                        iou_threshold=0.5, max_detections=100, name='fcos_lite'):
+                        iou_threshold=0.5, max_detections=100, name='fcos_lite', distance_activation='exp'):
     '''Full FCOS-lite detector: `fcos_lite_detection_base` plus box
     decoding and `_nms_dispatch`-based NMS, for inference use.
 
@@ -1854,6 +1890,7 @@ def fcos_lite_detection(input_tensor, n_classes, feature_levels=(3, 4, 5), fpn_c
         input_tensor, n_classes, feature_levels=feature_levels, fpn_channels=fpn_channels,
         stem_channels=stem_channels, stem_layers=stem_layers, backbone=backbone, weights=weights,
         freeze_backbone=freeze_backbone, freeze_batch_norm=freeze_batch_norm, name=name,
+        distance_activation=distance_activation,
     )
 
     raw_outputs = base_model(input_tensor)
@@ -1903,7 +1940,7 @@ def fcos_lite_detection(input_tensor, n_classes, feature_levels=(3, 4, 5), fpn_c
 def gfl_lite_detection_base(input_tensor, n_classes, feature_levels=(3, 4, 5), neck_channels=96,
                             stem_channels=96, stem_layers=2, reg_max=7, num_extra_levels=0,
                             backbone='MobileNetV2', weights='imagenet', freeze_backbone=True,
-                            freeze_batch_norm=True, name='gfl_lite'):
+                            freeze_batch_norm=True, name='gfl_lite', flat_reg=False):
     '''Backbone -> `ghost_pan_lite_neck` -> `gfl_lite_head`, raw per-level
     predictions (no decoding/NMS) - the "base" half of the `base.py`/
     `models.py` split every other model in this plan uses, exactly mirroring
@@ -1945,7 +1982,7 @@ def gfl_lite_detection_base(input_tensor, n_classes, feature_levels=(3, 4, 5), n
     strides = [int(input_tensor.shape[1] // f.shape[1]) for f in neck_features]
     head_outputs = gfl_lite_head(
         neck_features, n_classes, reg_max=reg_max, stem_channels=stem_channels,
-        stem_layers=stem_layers, name='{}_head'.format(name),
+        stem_layers=stem_layers, name='{}_head'.format(name), flat_reg=flat_reg,
     )
 
     flat_outputs = []
@@ -1955,7 +1992,7 @@ def gfl_lite_detection_base(input_tensor, n_classes, feature_levels=(3, 4, 5), n
     m = Model([input_tensor, ], flat_outputs)
 
     with tfmot.quantization.keras.quantize_scope():
-        m = tfmot.quantization.keras.quantize_apply(m)
+        m = qat_apply(m)
 
     m.preprocessing = backbone_.preprocessing
     m.strides = strides
@@ -2047,7 +2084,8 @@ def gfl_lite_detection(input_tensor, n_classes, feature_levels=(3, 4, 5), neck_c
 def fcos_lite_instance_segmentation_base(input_tensor, n_classes, k=32, feature_levels=(3, 4, 5),
                                          fpn_channels=96, proto_channels=64, stem_channels=96, stem_layers=2,
                                          backbone='MobileNetV2', weights='imagenet', freeze_backbone=True,
-                                         freeze_batch_norm=True, name='fcos_lite_instseg'):
+                                         freeze_batch_norm=True, name='fcos_lite_instseg',
+                                         distance_activation='exp'):
     '''Backbone -> `pafpn_lite_neck` -> `fcos_lite_instance_head` (per-level
     predictions, including mask coefficients) + `_prototype_branch` (one
     shared prototype-mask tensor) - the "base" half of the `base.py`/
@@ -2081,7 +2119,7 @@ def fcos_lite_instance_segmentation_base(input_tensor, n_classes, k=32, feature_
     strides = [int(input_tensor.shape[1] // f.shape[1]) for f in fpn_features]
     head_outputs = fcos_lite_instance_head(
         fpn_features, n_classes, k=k, strides=strides, stem_channels=stem_channels,
-        stem_layers=stem_layers, name='{}_head'.format(name),
+        stem_layers=stem_layers, name='{}_head'.format(name), distance_activation=distance_activation,
     )
     prototypes = _prototype_branch(
         fpn_features[0], k=k, proto_channels=proto_channels, name='{}_proto'.format(name))
@@ -2094,7 +2132,7 @@ def fcos_lite_instance_segmentation_base(input_tensor, n_classes, k=32, feature_
     m = Model([input_tensor, ], flat_outputs)
 
     with tfmot.quantization.keras.quantize_scope():
-        m = tfmot.quantization.keras.quantize_apply(m)
+        m = qat_apply(m)
 
     m.preprocessing = backbone_.preprocessing
     m.strides = strides
@@ -2107,7 +2145,8 @@ def fcos_lite_instance_segmentation(input_tensor, n_classes, k=32, feature_level
                                     fpn_channels=96, proto_channels=64, stem_channels=96, stem_layers=2,
                                     backbone='MobileNetV2', weights='imagenet', freeze_backbone=True,
                                     freeze_batch_norm=True, score_threshold=0.05, iou_threshold=0.5,
-                                    max_output_size_per_class=100, max_detections=100, name='fcos_lite_instseg'):
+                                    max_output_size_per_class=100, max_detections=100, name='fcos_lite_instseg',
+                                    distance_activation='exp'):
     '''Full YOLACT-style FCOS-lite instance segmentation detector:
     `fcos_lite_instance_segmentation_base` plus box decoding,
     `_indexed_nms_gather`-based NMS (not `combined_non_max_suppression` -
@@ -2172,7 +2211,7 @@ def fcos_lite_instance_segmentation(input_tensor, n_classes, k=32, feature_level
         input_tensor, n_classes, k=k, feature_levels=feature_levels, fpn_channels=fpn_channels,
         proto_channels=proto_channels, stem_channels=stem_channels, stem_layers=stem_layers,
         backbone=backbone, weights=weights, freeze_backbone=freeze_backbone,
-        freeze_batch_norm=freeze_batch_norm, name=name,
+        freeze_batch_norm=freeze_batch_norm, name=name, distance_activation=distance_activation,
     )
 
     raw_outputs = base_model(input_tensor)

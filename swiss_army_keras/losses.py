@@ -1639,3 +1639,324 @@ def varifocal_loss(alpha=0.75, gamma=2.0):
         return tf.reduce_mean(weight * ce)
 
     return varifocal_loss_fixed
+
+
+# ========================= #
+# Affine-invariant depth losses (for relative depth, e.g. teacher pseudo-labels)
+
+
+def _align_scale_shift(y_true, y_pred, mask):
+    '''Least-squares scale and shift that bring each predicted image onto
+    its target over the valid pixels. Inputs are `(batch, pixels)`.
+    '''
+    a00 = tf.reduce_sum(mask * y_pred * y_pred, axis=1)
+    a01 = tf.reduce_sum(mask * y_pred, axis=1)
+    a11 = tf.reduce_sum(mask, axis=1)
+    b0 = tf.reduce_sum(mask * y_pred * y_true, axis=1)
+    b1 = tf.reduce_sum(mask * y_true, axis=1)
+    det = a00 * a11 - a01 * a01
+    safe = tf.where(tf.abs(det) > K.epsilon(), det, tf.ones_like(det))
+    scale = tf.where(tf.abs(det) > K.epsilon(), (a11 * b0 - a01 * b1) / safe, tf.ones_like(det))
+    shift = tf.where(tf.abs(det) > K.epsilon(), (a00 * b1 - a01 * b0) / safe, tf.zeros_like(det))
+    return scale[:, tf.newaxis], shift[:, tf.newaxis]
+
+
+def scale_shift_invariant_loss(y_true, y_pred):
+    '''
+    Scale-and-shift-invariant depth loss: each predicted map is first
+    aligned to its target by the least-squares scale and shift, then the
+    mean absolute error is taken over the valid pixels.
+
+    scale_shift_invariant_loss(y_true, y_pred)
+
+    ----------
+    Ranftl, R., Lasinger, K., Hafner, D., Schindler, K. and Koltun, V.,
+    2020. Towards robust monocular depth estimation: Mixing datasets for
+    zero-shot cross-dataset transfer. TPAMI. (the MiDaS loss)
+
+    Use it when the target is relative depth, known only up to an affine
+    transformation: the output of a foundation depth model used as teacher,
+    or disparity from an uncalibrated stereo pair.
+    `scale_invariant_log_loss` removes a scale only and needs positive
+    predictions; this loss also removes a shift and accepts any real
+    output, so it suits a linear head.
+
+    Input
+    ----------
+        y_true: target map, shape `(batch, H, W, 1)` or `(batch, H, W)`.
+                Pixels with `y_true <= 0` are missing and left out.
+        y_pred: predicted map, same shape.
+    '''
+    y_pred = tf.convert_to_tensor(y_pred)
+    y_true = tf.cast(y_true, y_pred.dtype)
+    batch = tf.shape(y_pred)[0]
+    y_pred = tf.reshape(y_pred, (batch, -1))
+    y_true = tf.reshape(y_true, (batch, -1))
+    mask = tf.cast(y_true > 0, y_pred.dtype)
+
+    scale, shift = _align_scale_shift(y_true, y_pred, mask)
+    error = tf.abs(scale * y_pred + shift - y_true) * mask
+    return tf.reduce_sum(error) / tf.maximum(tf.reduce_sum(mask), 1.0)
+
+
+def gradient_matching_loss(y_true, y_pred, scales=4):
+    '''
+    Multi-scale gradient matching loss for depth: after the same alignment
+    as `scale_shift_invariant_loss`, penalizes the horizontal and vertical
+    gradients of the error map at `scales` resolutions. It sharpens depth
+    discontinuities, which the plain error term smooths.
+
+    gradient_matching_loss(y_true, y_pred, scales=4)
+
+    ----------
+    Li, Z. and Snavely, N., 2018. MegaDepth: Learning single-view depth
+    prediction from internet photos. CVPR. Used in the MiDaS loss (Ranftl
+    et al., 2020).
+
+    Input
+    ----------
+        y_true: target map, shape `(batch, H, W, 1)`; `y_true <= 0` is
+                missing.
+        y_pred: predicted map, same shape.
+        scales: number of resolutions; each halves the previous one.
+    '''
+    y_pred = tf.convert_to_tensor(y_pred)
+    y_true = tf.cast(y_true, y_pred.dtype)
+    shape = tf.shape(y_pred)
+    batch = shape[0]
+    mask = tf.cast(y_true > 0, y_pred.dtype)
+    scale, shift = _align_scale_shift(
+        tf.reshape(y_true, (batch, -1)), tf.reshape(y_pred, (batch, -1)), tf.reshape(mask, (batch, -1)))
+    aligned = tf.reshape(scale * tf.reshape(y_pred, (batch, -1)) + shift, shape)
+    residual = (aligned - y_true) * mask
+
+    total = 0.0
+    for level in range(scales):
+        step = 2 ** level
+        r = residual[:, ::step, ::step]
+        m = mask[:, ::step, ::step]
+        grad_x = tf.abs(r[:, :, 1:] - r[:, :, :-1]) * m[:, :, 1:] * m[:, :, :-1]
+        grad_y = tf.abs(r[:, 1:] - r[:, :-1]) * m[:, 1:] * m[:, :-1]
+        total += (tf.reduce_sum(grad_x) + tf.reduce_sum(grad_y)) / tf.maximum(tf.reduce_sum(m), 1.0)
+    return total
+
+
+def midas_loss(alpha=0.5, scales=4):
+    '''
+    The MiDaS training loss: `scale_shift_invariant_loss + alpha *
+    gradient_matching_loss`.
+
+    midas_loss(alpha=0.5, scales=4)
+
+    Input
+    ----------
+        alpha: weight of the gradient term (0.5 in the paper).
+        scales: resolutions of the gradient term.
+
+    Output
+    ----------
+        A loss `(y_true, y_pred) -> scalar` for `model.compile`.
+    '''
+    def loss(y_true, y_pred):
+        return scale_shift_invariant_loss(y_true, y_pred) + alpha * gradient_matching_loss(y_true, y_pred, scales)
+    loss.__name__ = 'midas_loss'
+    return loss
+
+
+# ========================= #
+# Classification: long tails and margins
+
+
+def logit_adjusted_crossentropy(class_priors, tau=1.0):
+    '''
+    Logit-adjusted softmax cross-entropy for long-tailed classification:
+    `tau * log(prior)` is added to the logits during training, so that rare
+    classes need a larger margin to be predicted. At inference the logits
+    are used as they are.
+
+    logit_adjusted_crossentropy(class_priors, tau=1.0)
+
+    ----------
+    Menon, A.K., Jayasumana, S., Rawat, A.S., Jain, H., Veit, A. and Kumar,
+    S., 2021. Long-tail learning via logit adjustment. ICLR.
+
+    Input
+    ----------
+        class_priors: class frequencies of the training set, one positive
+                      value per class (counts or fractions).
+        tau: strength of the adjustment (1.0 is the consistent choice).
+
+    Output
+    ----------
+        A loss `(y_true, y_pred)` taking one-hot labels and raw **logits**
+        (build the classifier with `return_logits=True` and apply it to the
+        logits output).
+    '''
+    priors = np.asarray(class_priors, dtype=np.float64)
+    if priors.ndim != 1 or np.any(priors <= 0):
+        raise ValueError('class_priors must be a 1-D sequence of positive values.')
+    adjustment = tf.constant(tau * np.log(priors / priors.sum()), dtype=tf.float32)
+
+    def loss(y_true, y_pred):
+        y_pred = tf.convert_to_tensor(y_pred)
+        y_true = tf.cast(y_true, y_pred.dtype)
+        logits = y_pred + tf.cast(adjustment, y_pred.dtype)
+        return tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(labels=y_true, logits=logits))
+    loss.__name__ = 'logit_adjusted_crossentropy'
+    return loss
+
+
+def arcface_loss(margin=0.5, scale=30.0):
+    '''
+    Additive angular margin loss: the angle between an embedding and the
+    weight of its own class is increased by `margin` before the scaled
+    softmax cross-entropy, which pulls classes apart on the hypersphere.
+
+    arcface_loss(margin=0.5, scale=30.0)
+
+    ----------
+    Deng, J., Guo, J., Xue, N. and Zafeiriou, S., 2019. ArcFace: Additive
+    angular margin loss for deep face recognition. CVPR.
+
+    Input
+    ----------
+        margin: angular margin in radians.
+        scale: factor applied to the cosines before the softmax.
+
+    Output
+    ----------
+        A loss `(y_true, y_pred)` taking one-hot identity labels and
+        **cosine similarities** in `[-1, 1]`, as the second output of
+        `models.reid_training_model` provides.
+    '''
+    cos_m, sin_m = math.cos(margin), math.sin(margin)
+    threshold = math.cos(math.pi - margin)
+    fallback = math.sin(math.pi - margin) * margin
+
+    def loss(y_true, y_pred):
+        cosine = tf.clip_by_value(tf.convert_to_tensor(y_pred), -1.0, 1.0)
+        y_true = tf.cast(y_true, cosine.dtype)
+        sine = tf.sqrt(tf.maximum(1.0 - tf.square(cosine), 0.0))
+        with_margin = cosine * cos_m - sine * sin_m
+        # keep the target logit monotonic when the angle plus the margin passes pi
+        with_margin = tf.where(cosine > threshold, with_margin, cosine - fallback)
+        logits = scale * (y_true * with_margin + (1.0 - y_true) * cosine)
+        return tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(labels=y_true, logits=logits))
+    loss.__name__ = 'arcface_loss'
+    return loss
+
+
+def cosface_loss(margin=0.35, scale=30.0):
+    '''
+    Additive cosine margin loss: `margin` is subtracted from the cosine of
+    the true class before the scaled softmax cross-entropy.
+
+    cosface_loss(margin=0.35, scale=30.0)
+
+    ----------
+    Wang, H., Wang, Y., Zhou, Z., Ji, X., Gong, D., Zhou, J., Li, Z. and
+    Liu, W., 2018. CosFace: Large margin cosine loss for deep face
+    recognition. CVPR.
+
+    Input and output as `arcface_loss`.
+    '''
+    def loss(y_true, y_pred):
+        cosine = tf.clip_by_value(tf.convert_to_tensor(y_pred), -1.0, 1.0)
+        y_true = tf.cast(y_true, cosine.dtype)
+        logits = scale * (cosine - margin * y_true)
+        return tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(labels=y_true, logits=logits))
+    loss.__name__ = 'cosface_loss'
+    return loss
+
+
+# ========================= #
+# Keypoints by coordinate classification, and counting
+
+
+def simcc_loss(y_true, y_pred, beta=1.0):
+    '''
+    Loss of the coordinate-classification keypoint head
+    (`models.simcc_head`): the Kullback-Leibler divergence between the
+    Gaussian-smoothed target distribution over bins and the softmax of the
+    predicted logits, averaged over the labelled keypoints.
+
+    simcc_loss(y_true, y_pred, beta=1.0)
+
+    ----------
+    Li, Y. et al., 2022. SimCC: A simple coordinate classification
+    perspective for human pose estimation. ECCV.
+
+    Input
+    ----------
+        y_true: target distributions, shape `(batch, n_keypoints, bins)`,
+                from `models.simcc_encode`. A row of zeros marks a keypoint
+                without label and is left out.
+        y_pred: logits, same shape (one of the two outputs of the head;
+                compile the model with this loss on both).
+        beta: factor applied to the logits before the softmax.
+    '''
+    y_pred = tf.convert_to_tensor(y_pred)
+    y_true = tf.cast(y_true, y_pred.dtype)
+    labelled = tf.cast(tf.reduce_sum(y_true, axis=-1) > 0, y_pred.dtype)
+    log_prediction = tf.nn.log_softmax(y_pred * beta, axis=-1)
+    divergence = tf.reduce_sum(
+        y_true * (tf.math.log(tf.maximum(y_true, K.epsilon())) - log_prediction), axis=-1)
+    return tf.reduce_sum(divergence * labelled) / tf.maximum(tf.reduce_sum(labelled), 1.0)
+
+
+def points_to_density(points, shape, sigma=4.0):
+    '''
+    Density map for counting from point annotations: one normalized
+    Gaussian per point, so that the map sums to the number of points that
+    fall inside the image.
+
+    Input
+    ----------
+        points: `(n, 2)` array of `(x, y)` positions in pixels.
+        shape: `(height, width)` of the map.
+        sigma: standard deviation of each Gaussian, in pixels.
+
+    Output
+    ----------
+        A float32 array of shape `(height, width, 1)`.
+    '''
+    height, width = shape
+    density = np.zeros((height, width), dtype=np.float64)
+    ys, xs = np.arange(height)[:, None], np.arange(width)[None, :]
+    for x, y in np.asarray(points, dtype=np.float64).reshape(-1, 2):
+        if not (0 <= x < width and 0 <= y < height):
+            continue
+        blob = np.exp(-((xs - x) ** 2 + (ys - y) ** 2) / (2.0 * sigma ** 2))
+        density += blob / blob.sum()
+    return density[..., None].astype(np.float32)
+
+
+def density_count_loss(count_weight=0.01, density_scale=1.0):
+    '''
+    Loss for counting by density map (`models.density_head`): squared error
+    on the map plus the absolute error of the count per image.
+
+    density_count_loss(count_weight=0.01, density_scale=1.0)
+
+    Input
+    ----------
+        count_weight: weight of the count term.
+        density_scale: factor applied to the target map. Density values
+                       are small (a Gaussian of sigma 4 peaks near 0.01);
+                       a factor such as 100 makes the regression better
+                       conditioned. The predicted count is then the sum of
+                       the output divided by the same factor.
+
+    Output
+    ----------
+        A loss `(y_true, y_pred)` for maps of shape `(batch, H, W, 1)`.
+    '''
+    def loss(y_true, y_pred):
+        y_pred = tf.convert_to_tensor(y_pred)
+        y_true = tf.cast(y_true, y_pred.dtype) * density_scale
+        pixel = tf.reduce_mean(tf.square(y_pred - y_true))
+        count = tf.reduce_mean(tf.abs(
+            tf.reduce_sum(y_pred, axis=[1, 2, 3]) - tf.reduce_sum(y_true, axis=[1, 2, 3])))
+        return pixel + count_weight * count
+    loss.__name__ = 'density_count_loss'
+    return loss

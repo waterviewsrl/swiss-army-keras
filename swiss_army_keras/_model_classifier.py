@@ -5,7 +5,7 @@ import tensorflow as tf
 from tensorflow.keras.regularizers import l2
 
 from swiss_army_keras._backbone_zoo import backbone_zoo, bach_norm_checker
-from swiss_army_keras.layer_utils import GeMPooling2D, apply_pre_pool_attention, iqa_regression_head, qat_annotate_layer
+from swiss_army_keras.layer_utils import GeMPooling2D, apply_pre_pool_attention, iqa_regression_head, qat_annotate_layer, qat_apply
 
 import tensorflow_model_optimization as tfmot
 
@@ -128,7 +128,7 @@ def classifier(input_tensor, n_classes, backbone='MobileNetV3Large', weights='im
     res = tf.keras.models.Model(inputs=input_tensor, outputs=outputs)
 
     with tfmot.quantization.keras.quantize_scope():
-        res = tfmot.quantization.keras.quantize_apply(res)
+        res = qat_apply(res)
 
     res.preprocessing = backbone_.preprocessing
 
@@ -253,7 +253,7 @@ def learnable_resizer_classifier(input_tensor, n_classes, target_size=(480, 480)
     res = tf.keras.models.Model(inputs=input_tensor, outputs=classifier)
 
     with tfmot.quantization.keras.quantize_scope():
-        res = tfmot.quantization.keras.quantize_apply(res)
+        res = qat_apply(res)
 
     res.preprocessing = backbone_.preprocessing
     return res
@@ -327,7 +327,7 @@ def wise_srnet_classifier(input_tensor, n_classes, backbone='MobileNetV3Large', 
     res = tf.keras.models.Model(inputs=input_tensor, outputs=classifier)
 
     with tfmot.quantization.keras.quantize_scope():
-        res = tfmot.quantization.keras.quantize_apply(res)
+        res = qat_apply(res)
 
     res.preprocessing = backbone_.preprocessing
     return res
@@ -432,7 +432,7 @@ def learnable_resizer_distiller_classifier(input_tensor, n_classes, target_size=
     res = tf.keras.models.Model(inputs=input_tensor, outputs=classifier)
 
     with tfmot.quantization.keras.quantize_scope():
-        res = tfmot.quantization.keras.quantize_apply(res)
+        res = qat_apply(res)
 
     res.preprocessing = backbone_.preprocessing
     return res
@@ -518,7 +518,7 @@ def distiller_classifier(input_tensor, n_classes, backbone='MobileNetV3Large', w
     res = tf.keras.models.Model(inputs=input_tensor, outputs=classifier)
 
     with tfmot.quantization.keras.quantize_scope():
-        res = tfmot.quantization.keras.quantize_apply(res)
+        res = qat_apply(res)
 
     res.preprocessing = backbone_.preprocessing
     return res
@@ -565,7 +565,7 @@ def multilabel_classifier(input_tensor, n_classes, backbone='MobileNetV3Large', 
     res = tf.keras.models.Model(inputs=input_tensor, outputs=classifier_out)
 
     with tfmot.quantization.keras.quantize_scope():
-        res = tfmot.quantization.keras.quantize_apply(res)
+        res = qat_apply(res)
 
     res.preprocessing = backbone_.preprocessing
 
@@ -677,7 +677,7 @@ def ordinal_classifier(input_tensor, n_classes, backbone='MobileNetV3Large', wei
     res = tf.keras.models.Model(inputs=input_tensor, outputs=classifier_out)
 
     with tfmot.quantization.keras.quantize_scope():
-        res = tfmot.quantization.keras.quantize_apply(res)
+        res = qat_apply(res)
 
     res.preprocessing = backbone_.preprocessing
 
@@ -759,7 +759,7 @@ def pose_regression_head(input_tensor, n_keypoints, backbone='MobileNetV3Large',
     res = tf.keras.models.Model(inputs=input_tensor, outputs=keypoints)
 
     with tfmot.quantization.keras.quantize_scope():
-        res = tfmot.quantization.keras.quantize_apply(res)
+        res = qat_apply(res)
 
     res.preprocessing = backbone_.preprocessing
 
@@ -856,8 +856,81 @@ def reid_embedding_head(input_tensor, embedding_size=128, backbone='MobileNetV3L
     res = tf.keras.models.Model(inputs=input_tensor, outputs=embedding)
 
     with tfmot.quantization.keras.quantize_scope():
-        res = tfmot.quantization.keras.quantize_apply(res)
+        res = qat_apply(res)
 
     res.preprocessing = backbone_.preprocessing
 
     return res
+
+
+@tf.keras.utils.register_keras_serializable(package='swiss_army_keras')
+class CosineClassifier(tf.keras.layers.Layer):
+    '''Cosine similarity between an embedding and one learned weight vector
+    per class: a dense layer without bias whose inputs and weights are both
+    L2-normalized. Its output is what margin losses (`losses.arcface_loss`,
+    `losses.cosface_loss`) take.
+    '''
+
+    def __init__(self, n_classes, **kwargs):
+        super().__init__(**kwargs)
+        self.n_classes = n_classes
+
+    def build(self, input_shape):
+        self.class_weights = self.add_weight(
+            name='class_weights', shape=(int(input_shape[-1]), self.n_classes),
+            initializer='glorot_uniform', trainable=True)
+
+    def call(self, inputs):
+        return tf.matmul(tf.math.l2_normalize(inputs, axis=-1), tf.math.l2_normalize(self.class_weights, axis=0))
+
+    def get_config(self):
+        config = super().get_config()
+        config['n_classes'] = self.n_classes
+        return config
+
+
+def reid_training_model(embedding_model, n_identities, bnneck=True, name='reid_train'):
+    '''Training wrapper for an embedding model: adds an identity classifier
+    with cosine outputs, optionally behind a batch-norm neck.
+
+    The usual strong baseline for re-identification (Luo et al., 2019, "Bag
+    of Tricks and a Strong Baseline for Deep Person Re-identification")
+    trains the embedding with a metric loss and, through a batch-norm layer
+    without bias (the "BNNeck"), an identity classification loss. The
+    classifier exists only for training.
+
+    Input
+    ----------
+        embedding_model: a model with one embedding output, e.g. from
+                         `reid_embedding_head`.
+        n_identities: number of identities in the training set.
+        bnneck: put a batch norm (no shift) between the embedding and the
+                classifier.
+        name: name of the returned model.
+
+    Output
+    ----------
+        A `tf.keras.Model` sharing the layers of `embedding_model`, with two
+        outputs named `embedding` (unchanged) and `identity` (cosine
+        similarities to the `n_identities` class weights). Compile it with a
+        metric loss on `embedding` (e.g. `losses.triplet_1d`) and
+        `losses.arcface_loss()` or `losses.cosface_loss()` on `identity`.
+        After training, export `embedding_model` itself: it shares the
+        trained weights and has no classifier.
+    '''
+    if len(embedding_model.outputs) != 1:
+        raise ValueError('reid_training_model expects a model with a single embedding output.')
+    embedding = embedding_model.outputs[0]
+    feature = embedding
+    if bnneck:
+        feature = tf.keras.layers.BatchNormalization(center=False, name='{}_bnneck'.format(name))(feature)
+    identity = CosineClassifier(n_identities, name='{}_cosine'.format(name))(feature)
+
+    outputs = [
+        tf.keras.layers.Activation('linear', name='embedding')(embedding),
+        tf.keras.layers.Activation('linear', name='identity')(identity),
+    ]
+    model = tf.keras.models.Model(embedding_model.inputs, outputs, name=name)
+    if hasattr(embedding_model, 'preprocessing'):
+        model.preprocessing = embedding_model.preprocessing
+    return model

@@ -839,3 +839,42 @@ class TestFcosLiteInstanceSegmentation:
         )
         with pytest.raises(tf.errors.InvalidArgumentError):
             model.predict(_random_batch(batch_size=2), verbose=0)
+
+
+# Export-friendly head options (CANDIDATES_BY_TASK.md section 2): FCOS
+# distances without an exponential, GFL outputs without slices.
+
+
+def test_fcos_relu_distances_have_no_exponential_and_stay_non_negative():
+    from swiss_army_keras._model_detection import fcos_lite_detection_base
+
+    inp = tf.keras.Input((128, 128, 3))
+    model = fcos_lite_detection_base(inp, n_classes=3, backbone="MobileNetV2", weights=None,
+                                     freeze_backbone=False, distance_activation="relu")
+    assert not any("exp" in layer.name for layer in model.layers)
+    outputs = model.predict(np.random.rand(1, 128, 128, 3).astype("float32"), verbose=0)
+    for level in range(3):
+        assert outputs[level * 3 + 1].min() >= 0.0
+
+    default = fcos_lite_detection_base(tf.keras.Input((128, 128, 3)), n_classes=3, backbone="MobileNetV2",
+                                       weights=None, freeze_backbone=False)
+    assert any("exp" in layer.name for layer in default.layers)
+    with pytest.raises(ValueError, match="distance_activation"):
+        fcos_lite_detection_base(tf.keras.Input((128, 128, 3)), n_classes=3, backbone="MobileNetV2",
+                                 weights=None, distance_activation="softplus")
+
+
+def test_gfl_head_uses_two_output_convolutions_and_can_stay_4d():
+    from swiss_army_keras._model_detection import gfl_lite_detection_base
+
+    inp = tf.keras.Input((128, 128, 3))
+    model = gfl_lite_detection_base(inp, n_classes=3, backbone="MobileNetV2", weights=None, freeze_backbone=False)
+    names = {layer.name for layer in model.layers}
+    assert {"quant_gfl_lite_head_cls_out", "quant_gfl_lite_head_reg_out"} <= names
+    assert not any("getitem" in name or "strided_slice" in name for name in names)
+    assert model.output_shape[1] == (None, 16, 16, 4, 8)
+
+    flat = gfl_lite_detection_base(tf.keras.Input((128, 128, 3)), n_classes=3, backbone="MobileNetV2",
+                                   weights=None, freeze_backbone=False, flat_reg=True)
+    assert flat.output_shape[1] == (None, 16, 16, 32)
+    assert all(len(shape) == 4 for shape in flat.output_shape)

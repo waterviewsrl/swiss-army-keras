@@ -90,15 +90,8 @@ from literally the same ResNet `BasicBlock`/`Bottleneck` shapes.
   5-branch cascade-pooling module PIDNet's own `DAPPM` class is (confirmed
   identical branch kernel/stride/pad triples, cascade-accumulation pattern,
   and final concat+compression+shortcut, from reading both source files
-  directly). **Known, deliberately-not-fixed discrepancy inherited from
-  the existing `dappm`**: DDRNet's `dappm` appends one extra
-  `BatchNormalization` after each of its 5 branches' `Conv1x1` (via
-  `_conv_bn`) that the verified PyTorch reference does not have (each
-  branch there ends on a bare `Conv2d(bias=False)`, no trailing BN) — found
-  while cross-referencing PIDNet's byte-identical `DAPPM` class against
-  this file's own already-shipped, already-tested `dappm`, out of scope to
-  silently "fix" here since it's pre-existing, shipped behavior this
-  session wasn't asked to touch; flagged in plan.md instead. `PAPPM`
+  directly); since 2026-11-10 `dappm` also matches it layer for layer
+  (no batch norm after its convolutions). `PAPPM`
   (`m == 2`, "S"/"M") is genuinely different, not just a renamed DAPPM —
   a new `_pappm` in this file: same 5 pooling branches, but every branch is
   added to `scale0`'s output *independently* (not cascaded onto the
@@ -162,13 +155,14 @@ from tensorflow.keras.models import Model
 from tensorflow.keras.initializers import HeNormal
 from tensorflow.keras.utils import register_keras_serializable
 
-from swiss_army_keras.layer_utils import dummy_preprocessing, qat_annotate_layer
+from swiss_army_keras.layer_utils import check_input_size, dummy_preprocessing, qat_annotate_layer, resize_to, qat_apply
 from swiss_army_keras._model_ddrnet import (
     basic_block,
     bottleneck_block,
     dappm,
     _avg_pool_branch,
     _bn_relu,
+    _bn_relu_conv,
     _conv_bn,
     _conv_bn_relu,
     _make_stage,
@@ -217,18 +211,12 @@ def _pagfm(x, y, mid_channels, name=''):
     target_h, target_w = int(x.shape[1]), int(x.shape[2])
 
     y_q = _conv_bn(y, mid_channels, 1, name=f'{name}_f_y')
-    y_q = qat_annotate_layer(UpSampling2D(
-        size=(target_h // y_q.shape[1], target_w // y_q.shape[2]),
-        interpolation='bilinear', name=f'{name}_yq_up',
-    ))(y_q)
+    y_q = resize_to(y_q, target_h, target_w, name=f'{name}_yq_up')
     x_k = _conv_bn(x, mid_channels, 1, name=f'{name}_f_x')
 
     sim_map = ChannelSumSigmoid(name=f'{name}_sim')([x_k, y_q])
 
-    y_up = qat_annotate_layer(UpSampling2D(
-        size=(target_h // y.shape[1], target_w // y.shape[2]),
-        interpolation='bilinear', name=f'{name}_y_up',
-    ))(y)
+    y_up = resize_to(y, target_h, target_w, name=f'{name}_y_up')
 
     # x*(1-sim_map) + y_up*sim_map == AttentionBlend(y_up, x, sim_map)
     # (AttentionBlend(a, b, atten) = a*atten + b*(1-atten)).
@@ -279,9 +267,7 @@ def _pappm(x, branch_channels, out_channels, name='pappm'):
     than 4 separate per-scale 3x3 convs — confirmed from source, this is
     the actual mechanism behind "parallel" in the name, not a simplifying
     guess. Every branch ends on a bare conv (no trailing BN), matching the
-    reference exactly (unlike this file's reused `dappm`, which has a
-    known, documented, deliberately-not-fixed extra-BN discrepancy — see
-    module docstring).
+    reference exactly.
     '''
     height, width = int(x.shape[1]), int(x.shape[2])
 
@@ -300,10 +286,7 @@ def _pappm(x, branch_channels, out_channels, name='pappm'):
             branch_channels, 1, padding='same', use_bias=False,
             kernel_initializer=HeNormal(), name=f'{name}_scale{i}_conv',
         ))(pooled)
-        pooled = qat_annotate_layer(UpSampling2D(
-            size=(height // pooled.shape[1], width // pooled.shape[2]),
-            interpolation='bilinear', name=f'{name}_scale{i}_up',
-        ))(pooled)
+        pooled = resize_to(pooled, height, width, name=f'{name}_scale{i}_up')
         scale_list.append(Add(name=f'{name}_scale{i}_merge')([pooled, x0]))
 
     global_pooled = qat_annotate_layer(tf.keras.layers.AveragePooling2D(
@@ -384,7 +367,9 @@ def pidnet(input_tensor, n_labels, m=2, n=3, planes=32, ppm_planes=96,
 
     Input
     ----------
-        input_tensor: the input tensor, e.g., `keras.layers.Input((None, None, 3))`.
+        input_tensor: the input tensor, with a static height and width that
+                      are multiples of 8, at least 64 (the context branch reaches
+                      stride 64), e.g. `keras.layers.Input((512, 1024, 3))`.
         n_labels: number of segmentation classes.
         m: **both** the shared trunk's/P branch's per-stage `BasicBlock`
            repeat count *and* the selector for which pooling module
@@ -419,13 +404,14 @@ def pidnet(input_tensor, n_labels, m=2, n=3, planes=32, ppm_planes=96,
         `(H, W, C)` logit map at the input's spatial resolution (`C =
         n_labels` for the main/P-aux outputs, `C = 1` for the D-aux one).
     '''
+    input_h, input_w = check_input_size(input_tensor, multiple=8, minimum=64, what='PIDNet')
     highres_planes = planes * 2
-    input_h, input_w = input_tensor.shape[1], input_tensor.shape[2]
     target_h, target_w = input_h // 8, input_w // 8
     use_light = (m == 2)
 
-    x = _conv_bn_relu(input_tensor, planes, 3, stride=2, name=f'{name}_stem1')
-    x = _conv_bn_relu(x, planes, 3, stride=2, name=f'{name}_stem2')
+    # the two stem convolutions carry a bias in the reference
+    x = _conv_bn_relu(input_tensor, planes, 3, stride=2, use_bias=True, name=f'{name}_stem1')
+    x = _conv_bn_relu(x, planes, 3, stride=2, use_bias=True, name=f'{name}_stem2')
 
     x = _make_stage(x, basic_block, planes, m, stride=1, name=f'{name}_layer1')
     x = qat_annotate_layer(Activation('relu', name=f'{name}_layer1_relu'))(x)
@@ -446,10 +432,7 @@ def pidnet(input_tensor, n_labels, m=2, n=3, planes=32, ppm_planes=96,
 
     diff3_width = planes if use_light else highres_planes
     diff3 = _conv_bn(x, diff3_width, 3, name=f'{name}_diff3')
-    diff3 = qat_annotate_layer(UpSampling2D(
-        size=(target_h // diff3.shape[1], target_w // diff3.shape[2]),
-        interpolation='bilinear', name=f'{name}_diff3_up',
-    ))(diff3)
+    diff3 = resize_to(diff3, target_h, target_w, name=f'{name}_diff3_up')
     x_d = Add(name=f'{name}_fuse3_d')([x_d, diff3])
 
     if augment:
@@ -477,10 +460,7 @@ def pidnet(input_tensor, n_labels, m=2, n=3, planes=32, ppm_planes=96,
     x_ = _pagfm(x_, compression4, planes, name=f'{name}_pag4')
 
     diff4 = _conv_bn(x, highres_planes, 3, name=f'{name}_diff4')
-    diff4 = qat_annotate_layer(UpSampling2D(
-        size=(target_h // diff4.shape[1], target_w // diff4.shape[2]),
-        interpolation='bilinear', name=f'{name}_diff4_up',
-    ))(diff4)
+    diff4 = resize_to(diff4, target_h, target_w, name=f'{name}_diff4_up')
     x_d = Add(name=f'{name}_fuse4_d')([x_d, diff4])
 
     if augment:
@@ -494,19 +474,13 @@ def pidnet(input_tensor, n_labels, m=2, n=3, planes=32, ppm_planes=96,
         qat_annotate_layer(Activation('relu', name=f'{name}_d4_relu'))(x_d),
         planes * 4, 1, stride=1, name=f'{name}_layer5_d',
     )
-    x = _bottleneck_stage(
-        qat_annotate_layer(Activation('relu', name=f'{name}_i4_relu'))(x),
-        planes * 16, 2, stride=2, name=f'{name}_layer5',
-    )
+    x = _bottleneck_stage(x, planes * 16, 2, stride=2, name=f'{name}_layer5')
 
     if use_light:
         x = _pappm(x, ppm_planes, planes * 4, name=f'{name}_pappm')
     else:
         x = dappm(x, ppm_planes, planes * 4, name=f'{name}_dappm')
-    x = qat_annotate_layer(UpSampling2D(
-        size=(target_h // x.shape[1], target_w // x.shape[2]),
-        interpolation='bilinear', name=f'{name}_spp_up',
-    ))(x)
+    x = resize_to(x, target_h, target_w, name=f'{name}_spp_up')
 
     if use_light:
         fused = _light_bag(x_, x, x_d, planes * 4, name=f'{name}_dfm')
@@ -514,32 +488,23 @@ def pidnet(input_tensor, n_labels, m=2, n=3, planes=32, ppm_planes=96,
         fused = _bag(x_, x, x_d, planes * 4, name=f'{name}_dfm')
 
     main_out = _pidnet_segmenthead(fused, head_planes, n_labels, name=f'{name}_final_head')
-    main_out = qat_annotate_layer(UpSampling2D(
-        size=(input_h // main_out.shape[1], input_w // main_out.shape[2]),
-        interpolation='bilinear', name=f'{name}_final_upsample',
-    ))(main_out)
+    main_out = resize_to(main_out, input_h, input_w, name=f'{name}_final_upsample')
 
     if not augment:
         outputs = [main_out]
     else:
         p_aux = _pidnet_segmenthead(temp_p, head_planes, n_labels, name=f'{name}_p_head')
-        p_aux = qat_annotate_layer(UpSampling2D(
-            size=(input_h // p_aux.shape[1], input_w // p_aux.shape[2]),
-            interpolation='bilinear', name=f'{name}_p_upsample',
-        ))(p_aux)
+        p_aux = resize_to(p_aux, input_h, input_w, name=f'{name}_p_upsample')
 
         d_aux = _pidnet_segmenthead(temp_d, planes, 1, name=f'{name}_d_head')
-        d_aux = qat_annotate_layer(UpSampling2D(
-            size=(input_h // d_aux.shape[1], input_w // d_aux.shape[2]),
-            interpolation='bilinear', name=f'{name}_d_upsample',
-        ))(d_aux)
+        d_aux = resize_to(d_aux, input_h, input_w, name=f'{name}_d_upsample')
 
         outputs = [p_aux, main_out, d_aux]
 
     model = Model([input_tensor, ], outputs)
 
     with tfmot.quantization.keras.quantize_scope():
-        model = tfmot.quantization.keras.quantize_apply(model)
+        model = qat_apply(model)
 
     model.preprocessing = dummy_preprocessing
 

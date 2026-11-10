@@ -25,6 +25,80 @@ from tensorflow.keras.layers import ReLU, LeakyReLU, PReLU, ELU, Softmax
 from tensorflow.keras.models import Model
 
 
+# Global quantization-aware-training switch, see `set_qat` / `qat_options`.
+_QAT_OPTIONS = {'enabled': True}
+
+
+def set_qat(enabled=None):
+    '''Set whether the model builders of this library use
+    quantization-aware training (QAT). Applies to models built afterwards.
+
+    Input
+    ----------
+        enabled: `True` (the default state) wraps the layers of every head
+                 with `tensorflow_model_optimization` fake-quantization
+                 wrappers. `False` makes the builders return plain float
+                 Keras models: nothing is wrapped, layers keep their names
+                 (no `quant_` prefix), building is faster and the model is
+                 quantized post-training at export. That is already what
+                 happens to the wrappers for accelerator profiles
+                 (`Quantizer` strips them), so for those targets a model
+                 built without QAT is exported identically. `None` leaves
+                 the switch unchanged.
+
+    Output
+    ----------
+        The previous state, as a dict that can be passed back:
+        `set_qat(**previous)`.
+
+    A per-tensor QAT scheme was tried and is not offered:
+    `tensorflow_model_optimization` drops the weight quantizer of a
+    convolution that is followed by an activation layer when per-axis
+    quantization is disabled, and the converter then quantizes those
+    weights per channel anyway.
+    '''
+    previous = dict(_QAT_OPTIONS)
+    if enabled is not None:
+        _QAT_OPTIONS['enabled'] = bool(enabled)
+    return previous
+
+
+class qat_options:
+    '''Context manager form of `set_qat`::
+
+        with qat_options(enabled=False):
+            model = lr_aspp(input_tensor, n_labels=4, backbone='ResNet18')   # a plain float model
+    '''
+
+    def __init__(self, enabled=None):
+        self._requested = enabled
+        self._previous = None
+
+    def __enter__(self):
+        self._previous = set_qat(enabled=self._requested)
+        return self
+
+    def __exit__(self, *exc):
+        set_qat(**self._previous)
+        return False
+
+
+def qat_enabled():
+    '''Whether the builders currently wrap their layers for QAT.'''
+    return _QAT_OPTIONS['enabled']
+
+
+def qat_apply(model):
+    '''Finish a model whose layers were passed through
+    `qat_annotate_layer`: apply the QAT wrappers, or return the model
+    unchanged when QAT is disabled. Every builder ends with this call.
+    '''
+    if not _QAT_OPTIONS['enabled']:
+        return model
+    with tfmot.quantization.keras.quantize_scope():
+        return tfmot.quantization.keras.quantize_apply(model)
+
+
 def qat_annotate_layer(layer):
     '''Wrap `layer` for QAT (in place of a bare
     `tfmot.quantization.keras.quantize_annotate_layer` call), forcing float32
@@ -56,6 +130,8 @@ def qat_annotate_layer(layer):
     `_force_quantize_wrapper_dtype_float32()` below, since that wrapper is
     built internally by `tfmot`, not by this function.
     '''
+    if not _QAT_OPTIONS['enabled']:
+        return layer
     layer._set_dtype_policy(tf.keras.mixed_precision.Policy('float32'))
     wrapped = tfmot.quantization.keras.quantize_annotate_layer(layer)
     wrapped._set_dtype_policy(tf.keras.mixed_precision.Policy('float32'))
@@ -706,6 +782,69 @@ class CoordAttLite(tf.keras.layers.Layer):
         config = super().get_config()
         config.update({'reduction': self.reduction})
         return config
+
+
+def resize_to(x, height, width, name=None, interpolation='bilinear'):
+    '''Resize a feature map to an explicit spatial size.
+
+    Decoders used to resize with `UpSampling2D` and an integer factor
+    computed from two shapes, which fails whenever the target is not an
+    exact multiple of the source (for example a 23-row map under a 90-row
+    one, as a 720-pixel input produces). This helper keeps `UpSampling2D`
+    (annotated for quantization-aware training, as before) when the factor
+    is an integer, uses `Resizing` otherwise, and adds no layer at all when
+    the sizes already match. Both layers export as one `RESIZE_BILINEAR`
+    with half-pixel centres, the convention of the PyTorch references
+    (`align_corners=False`).
+
+    Input
+    ----------
+        x: a `(batch, h, w, channels)` tensor with a static spatial size.
+        height, width: the target size.
+        name: layer name.
+        interpolation: `'bilinear'` or `'nearest'`.
+
+    Output
+    ----------
+        The resized tensor, or `x` itself when no resize is needed.
+    '''
+    h, w = int(x.shape[1]), int(x.shape[2])
+    height, width = int(height), int(width)
+    if (h, w) == (height, width):
+        return x
+    if height % h == 0 and width % w == 0:
+        return qat_annotate_layer(UpSampling2D(
+            size=(height // h, width // w), interpolation=interpolation, name=name))(x)
+    return tf.keras.layers.Resizing(height, width, interpolation=interpolation, name=name)(x)
+
+
+def check_input_size(input_tensor, multiple=32, minimum=None, what='This model'):
+    '''Fail early, with a clear message, on an input size a builder cannot use.
+
+    Input
+    ----------
+        input_tensor: the model input, `(batch, height, width, channels)`.
+        multiple: height and width must be multiples of this.
+        minimum: smallest accepted height and width, or `None`.
+        what: name used in the message.
+
+    Output
+    ----------
+        `(height, width)` as ints. Raises `ValueError` for a dynamic size, a
+        size that is not a multiple of `multiple`, or one below `minimum`.
+    '''
+    height, width = input_tensor.shape[1], input_tensor.shape[2]
+    if height is None or width is None:
+        raise ValueError(
+            f'{what} needs a static input size, got {tuple(input_tensor.shape)}. '
+            'Pass an Input with a concrete height and width.')
+    height, width = int(height), int(width)
+    if height % multiple or width % multiple:
+        raise ValueError(
+            f'{what} needs a height and width that are multiples of {multiple}, got {height}x{width}.')
+    if minimum is not None and min(height, width) < minimum:
+        raise ValueError(f'{what} needs an input of at least {minimum}x{minimum}, got {height}x{width}.')
+    return height, width
 
 
 def apply_pre_pool_attention(x, pre_pool_attention=None, name='pre_pool_attention'):

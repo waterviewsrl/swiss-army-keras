@@ -20,11 +20,20 @@ on its own:
 
 ``quantize()`` performs these steps:
 
-1. **Reparameterize.** The training-time branches of a MobileOne, RepViT or
-   FastViT backbone are fused into plain convolutions.
-2. **Strip the QAT wrappers** (for integer-only targets, see below).
-3. **Equalize** consecutive layers (for per-tensor targets, see below).
-4. **Convert** for the chosen deployment profile, and write
+1. **Select outputs** (``outputs=``): leave out the auxiliary heads of a
+   network trained with deep supervision.
+2. **Reparameterize.** The training-time branches of a MobileOne, RepViT,
+   FastViT or QARepVGG backbone are fused into plain convolutions.
+3. **Strip the QAT wrappers** (for integer-only targets, see below).
+4. **Rewrite for the target**, on request or by profile: drop the final
+   sigmoid, softmax or L2 normalization (``drop_output_activations=True``),
+   and replace global average pooling by a windowed pooling when the
+   target's list has no ``MEAN`` operator.
+5. **Fold the batch norms** into their convolutions, **equalize**
+   consecutive layers and **correct the bias** (the last two for per-tensor
+   targets, see below).
+6. **Convert** for the chosen deployment profile, with a fixed batch of one
+   for the accelerator profiles, and write
 
    * ``<name>_quant_ui8.tflite``: full-integer model. Only
      ``TFLITE_BUILTINS_INT8`` operators are allowed, so conversion fails if
@@ -32,9 +41,12 @@ on its own:
    * ``<name>_quant_f16.tflite``: float16 weights with float32 input and
      output, for GPU delegates and as an accuracy reference.
 
-5. **Check** the full-integer file against the profile. The report is logged
+7. **Check** the full-integer file against the profile. The report is logged
    and kept in ``q.lint_report``; pass ``strict=True`` to make a failed check
    raise.
+
+Every weight change made for the export (equalization, bias correction) is
+undone on the trained model afterwards.
 
 With ``TrainingDriver``, choose the target with ``export_profile``:
 
@@ -51,7 +63,9 @@ The individual steps are available in ``swiss_army_keras.deploy_utils``:
    from swiss_army_keras import deploy_utils
 
    export_model = deploy_utils.strip_qat(deploy_utils.reparameterize_model(model))
-   deploy_utils.equalize_cross_layer(export_model)        # per-tensor targets
+   export_model = deploy_utils.fold_batch_norms(export_model)
+   deploy_utils.equalize_cross_layer(export_model)                     # per-tensor targets
+   deploy_utils.correct_bias(export_model, calibration_images)         # per-tensor targets
    tflite_bytes = deploy_utils.convert_to_tflite(export_model, representative_data_gen, profile="artpec8")
    print(deploy_utils.lint_tflite(tflite_bytes, profile="artpec8"))
    print(deploy_utils.quantization_error(export_model, tflite_bytes, some_normalized_images))
@@ -193,8 +207,92 @@ tensor and the QAT wrappers were stripped (``equalize=None``), and restores
 the original weights after conversion, since layers may be shared with the
 model being trained.
 
-Measured quantization quality
------------------------------
+Batch-norm folding and bias correction
+--------------------------------------
+
+Two more steps act on the same problem.
+
+``deploy_utils.fold_batch_norms`` folds each batch norm into the convolution
+before it, which is what the converter does anyway before it quantizes.
+Doing it first means equalization works on the weights that will actually
+be quantized.
+
+``deploy_utils.correct_bias`` implements bias correction (Nagel et al.,
+2019). Rounding weights to 8 bits shifts the mean output of a layer whenever
+its inputs have a non-zero mean, which is always true after a ReLU. The
+function measures that shift per output channel on the calibration images
+and subtracts it from the bias. It uses the activations of the float model,
+so errors that build up along the network are not compensated.
+
+``Quantizer`` folds whenever the wrappers were stripped, and corrects the
+bias for per-tensor profiles (``fold_batch_norms=None``,
+``bias_correction=None``).
+
+Measured task accuracy
+----------------------
+
+Mean intersection-over-union of two segmentation models trained on
+Oxford-IIIT Pets (three classes, 256 x 256) in September 2026, re-exported
+in every variant on 2026-11-10. 150 evaluation images and 32 calibration
+images. The split of the training runs was not recorded, so the evaluation
+images may include training images: read the columns against each other,
+not as absolute accuracy. Nothing was retrained.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 52 24 24
+
+   * - Export
+     - PP-LiteSeg on MobileNetV4-Conv-S
+     - LR-ASPP on MobileOne-S1 (fused)
+   * - Float model
+     - 0.832
+     - 0.664
+   * - QAT wrappers kept, per channel (``default`` profile)
+     - 0.819
+     - 0.357, with one operator left in floating point
+   * - Post-training, per channel (``artpec9`` profile)
+     - 0.818
+     - 0.522
+   * - Post-training, per tensor, no other step
+     - 0.505
+     - 0.197
+   * - Per tensor, equalized (the ``artpec8`` default until 2026-11-10)
+     - 0.741
+     - 0.374
+   * - Per tensor, folded and equalized
+     - 0.784
+     - 0.374
+   * - Per tensor, folded and bias-corrected
+     - 0.756
+     - 0.456
+   * - Per tensor, folded, equalized and bias-corrected (the ``artpec8``
+       default now)
+     - 0.808
+     - 0.381
+   * - Per channel, folded and bias-corrected
+     - 0.818
+     - 0.502
+
+What this says:
+
+* **The QAT wrappers on the head buy almost nothing** on the model that
+  quantizes well (0.819 against 0.818 post-training), and on the MobileOne
+  model the QAT export is the worst variant.
+* **Per-tensor quantization needs all three steps.** On PP-LiteSeg with
+  MobileNetV4 they bring 0.505 to 0.808, within 0.024 of the float model
+  and 0.010 of the per-channel export.
+* **A fused MobileOne backbone loses accuracy under every 8-bit export
+  tried**: 0.142 per channel and at least 0.208 per tensor. Equalization
+  does not help it and bias correction helps only without equalization.
+  This confirms at task level what the feature measurements below showed.
+  Until that is solved, prefer MobileNetV4-Conv or one of the plain
+  backbones for an accelerator.
+* Bias correction changes nothing per channel, where weight rounding is
+  already fine.
+
+Measured quantization quality of backbone features
+--------------------------------------------------
 
 Signal-to-quantization-noise ratio (SQNR, in dB, higher is better; 6 dB is
 roughly one bit) of the backbone feature maps, quantized TFLite against the
@@ -287,6 +385,42 @@ These are feature-level measurements on a small image set, a proxy for task
 accuracy, not a substitute: no trained head was evaluated. Measure your own
 model with ``deploy_utils.quantization_error`` before deploying.
 
+Building models without QAT wrappers
+************************************
+
+Given the measurements above, quantization-aware training is optional:
+
+.. code-block:: python
+
+   from swiss_army_keras.layer_utils import qat_options, set_qat
+
+   with qat_options(enabled=False):
+       model = lr_aspp(input_tensor, n_labels=4, backbone="ResNet18")   # a plain float Keras model
+
+   set_qat(enabled=False)        # or for everything built from here on
+
+Such a model has no ``tensorflow_model_optimization`` wrappers and its
+layers keep their names. It trains faster and exports to the same file for
+the accelerator profiles, which strip the wrappers anyway. Keep QAT enabled
+for the ``default`` and ``litert-cpu`` profiles if you rely on the learned
+ranges.
+
+Finding the layers that quantize badly
+**************************************
+
+.. code-block:: python
+
+   report = deploy_utils.quantization_debug_report(export_model, representative_data_gen,
+                                                   profile="artpec8", top=10)
+   for row in report:
+       print(row["rmse_over_scale"], row["op_name"], row["tensor_name"])
+
+Each operator of the quantized model is compared with its float counterpart
+on the calibration data. Values of ``rmse_over_scale`` near 0.29 are the
+error of ideal rounding; a layer far above that has a range or weight
+problem (a candidate for equalization, a different activation, or a look at
+its inputs).
+
 Measuring quantization error
 ****************************
 
@@ -311,6 +445,45 @@ builders offer a plain variant, to be chosen before training:
   concatenation.
 * ``pp_liteseg(..., fusion='add')``: the two features are added instead of
   blended by the UAFM attention.
+
+Models with nothing off the Axis lists
+**************************************
+
+These combinations export with no operator outside either published list
+(checked at 128 x 128 and 256 x 256 with random weights; the lists
+themselves are unverified on a device):
+
+* **Backbones:** ``ResNet18``, ``ResNet34``, ``STDC1``, ``STDC2``,
+  ``QARepVGG-A0`` / ``-A1`` / ``-B0`` (fused automatically), ``CSP-N`` /
+  ``-S`` / ``-M``, ``MobileNetV3Small``. They use ``'same'`` padding, so no
+  ``PAD`` operator. The MobileNetV4, MobileOne and MobileNetV2 backbones add
+  explicit padding, which is on the ARTPEC-9 list but not on the ARTPEC-8
+  one.
+* **Heads:** ``fpn_seg`` and ``density_head`` (convolutions, additions and
+  resizes by 2 only), ``lr_aspp(gate=False)``, ``pp_liteseg(fusion='add')``,
+  ``fastdepth_head``, ``simcc_head``, the classifiers with
+  ``activation='relu'``, ``reid_embedding_head(pre_pool_attention=None,
+  activation='relu')``, ``pose_regression_head(activation='relu')``,
+  ``fcos_lite_detection_base(distance_activation='relu')``,
+  ``gfl_lite_detection_base(flat_reg=True)``, and ``ddrnet``. Use
+  ``drop_output_activations=True`` for those that end with a sigmoid,
+  softmax or normalization.
+
+Not in this list: PIDNet and PP-MobileSeg (gates and attention in the
+network), ``lr_aspp`` and ``pp_liteseg`` with their default gates, and the
+full detectors, whose box decoding and NMS run on the host: export the
+``*_base`` models and decode in the application.
+
+Fixed batch size
+****************
+
+The accelerator profiles convert with a batch of exactly one
+(``static_batch``): accelerators take one frame at a time, and with a fixed
+batch the converter folds shape arithmetic away. Two visible effects: a
+``Reshape`` no longer leaves ``SHAPE`` / ``PACK`` / ``STRIDED_SLICE``
+operators, and the dilated convolutions of DeepLabV3+ stay single
+convolutions instead of ``SPACE_TO_BATCH_ND`` / ``BATCH_TO_SPACE_ND``
+triples. The ``default`` and ``litert-cpu`` profiles keep a dynamic batch.
 
 Final sigmoid and softmax
 *************************
@@ -521,8 +694,13 @@ Known limitations
 * For accelerator profiles the QAT ranges are discarded at export (see
   above).
 * Post-training quantization of fused MobileOne and RepViT backbones is
-  poor (see the measurements above); equalization does not cover ReLU6
-  networks; there is no bias correction and no per-layer error report yet.
+  poor (see the measurements above), and none of the strategies here fixes
+  it; equalization does not cover ReLU6 networks; bias correction uses
+  float activations only.
+* The lint reports a zero quantization scale as an error and a near-zero
+  one as a warning. Both mean a tensor was constant during calibration (an
+  untrained model, a saturated gate, a dead activation); the LiteRT runtime
+  can abort on the first and has intermittently refused the second.
 * Several architectures use operators outside the published Axis lists
   (sigmoid gates, explicit padding, GELU, squeeze-excite, dilated
   convolutions). The lint reports them; it does not rewrite the model.

@@ -9,7 +9,9 @@ Typical use (also what `quantization_utils.Quantizer` does)::
 
     plain = deploy_utils.strip_qat(deploy_utils.reparameterize_model(model))
     plain = deploy_utils.drop_output_activations(plain)   # optional: no final sigmoid/softmax
+    plain = deploy_utils.fold_batch_norms(plain)      # needed for bias correction
     deploy_utils.equalize_cross_layer(plain)          # for per-tensor targets
+    deploy_utils.correct_bias(plain, calibration_images)   # optional, per-tensor targets
     tflite = deploy_utils.convert_to_tflite(plain, representative_dataset, profile='artpec8')
     report = deploy_utils.lint_tflite(tflite, profile='artpec8')
     print(report)
@@ -82,6 +84,10 @@ class DeploymentProfile:
         ops_source: where `supported_ops` comes from, for the report.
         constraints: names of extra per-operator checks to run (keys of
                      `_CONSTRAINT_CHECKS`).
+        static_batch: if set, the model is converted with this fixed batch
+                      size. Accelerators take one frame at a time and no
+                      dynamic shapes; a fixed batch also lets the converter
+                      fold the shape arithmetic of reshapes away.
         notes: free text shown in the lint report.
     '''
     name: str
@@ -93,6 +99,7 @@ class DeploymentProfile:
     supported_ops: Optional[FrozenSet[str]] = None
     ops_source: str = ''
     constraints: Tuple[str, ...] = ()
+    static_batch: Optional[int] = None
     notes: str = ''
 
 
@@ -109,6 +116,7 @@ PROFILES = {
         name='artpec7',
         description='Axis ARTPEC-7 (Edge TPU): full-integer TFLite, to be compiled with the Edge TPU compiler.',
         integer_only=True,
+        static_batch=1,
         notes='Run `edgetpu_compiler` on the exported file; it reports which operators stay on the CPU.',
     ),
     'artpec8': DeploymentProfile(
@@ -116,6 +124,7 @@ PROFILES = {
         description='Axis ARTPEC-8 DLPU: per-tensor weights, uint8 input/output.',
         per_channel=False,
         integer_only=True,
+        static_batch=1,
         channel_multiple=6,
         supported_ops=_ARTPEC8_OPS,
         ops_source='Axis developer documentation, ARTPEC-8 "Supported Ops", read {} (unverified on device)'.format(_AXIS_DOC_DATE),
@@ -126,6 +135,7 @@ PROFILES = {
         description='Axis ARTPEC-9 DLPU: uint8 input/output; per-channel weights for convolutions.',
         per_channel=True,
         integer_only=True,
+        static_batch=1,
         channel_multiple=16,
         supported_ops=_ARTPEC9_OPS,
         ops_source='Axis developer documentation, ARTPEC-9 "Supported Ops", read {} (unverified on device)'.format(_AXIS_DOC_DATE),
@@ -156,10 +166,12 @@ def _reparam_families():
     from swiss_army_keras._backbone_mobileone import MOBILEONE_CONFIGS, reparameterize_mobileone
     from swiss_army_keras._backbone_repvit import REPVIT_CONFIGS, reparameterize_repvit
     from swiss_army_keras._backbone_fastvit import FASTVIT_CONFIGS, reparameterize_fastvit
+    from swiss_army_keras._backbone_plain import QAREPVGG_CONFIGS, reparameterize_qarepvgg
     return (
         (MOBILEONE_CONFIGS, '_mobileone_config', reparameterize_mobileone),
         (REPVIT_CONFIGS, '_repvit_config', reparameterize_repvit),
         (FASTVIT_CONFIGS, '_fastvit_config', reparameterize_fastvit),
+        (QAREPVGG_CONFIGS, '_qarepvgg_config', reparameterize_qarepvgg),
     )
 
 
@@ -199,7 +211,8 @@ def _fuse_nested_backbone(backbone):
         tap_names = BACKBONE_REGISTRY[key].layers[:len(backbone.outputs)]
         taps = [deploy.get_layer(tap).output for tap in tap_names]
         for old, new in zip(backbone.outputs, taps):
-            if tuple(old.shape) != tuple(new.shape):
+            # compare without the batch dimension: the model may have been built with a fixed batch size
+            if tuple(old.shape[1:]) != tuple(new.shape[1:]):
                 raise RuntimeError(
                     "Reparameterized backbone '{}' changed a feature shape: {} -> {}".format(key, old.shape, new.shape))
         fused = tf.keras.models.Model(inputs=[deploy.input, ], outputs=taps, name=name)
@@ -373,7 +386,11 @@ def strip_qat(model):
     Output
     ----------
         a new float model (weights copied, not shared), or `model` itself if
-        it contains no QAT wrappers. `preprocessing` is carried over.
+        it contains no QAT wrappers. `preprocessing` is carried over. For a
+        model that Keras cannot clone (one with `tf` operations around a
+        QAT sub-model, such as the full detectors or a model wrapped by
+        `uint8_input_wrapper`), the unwrapped layers are shared with
+        `model` instead of copied.
     '''
     if not has_qat_layers(model):
         return model
@@ -392,12 +409,25 @@ def strip_qat(model):
             return strip_qat(layer)
         return layer
 
-    stripped = tf.keras.models.clone_model(model, clone_function=clone_function)
+    try:
+        stripped = tf.keras.models.clone_model(model, clone_function=clone_function)
+    except Exception:
+        # Keras cannot rebuild some graphs from their configuration (`tf`
+        # operations with constant arguments, as in the box decoding of the
+        # detectors and in `uint8_input_wrapper`). Replay the graph instead:
+        # the layers that are not QAT wrappers are then shared with `model`.
+        sources.clear()
+        cache = {}
+
+        def substitute(layer):
+            if id(layer) not in cache:
+                cache[id(layer)] = clone_function(layer)
+            return cache[id(layer)]
+
+        stripped = _replay(model, substitute)
     for plain, wrapper in sources.items():
         _copy_wrapped_weights(wrapper, plain)
-    if hasattr(model, 'preprocessing'):
-        stripped.preprocessing = model.preprocessing
-    return stripped
+    return _carry_attributes(model, stripped)
 
 
 # ========================= #
@@ -405,7 +435,8 @@ def strip_qat(model):
 
 def _carry_attributes(source, target):
     '''Copy the attributes this library attaches to its models.'''
-    for attribute in ('preprocessing', 'head_names', '_sak_reparameterized'):
+    for attribute in ('preprocessing', 'head_names', 'strides', 'reg_max', 'dropped_output_activations',
+                      '_sak_reparameterized'):
         if hasattr(source, attribute):
             setattr(target, attribute, getattr(source, attribute))
     return target
@@ -425,6 +456,8 @@ def _output_activation(layer):
         return ('standalone', symbol) if symbol else (None, None)
     if isinstance(inner, tf.keras.layers.Softmax):
         return 'standalone', 'softmax'
+    if isinstance(inner, tf.keras.layers.UnitNormalization):
+        return 'standalone', 'l2_normalize'
     if isinstance(inner, tf.keras.layers.Activation):
         return 'standalone', getattr(_real_activation(inner.activation), '__name__', None)
     if hasattr(inner, 'activation') and inner.activation is not None:
@@ -439,17 +472,23 @@ def _producer(tensor):
     return layer, inputs
 
 
-def drop_output_activations(model, activations=('sigmoid', 'softmax')):
+def drop_output_activations(model, activations=('sigmoid', 'softmax', 'l2_normalize')):
     '''
-    Return a model whose outputs are taken before their final sigmoid or
-    softmax, for accelerators that do not run those operators.
+    Return a model whose outputs are taken before their final sigmoid,
+    softmax or L2 normalization, for accelerators that do not run those
+    operators.
 
     A final sigmoid or softmax has no weights, so dropping it at export
     needs no retraining: the exported model returns the value that fed the
     activation (the logits) and the application applies the activation
     itself. On a uint8 output that is a 256-entry lookup table for a
     sigmoid. The operator lists that motivate this: `LOGISTIC` is not listed
-    for the Axis ARTPEC-8 DLPU, `SOFTMAX` is not listed for ARTPEC-9.
+    for the Axis ARTPEC-8 DLPU, `SOFTMAX` is not listed for ARTPEC-9, and
+    `L2_NORMALIZATION` (the `UnitNormalization` that ends an embedding
+    head) is listed for neither.
+
+    A reshape or flatten that follows the activation (as in the pose head)
+    is kept: the activation is removed from behind it.
 
     Handled cases, per output: a standalone activation layer (plain or
     QAT-wrapped, or a `tf.sigmoid` call), reached through any identity
@@ -479,11 +518,17 @@ def drop_output_activations(model, activations=('sigmoid', 'softmax')):
         current = tensor
         new_output, name = tensor, None
         label = None
+        reshapes = []
         for _ in range(8):
             layer, inputs = _producer(current)
             kind, activation = _output_activation(layer)
             if len(inputs) != 1:
                 break
+            if isinstance(layer, (tf.keras.layers.Reshape, tf.keras.layers.Flatten)):
+                # a reshape after the activation (the pose head): look behind it
+                reshapes.insert(0, layer)
+                current = inputs[0]
+                continue
             if kind == 'standalone' and activation == 'linear':
                 # an identity layer that names the output (see `multi_task`)
                 label = label or layer.name
@@ -504,6 +549,9 @@ def drop_output_activations(model, activations=('sigmoid', 'softmax')):
                     new_output, name = plain(inputs[0]), activation
                     plain.set_weights(layer.get_weights())
             break
+        if name is not None:
+            for layer in reshapes:
+                new_output = layer(new_output)
         if name is not None and label is not None:
             # keep the name the output had, so that a head is still found by name
             new_output = tf.keras.layers.Activation('linear', name=label)(new_output)
@@ -516,6 +564,136 @@ def drop_output_activations(model, activations=('sigmoid', 'softmax')):
     _carry_attributes(model, result)
     result.dropped_output_activations = dropped
     return result
+
+
+# ========================= #
+# Graph rewrites
+
+def _replay(model, substitute):
+    '''
+    Rebuild a functional model by calling its layers again on new inputs.
+
+    `substitute(layer)` returns the layer to call in place of `layer` (the
+    layer itself to keep it). Layers that are kept are shared with `model`,
+    weights included. Unlike `tf.keras.models.clone_model` this does not go
+    through layer configurations, so it also works on graphs that hold
+    operations Keras cannot rebuild from a configuration (`tf` operations
+    with constant arguments, as the in-graph box decoding of the detectors
+    and `uint8_input_wrapper` have).
+    '''
+    usage = model._tensor_usage_count
+    tensor_dict = {}
+    new_inputs = []
+    for tensor in model.inputs:
+        new = tf.keras.Input(batch_shape=tensor.shape, dtype=tensor.dtype, name=tensor._keras_history.layer.name)
+        new_inputs.append(new)
+        tensor_dict[str(id(tensor))] = [new] * usage[str(id(tensor))]
+
+    for depth in sorted(model._nodes_by_depth, reverse=True):
+        for node in model._nodes_by_depth[depth]:
+            if node.is_input or any(t_id not in tensor_dict for t_id in node.flat_input_ids):
+                continue
+            args, kwargs = node.map_arguments(tensor_dict)
+            outputs = substitute(node.layer)(*args, **kwargs)
+            for t_id, tensor in zip(node.flat_output_ids, tf.nest.flatten(outputs)):
+                tensor_dict[t_id] = [tensor] * usage[t_id]
+
+    new_outputs = [tensor_dict[str(id(tensor))].pop() for tensor in model.outputs]
+    rebuilt = tf.keras.Model(new_inputs if len(new_inputs) > 1 else new_inputs[0],
+                             new_outputs if len(new_outputs) > 1 else new_outputs[0], name=model.name)
+    return _carry_attributes(model, rebuilt)
+
+
+def select_outputs(model, outputs):
+    '''
+    Keep some of a model's outputs, for instance the main output of a
+    network trained with auxiliary heads (`ddrnet`, `pidnet`).
+
+    Input
+    ----------
+        model: a functional `tf.keras.Model`.
+        outputs: an output index or name, or a list of them. Names are
+                 those of `model.output_names`.
+
+    Output
+    ----------
+        A new model sharing the layers of `model`, with only the requested
+        outputs, in the order given. Layers that no kept output depends on
+        (the auxiliary heads) are left out, so they do not reach the
+        exported file.
+    '''
+    wanted = outputs if isinstance(outputs, (list, tuple)) else [outputs]
+    names = list(model.output_names)
+    tensors = []
+    for item in wanted:
+        if isinstance(item, str):
+            if item not in names:
+                raise ValueError("select_outputs: no output named '{}' (outputs: {})".format(item, names))
+            item = names.index(item)
+        if not -len(model.outputs) <= item < len(model.outputs):
+            raise ValueError('select_outputs: output index {} out of range ({} outputs)'.format(item, len(model.outputs)))
+        tensors.append(model.outputs[item])
+    selected = tf.keras.Model(model.inputs, tensors if len(tensors) > 1 else tensors[0], name=model.name)
+    return _carry_attributes(model, selected)
+
+
+def _has_global_average_pooling(model):
+    for layer in model.layers:
+        if isinstance(layer, tf.keras.layers.GlobalAveragePooling2D):
+            return True
+        if isinstance(layer, tf.keras.Model) and _has_global_average_pooling(layer):
+            return True
+    return False
+
+
+def replace_global_pooling(model):
+    '''
+    Replace every `GlobalAveragePooling2D` by an `AveragePooling2D` over the
+    whole feature map, followed by a flatten where the original dropped the
+    spatial axes.
+
+    The two compute the same values. They export differently: global
+    pooling becomes a `MEAN` operator, the windowed form an
+    `AVERAGE_POOL_2D`. `MEAN` is not on the Axis ARTPEC-8 operator list as
+    published, and on ARTPEC-9 it is listed for 7x7 and 8x8 maps only.
+
+    Input
+    ----------
+        model: a functional `tf.keras.Model` without QAT wrappers (pass it
+               through `strip_qat` first). Nested sub-models are rewritten
+               too. Layers that reduce with their own operations (GeM
+               pooling, the attention blocks) are not touched.
+
+    Output
+    ----------
+        A new model sharing every other layer with `model`, or `model`
+        itself when it has no global average pooling.
+    '''
+    if has_qat_layers(model):
+        raise ValueError('replace_global_pooling needs a model without QAT wrappers: call strip_qat first.')
+    if not _has_global_average_pooling(model):
+        return model
+
+    replaced = {}
+
+    def substitute(layer):
+        if id(layer) in replaced:
+            return replaced[id(layer)]
+        new = layer
+        if isinstance(layer, tf.keras.layers.GlobalAveragePooling2D):
+            height, width = int(layer.input_shape[1]), int(layer.input_shape[2])
+            pool = tf.keras.layers.AveragePooling2D(pool_size=(height, width), name=layer.name + '_window')
+            if getattr(layer, 'keepdims', False):
+                new = pool
+            else:
+                new = tf.keras.Sequential([pool, tf.keras.layers.Flatten(name=layer.name + '_flatten')],
+                                          name=layer.name)
+        elif isinstance(layer, tf.keras.Model) and _has_global_average_pooling(layer):
+            new = replace_global_pooling(layer)
+        replaced[id(layer)] = new
+        return new
+
+    return _replay(model, substitute)
 
 
 # ========================= #
@@ -814,8 +992,25 @@ def quantization_error(model, tflite_model, inputs):
 _IO_DTYPES = {'uint8': tf.uint8, 'int8': tf.int8}
 
 
+def _static_batch_converter(model, batch_size):
+    '''A converter for `model` with a fixed batch size, or None if the model
+    cannot be traced that way (duplicate output names).'''
+    names = list(model.output_names)
+    if len(set(names)) != len(names):
+        return None
+    specs = [tf.TensorSpec([batch_size] + list(tensor.shape[1:]), tensor.dtype, name=tensor._keras_history.layer.name)
+             for tensor in model.inputs]
+
+    @tf.function(input_signature=specs)
+    def serving(*args):
+        outputs = model(list(args) if len(args) > 1 else args[0], training=False)
+        return dict(zip(names, tf.nest.flatten(outputs)))
+
+    return tf.lite.TFLiteConverter.from_concrete_functions([serving.get_concrete_function()], model)
+
+
 def convert_to_tflite(model, representative_dataset=None, profile='default', per_channel=None, io_dtype=None,
-                      float16=False):
+                      float16=False, static_batch=None):
     '''
     Convert a Keras model to a TFLite flatbuffer for a deployment profile.
 
@@ -831,6 +1026,8 @@ def convert_to_tflite(model, representative_dataset=None, profile='default', per
                   or 'float32' to keep float input and output).
         float16: if True, ignore the integer settings and produce a float16
                  model (float32 input and output) instead.
+        static_batch: override the profile's fixed batch size (0 keeps the
+                      batch dimension dynamic).
 
     Output
     ----------
@@ -838,12 +1035,24 @@ def convert_to_tflite(model, representative_dataset=None, profile='default', per
         `TFLITE_BUILTINS_INT8` operators only and therefore fails if any
         operator cannot be quantized.
     '''
+    return _configured_converter(model, representative_dataset, profile, per_channel=per_channel,
+                                 io_dtype=io_dtype, float16=float16, static_batch=static_batch).convert()
+
+
+def _configured_converter(model, representative_dataset, profile, per_channel=None, io_dtype=None,
+                          float16=False, static_batch=None):
+    '''The `TFLiteConverter` that `convert_to_tflite` runs, not yet run.'''
     profile = get_profile(profile)
-    converter = tf.lite.TFLiteConverter.from_keras_model(model)
+    static_batch = profile.static_batch if static_batch is None else static_batch
+    converter = None
+    if static_batch and not float16 and any(tensor.shape[0] is None for tensor in model.inputs):
+        converter = _static_batch_converter(model, static_batch)
+    if converter is None:
+        converter = tf.lite.TFLiteConverter.from_keras_model(model)
     converter.optimizations = [tf.lite.Optimize.DEFAULT]
     if float16:
         converter.target_spec.supported_types = [tf.float16]
-        return converter.convert()
+        return converter
 
     if representative_dataset is None:
         raise ValueError('`representative_dataset` is required for full-integer conversion.')
@@ -860,7 +1069,284 @@ def convert_to_tflite(model, representative_dataset=None, profile='default', per
     if not per_channel:
         # The only switch the TFLite converter offers for per-tensor weights.
         converter._experimental_disable_per_channel = True
-    return converter.convert()
+    return converter
+
+
+# ========================= #
+# Post-training quantization strategies
+
+def _nodes(model):
+    '''The nodes of a functional model in execution order, inputs excluded.'''
+    for depth in sorted(model._nodes_by_depth, reverse=True):
+        for node in model._nodes_by_depth[depth]:
+            if not node.is_input:
+                yield node
+
+
+def _is_linear(activation):
+    return activation is None or getattr(activation, '__name__', '') == 'linear'
+
+
+def _foldable_pairs(model):
+    '''`{id(conv): (conv, batch_norm)}` for every convolution of this model
+    whose only consumer is a batch norm, and that is called once.'''
+    usage = model._tensor_usage_count
+    calls = collections.Counter(id(node.layer) for node in _nodes(model))
+    pairs = {}
+    for node in _nodes(model):
+        layer = node.layer
+        if not isinstance(layer, tf.keras.layers.BatchNormalization) or calls[id(layer)] != 1:
+            continue
+        inputs = tf.nest.flatten(node.keras_inputs)
+        if len(inputs) != 1:
+            continue
+        conv = inputs[0]._keras_history.layer
+        if type(conv) not in (tf.keras.layers.Conv2D, tf.keras.layers.DepthwiseConv2D):
+            continue
+        if calls[id(conv)] != 1 or usage.get(str(id(inputs[0])), 0) != 1 or not _is_linear(conv.activation):
+            continue
+        pairs[id(conv)] = (conv, layer)
+    return pairs
+
+
+def _has_batch_norm(model):
+    for layer in model.layers:
+        if isinstance(layer, tf.keras.layers.BatchNormalization):
+            return True
+        if isinstance(layer, tf.keras.Model) and _has_batch_norm(layer):
+            return True
+    return False
+
+
+def fold_batch_norms(model):
+    '''
+    Fold every batch norm that directly follows a convolution into that
+    convolution.
+
+    The TFLite converter does the same before it quantizes weights. Doing it
+    on the Keras model gives the weights that will actually be quantized,
+    which `correct_bias` needs, and lets `equalize_cross_layer` work on
+    them directly.
+
+    Input
+    ----------
+        model: a functional `tf.keras.Model` without QAT wrappers, in
+               inference state. Nested sub-models are folded too.
+
+    Output
+    ----------
+        A new model computing the same function. Folded convolutions are
+        new layers with a bias; the batch norms become identity layers of
+        the same name; every other layer is shared with `model`. Batch
+        norms that do not follow a convolution (pre-activation blocks) are
+        left as they are.
+    '''
+    if has_qat_layers(model):
+        raise ValueError('fold_batch_norms needs a model without QAT wrappers: call strip_qat first.')
+    if not _has_batch_norm(model):
+        return model
+
+    pairs = _foldable_pairs(model)
+    batch_norms = {id(bn) for _, bn in pairs.values()}
+    replaced, pending = {}, []
+
+    def substitute(layer):
+        if id(layer) in replaced:
+            return replaced[id(layer)]
+        new = layer
+        if id(layer) in pairs:
+            conv, bn = pairs[id(layer)]
+            config = conv.get_config()
+            config['use_bias'] = True
+            new = type(conv).from_config(config)
+            pending.append((new,) + tuple(_fused_conv_bn(conv, bn)))
+        elif id(layer) in batch_norms:
+            new = tf.keras.layers.Activation('linear', name=layer.name)
+        elif isinstance(layer, tf.keras.Model) and _has_batch_norm(layer):
+            new = fold_batch_norms(layer)
+        replaced[id(layer)] = new
+        return new
+
+    folded = _replay(model, substitute)
+    for layer, kernel, bias in pending:
+        layer.set_weights([kernel, bias])
+    return folded
+
+
+def _fused_conv_bn(conv, bn):
+    from swiss_army_keras.reparam_utils import fuse_conv_bn_layers
+    return fuse_conv_bn_layers(conv, bn)
+
+
+def _quantized_weights(kernel, per_channel, channel_axis):
+    '''Symmetric 8-bit rounding of a weight tensor, as the TFLite converter
+    applies it: one scale for the tensor, or one per channel.'''
+    if per_channel:
+        axes = tuple(i for i in range(kernel.ndim) if i != channel_axis % kernel.ndim)
+        limit = np.max(np.abs(kernel), axis=axes, keepdims=True)
+    else:
+        limit = np.max(np.abs(kernel))
+    scale = np.where(limit > 0, limit / 127.0, 1.0)
+    return np.clip(np.round(kernel / scale), -127, 127) * scale
+
+
+@dataclass
+class BiasCorrectionResult:
+    '''Outcome of `correct_bias`: `layers` is the number of layers whose
+    bias was changed, `skipped` those left alone (no bias), `max_shift` the
+    largest absolute bias change, and `restore()` puts the biases back.
+    '''
+    layers: int
+    skipped: int
+    max_shift: float
+    _saved: list = field(default_factory=list, repr=False)
+
+    def restore(self):
+        '''Put back the biases the model had before the correction.'''
+        for layer, weights in self._saved:
+            layer.set_weights(weights)
+        self._saved = []
+
+
+def _correct_bias_in(model, inputs, per_channel, saved, counters, batch_size):
+    for node in _nodes(model):
+        layer = node.layer
+        node_inputs = tf.nest.flatten(node.keras_inputs)
+        if isinstance(layer, tf.keras.Model):
+            if len(node_inputs) == len(layer.inputs):
+                feeder = tf.keras.Model(model.inputs, node_inputs if len(node_inputs) > 1 else node_inputs[0])
+                _correct_bias_in(layer, feeder.predict(inputs, batch_size=batch_size, verbose=0),
+                                 per_channel, saved, counters, batch_size)
+            continue
+        if type(layer) not in (tf.keras.layers.Conv2D, tf.keras.layers.DepthwiseConv2D, tf.keras.layers.Dense):
+            continue
+        if not layer.use_bias:
+            counters['skipped'] += 1
+            continue
+        weights = layer.get_weights()
+        kernel = weights[0]
+        if isinstance(layer, tf.keras.layers.DepthwiseConv2D):
+            quantized = _quantized_weights(kernel, per_channel, channel_axis=2)
+        elif isinstance(layer, tf.keras.layers.Dense):
+            quantized = _quantized_weights(kernel, False, channel_axis=-1)
+        else:
+            quantized = _quantized_weights(kernel, per_channel, channel_axis=-1)
+
+        # the mean output of the layer for the weight error alone: conv(x, W_q - W)
+        config = layer.get_config()
+        config.update(use_bias=False, activation='linear', name=layer.name + '_weight_error')
+        probe = type(layer).from_config(config)
+        feeder = tf.keras.Model(model.inputs, node_inputs[0])
+        activations = feeder.predict(inputs, batch_size=batch_size, verbose=0)
+        probe.build(activations.shape)
+        probe.set_weights([quantized - kernel])
+        totals, count = 0.0, 0
+        for start in range(0, len(activations), batch_size):
+            error = probe(activations[start:start + batch_size]).numpy()
+            error = error.reshape(-1, error.shape[-1])
+            totals = totals + error.sum(axis=0)
+            count += error.shape[0]
+        shift = totals / max(count, 1)
+
+        saved.append((layer, weights))
+        layer.set_weights([kernel, weights[1] - shift.astype(weights[1].dtype)] + weights[2:])
+        counters['layers'] += 1
+        counters['max_shift'] = max(counters['max_shift'], float(np.max(np.abs(shift))))
+
+
+def correct_bias(model, inputs, per_channel=False, batch_size=8):
+    '''
+    Bias correction for post-training quantization (Nagel et al., 2019,
+    "Data-Free Quantization Through Weight Equalization and Bias
+    Correction", in its empirical form).
+
+    Rounding weights to 8 bits shifts the mean output of a layer whenever
+    its inputs have a non-zero mean, which is always the case after a ReLU.
+    The shift is `E[conv(x, W_q - W)]` per output channel. This function
+    measures it on calibration data and subtracts it from the bias, so the
+    quantized layer has the same mean output as the float one. It matters
+    most where the weight rounding is coarse: per-tensor quantization.
+
+    Works in place. Run it on a model whose batch norms are folded
+    (`fold_batch_norms`), after `equalize_cross_layer`, with the weight
+    granularity of the target.
+
+    Input
+    ----------
+        model: a functional `tf.keras.Model` without QAT wrappers. Layers
+               without a bias are skipped (fold the batch norms first).
+        inputs: calibration inputs, a float array `(n, H, W, C)` normalized
+                the way the model expects. A few dozen images are enough.
+        per_channel: weight quantization granularity of the target.
+        batch_size: batch size of the forward passes.
+
+    Output
+    ----------
+        A `BiasCorrectionResult`; call its `restore()` to undo the change.
+        The activations are those of the float model, so quantization
+        errors that build up along the network are not compensated.
+    '''
+    if has_qat_layers(model):
+        raise ValueError('correct_bias needs a model without QAT wrappers: call strip_qat first.')
+    inputs = np.asarray(inputs, dtype=np.float32)
+    saved, counters = [], dict(layers=0, skipped=0, max_shift=0.0)
+    _correct_bias_in(model, inputs, per_channel, saved, counters, batch_size)
+    return BiasCorrectionResult(counters['layers'], counters['skipped'], counters['max_shift'], saved)
+
+
+def quantization_debug_report(model, representative_dataset, profile='default', per_channel=None, top=None):
+    '''
+    Rank the tensors of a model by the error that quantization introduces
+    in them, with `tf.lite.experimental.QuantizationDebugger`.
+
+    Each operator of the quantized model is compared with its float
+    counterpart on the calibration data, one operator at a time (the error
+    of the layers before it is not included). The usual reading: sort by
+    `rmse_over_scale`; values near 0.29 (the error of ideal rounding,
+    `1 / sqrt(12)`) are healthy, values far above it point at a layer whose
+    range or weights are a problem.
+
+    Input
+    ----------
+        model: a `tf.keras.Model` (pass a stripped, fused model for an
+               accelerator profile, as for `convert_to_tflite`).
+        representative_dataset: the calibration generator callable.
+        profile: deployment profile; it sets per-channel or per-tensor
+                 weights.
+        per_channel: override the profile's granularity.
+        top: keep only this many entries.
+
+    Output
+    ----------
+        A list of dicts sorted by decreasing `rmse_over_scale`, each with
+        `op_name`, `tensor_name`, `scale`, `rmse`, `rmse_over_scale`,
+        `max_abs_error`, `mean_error` and `num_elements`.
+    '''
+    import csv
+    import io
+
+    converter = _configured_converter(model, representative_dataset, profile, per_channel=per_channel,
+                                      io_dtype='float32', static_batch=0)
+    debugger = tf.lite.experimental.QuantizationDebugger(converter=converter, debug_dataset=representative_dataset)
+    debugger.run()
+    buffer = io.StringIO()
+    debugger.layer_statistics_dump(buffer)
+    rows = []
+    for row in csv.DictReader(io.StringIO(buffer.getvalue())):
+        scale = float(row['scale'])
+        rmse = float(row['mean_squared_error']) ** 0.5
+        rows.append({
+            'op_name': row['op_name'],
+            'tensor_name': row['tensor_name'],
+            'scale': scale,
+            'rmse': rmse,
+            'rmse_over_scale': rmse / scale if scale > 0 else float('inf'),
+            'max_abs_error': float(row['max_abs_error']),
+            'mean_error': float(row['mean_error']),
+            'num_elements': int(float(row['num_elements'])),
+        })
+    rows.sort(key=lambda r: r['rmse_over_scale'], reverse=True)
+    return rows[:top] if top else rows
 
 
 # ========================= #
@@ -1074,6 +1560,30 @@ def lint_tflite(tflite_model, profile='default', per_channel=None, io_dtype=None
             report.errors.append('floating-point operators inside an integer model: ' + ', '.join(
                 '{} x{}'.format(k, v) for k, v in sorted(float_ops.items()))
                 + ' (if the model has QAT wrappers, convert `strip_qat(model)` instead)')
+
+    # degenerate activation ranges
+    produced = set(inputs)
+    for op in ops:
+        produced.update(i for i in op['outputs'] if i >= 0)
+    zero_scale = [tensors[i]['name'] for i in sorted(produced)
+                  if tensors[i]['dtype'] not in _FLOAT_DTYPES
+                  and len(tensors[i]['quantization_parameters']['scales'])
+                  and not np.all(tensors[i]['quantization_parameters']['scales'] > 0)]
+    if zero_scale:
+        report.errors.append(
+            '{} tensor(s) have a zero quantization scale, e.g. {!r}: they were constant during calibration '
+            '(an untrained model, a dead activation, or unrepresentative calibration data). The LiteRT runtime '
+            'can abort when it loads such a file'.format(len(zero_scale), zero_scale[0]))
+    tiny_scale = [tensors[i]['name'] for i in sorted(produced)
+                  if tensors[i]['dtype'] not in _FLOAT_DTYPES
+                  and len(tensors[i]['quantization_parameters']['scales'])
+                  and np.all(tensors[i]['quantization_parameters']['scales'] > 0)
+                  and np.any(tensors[i]['quantization_parameters']['scales'] < 1e-7)]
+    if tiny_scale:
+        report.warnings.append(
+            '{} tensor(s) have a near-zero quantization scale, e.g. {!r}: they were almost constant during '
+            'calibration (a saturated gate or a dead activation, common in untrained models). Some runtimes '
+            'refuse such files'.format(len(tiny_scale), tiny_scale[0]))
 
     # weight quantization granularity
     per_channel_weights = 0

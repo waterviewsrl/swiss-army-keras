@@ -395,30 +395,24 @@ def test_ddrnet_dappm_cascade_channel_count():
     assert out.shape[-1] == 128
 
 
-def test_ddrnet_dappm_matches_pidnet_pappm_channel_contract():
-    """Not a DDRNet regression test - documents a real, deliberately-not-
-    fixed discrepancy found while implementing PIDNet (plan.md §3.4/Phase
-    9): DDRNet's `dappm` appends an extra `BatchNormalization` after each
-    of its 5 branches' 1x1 conv that the verified PyTorch reference (both
-    DDRNet's own and PIDNet's byte-identical `DAPPM` class) does not have -
-    each branch there ends on a bare `Conv2d(bias=False)`. `dappm` is still
-    reused as-is for PIDNet's own `m != 2` ("L") pooling path (out of scope
-    to retroactively "fix" this file's already-shipped, already-tested
-    behavior as a side effect of a different task) - this test only pins
-    down the channel-count contract both `dappm` and the new, more
-    faithful `_pappm` (`_model_pidnet.py`) share, so a future fix to either
-    doesn't silently break the other's call sites.
+def test_dappm_and_pappm_follow_the_reference_layout():
+    """Both pooling modules are pre-activation throughout: every convolution
+    is preceded by its batch norm and followed by nothing. Until 2026-11-10
+    `dappm` carried a batch norm after each of its 11 convolutions, which
+    the DDRNet and PIDNet references do not have.
     """
     from swiss_army_keras._model_ddrnet import dappm
     from swiss_army_keras._model_pidnet import _pappm
 
-    inp1 = tf.keras.Input((16, 16, 256))
-    out1 = dappm(inp1, branch_channels=32, out_channels=128, name='dappm_contract_test')
-    assert out1.shape[-1] == 128
-
-    inp2 = tf.keras.Input((16, 16, 256))
-    out2 = _pappm(inp2, branch_channels=32, out_channels=128, name='pappm_contract_test')
-    assert out2.shape[-1] == 128
+    for fn, name, n_bn in ((dappm, 'dappm_layout', 11), (_pappm, 'pappm_layout', 8)):
+        inp = tf.keras.Input((16, 16, 256))
+        out = fn(inp, branch_channels=32, out_channels=128, name=name)
+        assert out.shape[-1] == 128
+        model = tf.keras.Model(inp, out)
+        batch_norms = [l for l in model.layers if isinstance(l, tf.keras.layers.BatchNormalization)]
+        assert len(batch_norms) == n_bn
+        assert {(l.momentum, l.epsilon) for l in batch_norms} == {(0.9, 1e-5)}
+        assert not any(l.name.endswith('_conv_bn') for l in model.layers)
 
 
 def test_ddrnet_prebn_layers_are_not_quantize_annotated():
@@ -713,3 +707,50 @@ def test_lr_aspp_rejects_a_level_the_backbone_does_not_have():
         lr_aspp(inp, n_labels=N_LABELS, backbone="RepViT-M0.9", weights=None, deep_layer=5)
     with pytest.raises(ValueError, match="shallow_layer"):
         lr_aspp(inp, n_labels=N_LABELS, backbone="MobileNetV2", weights=None, deep_layer=3, shallow_layer=4)
+
+
+# DDRNet and PIDNet against their references, and input sizes
+# (ASSESSMENT.md section 13).
+
+
+def _trainable_parameters(model):
+    from swiss_army_keras import deploy_utils
+    plain = deploy_utils.strip_qat(model)
+    return int(sum(np.prod(w.shape) for w in plain.trainable_weights))
+
+
+def test_pidnet_s_parameter_count_matches_the_official_architecture():
+    """7,625,715 is the count derived by hand from the official source
+    (`XuJiacong/PIDNet`) for PIDNet-S with 19 classes and no auxiliary
+    heads; the paper rounds it to 7.6M.
+    """
+    inp = tf.keras.Input((DDRNET_INPUT_SIZE, DDRNET_INPUT_SIZE, 3))
+    model = pidnet(inp, n_labels=19, m=2, n=3, planes=32, ppm_planes=96, head_planes=128, augment=False)
+    assert _trainable_parameters(model) == 7_625_715
+
+
+def test_ddrnet_23_slim_parameter_count_matches_the_paper():
+    inp = tf.keras.Input((DDRNET_INPUT_SIZE, DDRNET_INPUT_SIZE, 3))
+    model = ddrnet(inp, n_labels=19, augment=False)
+    assert _trainable_parameters(model) == 5_695_987   # the paper and the Hailo zoo list 5.7M
+
+
+@pytest.mark.parametrize("builder", [ddrnet, pidnet], ids=["ddrnet", "pidnet"])
+@pytest.mark.parametrize("size", [(192, 320), (320, 320), (360, 640)], ids=str)
+def test_dual_resolution_networks_accept_any_multiple_of_8(builder, size):
+    """Sizes whose pooled maps do not divide the deepest map used to fail
+    with a shape error inside Keras (320, 448, 640, 720p...).
+    """
+    inp = tf.keras.Input((size[0], size[1], 3))
+    model = builder(inp, n_labels=N_LABELS, augment=True)
+    assert all(tuple(shape[1:3]) == size for shape in model.output_shape)
+
+
+@pytest.mark.parametrize("builder", [ddrnet, pidnet], ids=["ddrnet", "pidnet"])
+def test_dual_resolution_networks_reject_unusable_sizes_clearly(builder):
+    with pytest.raises(ValueError, match="multiples of 8"):
+        builder(tf.keras.Input((100, 100, 3)), n_labels=N_LABELS)
+    with pytest.raises(ValueError, match="static input size"):
+        builder(tf.keras.Input((None, None, 3)), n_labels=N_LABELS)
+    with pytest.raises(ValueError, match="at least 64"):
+        builder(tf.keras.Input((32, 32, 3)), n_labels=N_LABELS)

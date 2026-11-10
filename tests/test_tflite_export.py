@@ -106,6 +106,11 @@ def test_deployment_pipeline_produces_an_integer_only_model(decoder, backbone, p
     """
     from swiss_army_keras import deploy_utils as du
 
+    # Seeded: with some random initializations a sigmoid gate of PP-LiteSeg
+    # saturates, a tensor is then constant during calibration, gets a
+    # near-zero quantization scale, and XNNPACK intermittently refuses the
+    # file (seen in about 1 run in 9 before seeding; the lint now warns).
+    tf.keras.utils.set_random_seed(0)
     inp = tf.keras.Input((INPUT_SIZE, INPUT_SIZE, 3))
     model = decoder(inp, n_labels=N_LABELS, backbone=backbone, weights=None, freeze_backbone=False)
 
@@ -264,3 +269,132 @@ def test_multi_task_exports_one_integer_file_with_named_outputs():
     assert outputs["depth"]["shape"] == (1, INPUT_SIZE, INPUT_SIZE, 1)
     assert outputs["cls"]["shape"] == (1, 4)
     assert sorted(d["position"] for d in outputs.values()) == [0, 1, 2]
+
+
+# --------------------------------------------------------------------------- #
+# Additions of 2026-11-10
+
+def _dataset(n_outputs=1, size=INPUT_SIZE):
+    images = np.random.rand(4, size, size, 3).astype("float32")
+    return tf.data.Dataset.from_tensor_slices((images, np.zeros((4, 1), dtype="float32"))).batch(2), images
+
+
+@pytest.mark.slow
+def test_plain_backbone_with_pyramid_head_is_clean_for_both_axis_profiles(tmp_path):
+    """The first model of the library with nothing outside either published
+    Axis operator list: ResNet-18 with the plain pyramid head.
+    """
+    from swiss_army_keras.models import fpn_seg
+    from swiss_army_keras.quantization_utils import Quantizer
+
+    model = fpn_seg(tf.keras.Input((INPUT_SIZE, INPUT_SIZE, 3)), N_LABELS, backbone="ResNet18", weights=None,
+                    freeze_backbone=False)
+    dataset, images = _dataset()
+    for profile in ("artpec8", "artpec9"):
+        quantizer = Quantizer(dataset, model, str(tmp_path / profile), append_datetime=False, batches=2,
+                              profile=profile)
+        quantizer.quantize()
+        report = quantizer.lint_report
+        assert report.errors == [] and not report.unsupported_ops, str(report)
+        assert set(report.ops) <= {"QUANTIZE", "CONV_2D", "MAX_POOL_2D", "ADD", "RESIZE_BILINEAR"}
+        out = _run_tflite(quantizer.tflite_ui8_model, (images[:1] * 255).astype(np.uint8))
+        assert out.shape == (1, INPUT_SIZE, INPUT_SIZE, N_LABELS)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("name, main_output", [("ddrnet", 0), ("pidnet", 1)])
+def test_dual_resolution_networks_export_their_main_output_only(tmp_path, name, main_output):
+    from swiss_army_keras.models import ddrnet, pidnet
+    from swiss_army_keras.quantization_utils import Quantizer
+
+    builder = {"ddrnet": ddrnet, "pidnet": pidnet}[name]
+    model = builder(tf.keras.Input((INPUT_SIZE, INPUT_SIZE, 3)), n_labels=N_LABELS, augment=True)
+    dataset, images = _dataset()
+    quantizer = Quantizer(dataset, model, str(tmp_path / name), append_datetime=False, batches=2,
+                          profile="artpec9", outputs=main_output)
+    quantizer.quantize()
+
+    from swiss_army_keras import deploy_utils
+    outputs = deploy_utils.tflite_outputs(quantizer.tflite_ui8_model)
+    assert len(outputs) == 1 and outputs[0]["shape"] == (1, INPUT_SIZE, INPUT_SIZE, N_LABELS)
+    assert quantizer.lint_report.errors == [], str(quantizer.lint_report)
+    if name == "ddrnet":
+        assert not quantizer.lint_report.unsupported_ops, str(quantizer.lint_report)   # nothing off the ARTPEC-9 list
+    _run_tflite(quantizer.tflite_ui8_model, (images[:1] * 255).astype(np.uint8))
+
+
+@pytest.mark.slow
+def test_per_tensor_export_folds_equalizes_and_corrects_bias_then_restores(tmp_path):
+    from swiss_army_keras.quantization_utils import Quantizer
+
+    model = lr_aspp(tf.keras.Input((INPUT_SIZE, INPUT_SIZE, 3)), n_labels=N_LABELS, gate=False,
+                    backbone="MobileNetV4-Conv-S", weights=None, freeze_backbone=False)
+    before = [w.copy() for w in model.get_weights()]
+    dataset, _ = _dataset()
+    quantizer = Quantizer(dataset, model, str(tmp_path / "pt"), append_datetime=False, batches=2, profile="artpec8")
+    quantizer.quantize()
+
+    assert quantizer.bias_corrected is not None and quantizer.bias_corrected.layers > 20
+    assert quantizer.equalization is not None and quantizer.equalization.pairs > 10
+    assert not any(isinstance(layer, tf.keras.layers.BatchNormalization) and layer.weights
+                   for layer in quantizer.export_model.layers)
+    assert quantizer.lint_report.errors == [], str(quantizer.lint_report)
+    for old, new in zip(before, model.get_weights()):
+        np.testing.assert_array_equal(old, new)                      # the trained model is untouched
+
+
+@pytest.mark.slow
+def test_fixed_batch_conversion_removes_deeplab_space_to_batch_operators():
+    """With a dynamic batch the converter exports each dilated convolution
+    of the DeepLab pyramid as SPACE_TO_BATCH_ND + convolution +
+    BATCH_TO_SPACE_ND, operators that are on neither Axis list. Converting
+    with the fixed batch of the accelerator profiles keeps them as single
+    convolutions with a dilation factor.
+    """
+    from swiss_army_keras import deploy_utils
+    from swiss_army_keras.models import deeplab_v3_plus
+
+    size = 256      # a deep map large enough for the dilation rates to matter
+    def representative():
+        for _ in range(2):
+            yield [np.random.rand(1, size, size, 3).astype("float32")]
+
+    model = deeplab_v3_plus(tf.keras.Input((size, size, 3)), n_labels=N_LABELS, backbone="MobileNetV2",
+                            weights=None, freeze_backbone=False)
+    plain = deploy_utils.strip_qat(model)
+    fixed = deploy_utils.list_tflite_ops(deploy_utils.convert_to_tflite(plain, representative, profile="artpec9"))
+    dynamic = deploy_utils.list_tflite_ops(
+        deploy_utils.convert_to_tflite(plain, representative, profile="artpec9", static_batch=0))
+    assert {"SPACE_TO_BATCH_ND", "BATCH_TO_SPACE_ND"} <= set(dynamic)
+    assert not {"SPACE_TO_BATCH_ND", "BATCH_TO_SPACE_ND"} & set(fixed)
+
+
+@pytest.mark.slow
+def test_repaired_heads_export_without_their_former_off_list_operators():
+    """FCOS distances without EXP, GFL sides without STRIDED_SLICE, the pose
+    head without shape arithmetic, the embedding head without L2
+    normalization, the classifier without MEAN (CANDIDATES_BY_TASK.md
+    section 2).
+    """
+    from swiss_army_keras import deploy_utils
+    from swiss_army_keras._model_detection import fcos_lite_detection_base, gfl_lite_detection_base
+    from swiss_army_keras.models import classifier, pose_regression_head, reid_embedding_head
+
+    kwargs = dict(backbone="ResNet18", weights=None, freeze_backbone=False)
+
+    def export_ops(model):
+        plain = deploy_utils.strip_qat(model)
+        plain = deploy_utils.replace_global_pooling(deploy_utils.drop_output_activations(plain))
+        return set(deploy_utils.list_tflite_ops(
+            deploy_utils.convert_to_tflite(plain, _ptq_representative, profile="artpec8")))
+
+    def inp():
+        return tf.keras.Input((INPUT_SIZE, INPUT_SIZE, 3))
+
+    assert "EXP" not in export_ops(fcos_lite_detection_base(inp(), n_classes=3, distance_activation="relu", **kwargs))
+    assert "STRIDED_SLICE" not in export_ops(gfl_lite_detection_base(inp(), n_classes=3, flat_reg=True, **kwargs))
+    pose = export_ops(pose_regression_head(inp(), 6, activation="relu", **kwargs))
+    assert not {"SHAPE", "PACK", "STRIDED_SLICE", "LOGISTIC", "MEAN"} & pose
+    reid = export_ops(reid_embedding_head(inp(), pre_pool_attention=None, activation="relu", **kwargs))
+    assert not {"L2_NORMALIZATION", "POW", "MEAN"} & reid
+    assert not {"MEAN", "SOFTMAX", "LOGISTIC"} & export_ops(classifier(inp(), 4, activation="relu", **kwargs))

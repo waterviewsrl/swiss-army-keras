@@ -112,4 +112,4 @@ def test_bad_specifications_are_rejected():
         multi_task(inp, {'seg': dict(type='unet', n_labels=2)}, backbone='MobileNetV2', weights=None)
     with pytest.raises(ValueError, match='feature_level'):
         multi_task(inp, {'q': dict(type='iqa', feature_level=9)}, backbone='MobileNetV2', weights=None)
-    assert set(HEAD_TYPES) == {'lr_aspp', 'lr_aspp_depth', 'fastdepth', 'classifier', 'iqa'}
+    assert set(HEAD_TYPES) == {'lr_aspp', 'fpn_seg', 'density', 'lr_aspp_depth', 'fastdepth', 'classifier', 'iqa'}

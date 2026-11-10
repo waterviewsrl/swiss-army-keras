@@ -753,10 +753,15 @@ class SAM:
             sam.minimize(loss_fn, model.trainable_variables)
     """
 
-    def __init__(self, base_optimizer, rho: FloatTensorLike = 0.05, epsilon: FloatTensorLike = 1e-12):
+    def __init__(self, base_optimizer, rho: FloatTensorLike = 0.05, epsilon: FloatTensorLike = 1e-12,
+                 adaptive: bool = False):
         self.base_optimizer = base_optimizer
         self.rho = rho
         self.epsilon = epsilon
+        # ASAM (Kwon et al., 2021): scale the perturbation by the magnitude
+        # of each weight, which makes the neighbourhood invariant to weight
+        # rescaling. The paper uses a rho about ten times larger (0.5 to 2).
+        self.adaptive = adaptive
         self._e_ws = None  # perturbations applied in `first_step`, undone in `second_step`
 
     def first_step(self, grads, var_list):
@@ -768,9 +773,13 @@ class SAM:
         grads = list(grads)
         var_list = list(var_list)
 
-        grad_norm = tf.sqrt(
-            tf.add_n([tf.reduce_sum(tf.square(g)) for g in grads if g is not None])
-        )
+        if self.adaptive:
+            grads = [None if g is None else tf.square(v) * g for g, v in zip(grads, var_list)]
+            norm_terms = [tf.reduce_sum(tf.square(g / (tf.abs(v) + self.epsilon)))
+                          for g, v in zip(grads, var_list) if g is not None]
+        else:
+            norm_terms = [tf.reduce_sum(tf.square(g)) for g in grads if g is not None]
+        grad_norm = tf.sqrt(tf.add_n(norm_terms))
         scale = self.rho / (grad_norm + self.epsilon)
 
         self._e_ws = []
@@ -833,3 +842,250 @@ class SAM:
     @property
     def iterations(self):
         return self.base_optimizer.iterations
+
+
+# ========================= #
+# Learning-rate schedules
+
+
+@tf.keras.utils.register_keras_serializable(package='swiss_army_keras')
+class WarmupCosine(tf.keras.optimizers.schedules.LearningRateSchedule):
+    """Linear warm-up followed by a cosine decay.
+
+    The rate rises linearly from `warmup_start * peak` to `peak` over
+    `warmup_steps`, then follows half a cosine down to `final * peak` at
+    `total_steps`, and stays there. Steps are optimizer steps (batches).
+
+    Input
+    ----------
+        peak: the highest learning rate.
+        total_steps: length of the schedule, e.g. `epochs * len(train_set)`.
+        warmup_steps: length of the warm-up; an int, or a float below 1 for
+                      a fraction of `total_steps`.
+        warmup_start: starting rate as a fraction of `peak`.
+        final: final rate as a fraction of `peak`.
+    """
+
+    def __init__(self, peak, total_steps, warmup_steps=0.05, warmup_start=0.01, final=0.01, name=None):
+        super().__init__()
+        self.peak = float(peak)
+        self.total_steps = int(total_steps)
+        self.warmup_steps = int(round(warmup_steps * total_steps)) if warmup_steps < 1 else int(warmup_steps)
+        self.warmup_start = float(warmup_start)
+        self.final = float(final)
+        self.name = name
+
+    def __call__(self, step):
+        step = tf.cast(step, tf.float32)
+        warmup = tf.cast(tf.maximum(self.warmup_steps, 1), tf.float32)
+        rising = self.warmup_start + (1.0 - self.warmup_start) * step / warmup
+        span = tf.cast(tf.maximum(self.total_steps - self.warmup_steps, 1), tf.float32)
+        progress = tf.clip_by_value((step - self.warmup_steps) / span, 0.0, 1.0)
+        falling = self.final + (1.0 - self.final) * 0.5 * (1.0 + tf.cos(np.pi * progress))
+        return self.peak * tf.where(step < self.warmup_steps, rising, falling)
+
+    def get_config(self):
+        return dict(peak=self.peak, total_steps=self.total_steps, warmup_steps=self.warmup_steps,
+                    warmup_start=self.warmup_start, final=self.final, name=self.name)
+
+
+@tf.keras.utils.register_keras_serializable(package='swiss_army_keras')
+class OneCycle(tf.keras.optimizers.schedules.LearningRateSchedule):
+    """The one-cycle policy (Smith and Topin, 2019): the rate rises from
+    `peak / div` to `peak` over the first `pct_start` of training, then
+    anneals with a cosine to `peak / (div * final_div)`.
+
+    Input
+    ----------
+        peak: the highest learning rate.
+        total_steps: length of the schedule in optimizer steps.
+        pct_start: fraction of the schedule spent rising (0.3).
+        div: the starting rate is `peak / div` (25).
+        final_div: the final rate is the starting rate divided by this (1e4).
+    """
+
+    def __init__(self, peak, total_steps, pct_start=0.3, div=25.0, final_div=1e4, name=None):
+        super().__init__()
+        self.peak = float(peak)
+        self.total_steps = int(total_steps)
+        self.pct_start = float(pct_start)
+        self.div = float(div)
+        self.final_div = float(final_div)
+        self.name = name
+
+    def __call__(self, step):
+        step = tf.cast(step, tf.float32)
+        start = self.peak / self.div
+        end = start / self.final_div
+        rise_steps = tf.maximum(self.pct_start * self.total_steps, 1.0)
+        fall_steps = tf.maximum(self.total_steps - rise_steps, 1.0)
+
+        def anneal(a, b, fraction):
+            return b + (a - b) * 0.5 * (1.0 + tf.cos(np.pi * tf.clip_by_value(fraction, 0.0, 1.0)))
+
+        rising = anneal(start, self.peak, step / rise_steps)
+        falling = anneal(self.peak, end, (step - rise_steps) / fall_steps)
+        return tf.where(step < rise_steps, rising, falling)
+
+    def get_config(self):
+        return dict(peak=self.peak, total_steps=self.total_steps, pct_start=self.pct_start, div=self.div,
+                    final_div=self.final_div, name=self.name)
+
+
+# ========================= #
+# Weight decay done right, and per-group learning rates
+
+
+def no_decay_variables(model):
+    """The variables that should not be weight-decayed: biases and the
+    scale and shift of normalization layers (every trainable variable with
+    fewer than two dimensions).
+    """
+    return [v for v in model.trainable_variables if len(v.shape) < 2]
+
+
+def adamw(model, learning_rate=1e-3, weight_decay=0.05, **kwargs):
+    """AdamW with decoupled weight decay that skips biases and
+    normalization parameters.
+
+    Input
+    ----------
+        model: the model to be trained (its variables are inspected).
+        learning_rate: a float or a schedule such as `WarmupCosine`.
+        weight_decay: decay factor for kernels.
+        **kwargs: passed to `tf.keras.optimizers.AdamW`.
+
+    Note: variables that become trainable later (a backbone unfrozen in a
+    second phase) are decayed unless the optimizer is built again with this
+    function.
+    """
+    optimizer = tf.keras.optimizers.AdamW(learning_rate=learning_rate, weight_decay=weight_decay, **kwargs)
+    excluded = no_decay_variables(model)
+    if excluded:
+        optimizer.exclude_from_weight_decay(var_list=excluded)
+    return optimizer
+
+
+def sgdw(model, learning_rate=1e-2, momentum=0.9, weight_decay=5e-4, nesterov=True, **kwargs):
+    """SGD with momentum and decoupled weight decay that skips biases and
+    normalization parameters. Arguments as `adamw`.
+    """
+    optimizer = tf.keras.optimizers.SGD(
+        learning_rate=learning_rate, momentum=momentum, nesterov=nesterov, weight_decay=weight_decay, **kwargs)
+    excluded = no_decay_variables(model)
+    if excluded:
+        optimizer.exclude_from_weight_decay(var_list=excluded)
+    return optimizer
+
+
+class MultiOptimizer(tf.keras.optimizers.Optimizer):
+    """Several optimizers, each updating its own group of variables.
+
+    The usual reason is a lower learning rate for a pretrained backbone
+    than for a freshly initialized head; see `differential_learning_rate`
+    for that case.
+
+    Input
+    ----------
+        optimizers_and_selectors: a list of `(optimizer, selector)` pairs.
+            A selector is a callable `variable -> bool`, or `None` for
+            "every variable no earlier pair has taken" (use it last). Each
+            variable goes to the first pair whose selector accepts it.
+        name: optimizer name.
+
+    It can be passed to `model.compile`. `learning_rate` reads and writes
+    the rate of the first optimizer.
+    """
+
+    def __init__(self, optimizers_and_selectors, name='MultiOptimizer', **kwargs):
+        super().__init__(name=name, jit_compile=False, **kwargs)
+        pairs = list(optimizers_and_selectors)
+        if not pairs:
+            raise ValueError('MultiOptimizer needs at least one (optimizer, selector) pair.')
+        self.optimizers = [optimizer for optimizer, _ in pairs]
+        self._selectors = [selector for _, selector in pairs]
+        self._groups = {}
+
+    def _group(self, variable):
+        key = variable.ref()
+        if key not in self._groups:
+            for index, selector in enumerate(self._selectors):
+                if selector is None or selector(variable):
+                    self._groups[key] = index
+                    break
+            else:
+                raise ValueError("MultiOptimizer: no optimizer accepts variable '{}'.".format(variable.name))
+        return self._groups[key]
+
+    def build(self, var_list):
+        var_list = list(var_list)
+        super().build(var_list)
+        self._groups = {}
+        buckets = [[] for _ in self.optimizers]
+        for variable in var_list:
+            buckets[self._group(variable)].append(variable)
+        for optimizer, bucket in zip(self.optimizers, buckets):
+            optimizer._built = False
+            optimizer.build(bucket)
+        self._built = True
+
+    def apply_gradients(self, grads_and_vars, name=None, **kwargs):
+        grads_and_vars = [(g, v) for g, v in grads_and_vars if g is not None]
+        if not getattr(self, '_built', False):
+            self.build([v for _, v in grads_and_vars])
+        buckets = [[] for _ in self.optimizers]
+        for gradient, variable in grads_and_vars:
+            buckets[self._group(variable)].append((gradient, variable))
+        for optimizer, bucket in zip(self.optimizers, buckets):
+            if bucket:
+                optimizer.apply_gradients(bucket)
+        return self.iterations.assign_add(1)
+
+    def update_step(self, gradient, variable):
+        raise NotImplementedError('MultiOptimizer delegates to its optimizers.')
+
+    @property
+    def learning_rate(self):
+        return self.optimizers[0].learning_rate
+
+    @learning_rate.setter
+    def learning_rate(self, value):
+        self.optimizers[0].learning_rate = value
+
+    def get_config(self):
+        raise NotImplementedError('MultiOptimizer holds callables and cannot be serialized; rebuild it in code.')
+
+
+def differential_learning_rate(model, make_optimizer, learning_rate, backbone_factor=0.1):
+    """An optimizer that trains the backbone of `model` with a smaller
+    learning rate than the rest.
+
+    Input
+    ----------
+        model: a model built by this library: its backbone is the nested
+               sub-model whose name ends with `_backbone`.
+        make_optimizer: a callable `learning_rate -> optimizer`, e.g.
+                        `lambda lr: tf.keras.optimizers.AdamW(lr, weight_decay=0.01)`.
+        learning_rate: the rate of the head: a float, or a callable
+                       `factor -> schedule` when a schedule is wanted (it is
+                       called with 1.0 for the head and `backbone_factor`
+                       for the backbone).
+        backbone_factor: the backbone rate is the head rate times this.
+
+    Output
+    ----------
+        A `MultiOptimizer` for `model.compile`. The split is by variable, so
+        it stays right when the backbone is unfrozen later.
+    """
+    backbone_refs = {variable.ref() for layer in model.layers if layer.name.endswith('_backbone')
+                     for variable in layer.variables}
+    if not backbone_refs:
+        raise ValueError("differential_learning_rate: the model has no nested '*_backbone' sub-model.")
+
+    def rate(factor):
+        return learning_rate(factor) if callable(learning_rate) else learning_rate * factor
+
+    return MultiOptimizer([
+        (make_optimizer(rate(backbone_factor)), lambda variable: variable.ref() in backbone_refs),
+        (make_optimizer(rate(1.0)), None),
+    ])

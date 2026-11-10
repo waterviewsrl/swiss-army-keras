@@ -443,3 +443,252 @@ def test_tflite_outputs_maps_file_positions_to_keras_output_names():
     assert by_name["depth"]["shape"] == (1, SIZE // 2, SIZE // 2, 1)
     assert by_name["cls"]["shape"] == (1, 3)
     assert all(d["dtype"] == "uint8" and d["scale"] > 0 for d in described)
+
+
+# --------------------------------------------------------------------------- #
+# Graph rewrites and accelerator conversion details
+
+def test_select_outputs_by_index_and_name_drops_unused_layers():
+    model = _two_output_model()
+    only_depth = du.select_outputs(model, "depth")
+    assert only_depth.output_names == ["depth"]
+    assert not any(layer.name == "cls" for layer in only_depth.layers)
+    assert only_depth.preprocessing == "sentinel"
+
+    swapped = du.select_outputs(model, [1, 0])
+    assert swapped.output_names == ["cls", "depth"]
+    with pytest.raises(ValueError, match="no output named"):
+        du.select_outputs(model, "nope")
+    with pytest.raises(ValueError, match="out of range"):
+        du.select_outputs(model, 5)
+
+
+def _pooled_classifier(keepdims=False):
+    tf.keras.utils.set_random_seed(0)
+    inp = tf.keras.Input((SIZE, SIZE, 3))
+    x = L.Conv2D(8, 3, strides=2, padding="same", activation="relu")(inp)
+    x = L.GlobalAveragePooling2D(keepdims=keepdims, name="gap")(x)
+    if keepdims:
+        x = L.Flatten()(x)
+    return tf.keras.Model(inp, L.Dense(3, name="logits")(x))
+
+
+@pytest.mark.parametrize("keepdims", [False, True])
+def test_replace_global_pooling_keeps_the_function_and_changes_the_operator(keepdims):
+    model = _pooled_classifier(keepdims)
+    rewritten = du.replace_global_pooling(model)
+    assert not any(isinstance(l, L.GlobalAveragePooling2D) for l in rewritten.layers)
+
+    x = np.random.default_rng(0).random((2, SIZE, SIZE, 3), dtype=np.float32)
+    np.testing.assert_allclose(rewritten.predict(x, verbose=0), model.predict(x, verbose=0), atol=1e-6)
+
+    before = du.list_tflite_ops(du.convert_to_tflite(model, _representative, profile="artpec8"))
+    after = du.list_tflite_ops(du.convert_to_tflite(rewritten, _representative, profile="artpec8"))
+    assert "MEAN" in before and "MEAN" not in after and "AVERAGE_POOL_2D" in after
+
+    assert du.replace_global_pooling(_toy_model()) is not None      # nothing to replace: returned as is
+    with pytest.raises(ValueError, match="strip_qat"):
+        du.replace_global_pooling(_toy_qat_model())
+
+
+def test_strip_qat_handles_graphs_keras_cannot_clone():
+    """A QAT sub-model called inside a graph of `tf` operations with
+    constant arguments (what `uint8_input_wrapper` and the detectors build)
+    cannot be cloned from its configuration; `strip_qat` replays it.
+    """
+    qat = _toy_qat_model()
+    inp = tf.keras.Input((SIZE, SIZE, 3))
+    scaled = (inp - np.array([0.5, 0.4, 0.3], dtype="float32")) / np.array([0.2, 0.2, 0.2], dtype="float32")
+    logits = qat(scaled)
+    outer = tf.keras.Model(inp, tf.concat([logits, logits * 2.0], axis=-1))
+
+    stripped = du.strip_qat(outer)
+    assert not du.has_qat_layers(stripped)
+    x = np.random.default_rng(0).random((2, SIZE, SIZE, 3), dtype=np.float32)
+    assert stripped.predict(x, verbose=0).shape == (2, 6)
+    # the stripped model computes what the float graph inside the wrappers computes
+    plain_inner = du.strip_qat(qat)
+    expected = plain_inner.predict((x - [0.5, 0.4, 0.3]) / 0.2, verbose=0)
+    np.testing.assert_allclose(stripped.predict(x, verbose=0)[:, :3], expected, atol=1e-5)
+
+
+def test_drop_output_activations_handles_l2_normalization_and_a_trailing_reshape():
+    tf.keras.utils.set_random_seed(0)
+    inp = tf.keras.Input((SIZE, SIZE, 3))
+    feature = L.GlobalAveragePooling2D()(L.Conv2D(8, 3, activation="relu")(inp))
+    embedding = L.UnitNormalization(name="l2")(L.Dense(4, name="embedding")(feature))
+    keypoints = L.Reshape((2, 3), name="reshape")(L.Dense(6, activation="sigmoid", name="keypoints")(feature))
+    model = tf.keras.Model(inp, [embedding, keypoints])
+
+    dropped = du.drop_output_activations(model)
+    assert dropped.dropped_output_activations == ["l2_normalize", "sigmoid"]
+    assert dropped.output_shape == [(None, 4), (None, 2, 3)]
+
+    x = np.random.default_rng(0).random((2, SIZE, SIZE, 3), dtype=np.float32)
+    raw_embedding, logits = dropped.predict(x, verbose=0)
+    reference_embedding, reference_keypoints = model.predict(x, verbose=0)
+    np.testing.assert_allclose(tf.math.l2_normalize(raw_embedding, axis=-1).numpy(), reference_embedding, atol=1e-6)
+    np.testing.assert_allclose(tf.sigmoid(logits).numpy(), reference_keypoints, atol=1e-6)
+
+
+def test_accelerator_profiles_convert_with_a_fixed_batch_of_one():
+    """A fixed batch lets the converter fold the shape arithmetic of
+    reshapes: no SHAPE / PACK / STRIDED_SLICE operators in the file.
+    """
+    tf.keras.utils.set_random_seed(0)
+    inp = tf.keras.Input((SIZE, SIZE, 3))
+    x = L.GlobalAveragePooling2D()(L.Conv2D(8, 3, activation="relu")(inp))
+    out = L.Reshape((2, 3), name="pairs")(L.Dense(6)(x))
+    model = tf.keras.Model(inp, out)
+
+    dynamic = du.list_tflite_ops(du.convert_to_tflite(model, _representative, profile="default"))
+    fixed_bytes = du.convert_to_tflite(model, _representative, profile="artpec9")
+    fixed = du.list_tflite_ops(fixed_bytes)
+    assert "SHAPE" in dynamic
+    assert not {"SHAPE", "PACK", "STRIDED_SLICE"} & set(fixed)
+    assert du.tflite_outputs(fixed_bytes)[0]["name"] == "pairs"
+    assert du.tflite_outputs(fixed_bytes)[0]["shape"] == (1, 2, 3)
+
+    still_dynamic = du.list_tflite_ops(du.convert_to_tflite(model, _representative, profile="artpec9", static_batch=0))
+    assert "SHAPE" in still_dynamic
+    assert du.get_profile("artpec8").static_batch == 1 and du.get_profile("default").static_batch is None
+
+
+# --------------------------------------------------------------------------- #
+# Post-training quantization strategies: folding, bias correction, error report
+
+def _conv_bn_model():
+    """conv-BN-ReLU twice, a pre-activation BN that cannot be folded, and a
+    nested sub-model with its own conv-BN."""
+    tf.keras.utils.set_random_seed(0)
+    inner_in = tf.keras.Input((SIZE // 2, SIZE // 2, 8))
+    inner = L.BatchNormalization(name="inner_bn")(L.Conv2D(8, 3, padding="same", use_bias=False, name="inner_conv")(inner_in))
+    nested = tf.keras.Model(inner_in, L.ReLU()(inner), name="nested")
+
+    inp = tf.keras.Input((SIZE, SIZE, 3))
+    x = L.Conv2D(8, 3, strides=2, padding="same", use_bias=False, name="c1")(inp)
+    x = L.ReLU()(L.BatchNormalization(name="bn1")(x))
+    x = nested(x)
+    x = L.DepthwiseConv2D(3, padding="same", use_bias=True, name="dw")(x)
+    x = L.ReLU()(L.BatchNormalization(name="bn_dw")(x))
+    x = L.ReLU()(L.BatchNormalization(name="pre_bn")(x))          # follows a ReLU: not foldable
+    model = tf.keras.Model(inp, L.Conv2D(4, 1, name="out")(x))
+    rng = np.random.default_rng(0)
+    for layer in list(model.layers) + list(nested.layers):
+        if isinstance(layer, L.BatchNormalization):
+            shape = layer.get_weights()[0].shape
+            layer.set_weights([rng.uniform(0.5, 1.5, shape), rng.normal(0, 0.3, shape),
+                               rng.normal(0, 0.3, shape), rng.uniform(0.5, 1.5, shape)])
+    return model
+
+
+def test_fold_batch_norms_preserves_the_function_and_leaves_unfoldable_ones():
+    model = _conv_bn_model()
+    folded = du.fold_batch_norms(model)
+
+    x = np.random.default_rng(1).random((2, SIZE, SIZE, 3), dtype=np.float32)
+    np.testing.assert_allclose(folded.predict(x, verbose=0), model.predict(x, verbose=0), rtol=1e-4, atol=1e-5)
+
+    def batch_norms(m):
+        return [l.name for l in m.layers if isinstance(l, L.BatchNormalization)]
+    assert batch_norms(folded) == ["pre_bn"]
+    assert batch_norms(folded.get_layer("nested")) == []
+    assert folded.get_layer("c1").use_bias and folded.get_layer("nested").get_layer("inner_conv").use_bias
+    assert not model.get_layer("c1").use_bias                       # the original is untouched
+    assert du.fold_batch_norms(_toy_model()) is not None
+    with pytest.raises(ValueError, match="strip_qat"):
+        du.fold_batch_norms(_toy_qat_model())
+
+
+def test_correct_bias_restores_the_mean_output_of_each_quantized_layer():
+    """After the correction, a layer with its weights rounded to 8 bits has
+    the same mean output per channel as the float layer, on the
+    calibration data. Checked on the first convolution, per tensor.
+    """
+    from swiss_army_keras.deploy_utils import _quantized_weights
+
+    model = du.fold_batch_norms(_conv_bn_model())
+    calibration = np.random.default_rng(2).random((8, SIZE, SIZE, 3), dtype=np.float32)
+    layer = model.get_layer("c1")
+    kernel, bias = [w.copy() for w in layer.get_weights()]
+    quantized = _quantized_weights(kernel, per_channel=False, channel_axis=-1)
+
+    def mean_output(k, b):
+        out = tf.nn.conv2d(calibration, k, strides=2, padding="SAME") + b
+        return out.numpy().reshape(-1, out.shape[-1]).mean(axis=0)
+
+    assert np.abs(mean_output(quantized, bias) - mean_output(kernel, bias)).max() > 1e-4      # there is a shift
+    result = du.correct_bias(model, calibration, per_channel=False)
+    corrected_bias = layer.get_weights()[1]
+    np.testing.assert_allclose(mean_output(quantized, corrected_bias), mean_output(kernel, bias), atol=1e-5)
+    assert result.layers == 4 and result.skipped == 0 and result.max_shift > 0
+
+    result.restore()
+    np.testing.assert_array_equal(layer.get_weights()[1], bias)
+    # layers without a bias are skipped, not failed
+    unfolded = du.correct_bias(_conv_bn_model(), calibration)
+    assert unfolded.skipped == 2 and unfolded.layers == 2
+    with pytest.raises(ValueError, match="strip_qat"):
+        du.correct_bias(_toy_qat_model(), calibration)
+
+
+def test_quantized_weight_rounding_matches_the_converter_convention():
+    from swiss_army_keras.deploy_utils import _quantized_weights
+
+    kernel = np.random.default_rng(0).normal(size=(3, 3, 4, 6)).astype("float32")
+    kernel[..., 0] *= 20.0                                            # one loud channel
+    per_tensor = _quantized_weights(kernel, False, -1)
+    per_channel = _quantized_weights(kernel, True, -1)
+    step = np.abs(kernel).max() / 127.0
+    np.testing.assert_allclose(per_tensor / step, np.round(per_tensor / step), atol=1e-4)
+    assert np.abs(per_tensor - kernel).max() <= step / 2 + 1e-6
+    # per channel, the quiet channels are rounded much more finely
+    assert np.abs(per_channel[..., 1:] - kernel[..., 1:]).max() < np.abs(per_tensor[..., 1:] - kernel[..., 1:]).max()
+
+
+def test_quantization_debug_report_ranks_tensors_by_relative_error():
+    report = du.quantization_debug_report(_toy_model(), _representative, profile="artpec8")
+    assert len(report) >= 2
+    assert {"op_name", "tensor_name", "scale", "rmse", "rmse_over_scale", "max_abs_error"} <= set(report[0])
+    ratios = [row["rmse_over_scale"] for row in report]
+    assert ratios == sorted(ratios, reverse=True)
+    assert all(row["scale"] > 0 and np.isfinite(row["rmse"]) for row in report)
+    assert len(du.quantization_debug_report(_toy_model(), _representative, top=1)) == 1
+
+
+# --------------------------------------------------------------------------- #
+# QAT switches
+
+def test_builders_can_skip_qat_and_the_switch_is_restored():
+    from swiss_army_keras.layer_utils import qat_enabled, qat_options, set_qat
+
+    assert qat_enabled()
+    with qat_options(enabled=False):
+        assert not qat_enabled()
+        plain = lr_aspp(tf.keras.Input((64, 64, 3)), n_labels=3, backbone="MobileNetV2", weights=None)
+    assert qat_enabled()
+    wrapped = lr_aspp(tf.keras.Input((64, 64, 3)), n_labels=3, backbone="MobileNetV2", weights=None)
+
+    assert not du.has_qat_layers(plain) and du.has_qat_layers(wrapped)
+    assert "lr_aspp_head" in {layer.name for layer in plain.layers}
+    assert "quant_lr_aspp_head" in {layer.name for layer in wrapped.layers}
+    assert plain.output_shape == wrapped.output_shape and callable(plain.preprocessing)
+    assert du.strip_qat(plain) is plain
+
+    previous = set_qat(enabled=False)
+    assert previous == {"enabled": True} and not qat_enabled()
+    set_qat(**previous)
+    assert qat_enabled()
+
+
+def test_quantizer_strategy_defaults_follow_the_profile():
+    from swiss_army_keras.quantization_utils import Quantizer
+
+    def options(profile, **kwargs):
+        q = Quantizer(None, _toy_model(), "unused", append_datetime=False, profile=profile, **kwargs)
+        return q.strip_qat, q.fold_batch_norms, q.equalize, q.bias_correction, q.replace_global_pooling
+
+    assert options("artpec8") == (True, True, True, True, True)
+    assert options("artpec9") == (True, True, False, False, False)
+    assert options("default") == (False, False, False, False, False)
+    assert options("artpec8", bias_correction=False, fold_batch_norms=False)[1::2] == (False, False)

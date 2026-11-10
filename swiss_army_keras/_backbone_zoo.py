@@ -62,6 +62,14 @@ from swiss_army_keras._backbone_strideformer import (
     strideformer_stage_output_names,
 )
 
+from swiss_army_keras._backbone_plain import (
+    CSP_CONFIGS, CSP_M, CSP_N, CSP_S,
+    QAREPVGG_CONFIGS, QARepVGG_A0, QARepVGG_A1, QARepVGG_B0,
+    RESNET_CONFIGS, ResNet18, ResNet34,
+    STDC_CONFIGS, STDC1, STDC2,
+    csp_preprocess_input, csp_stage_output_names, plain_preprocess_input,
+    qarepvgg_stage_output_names, resnet_stage_output_names, stdc_stage_output_names,
+)
 import tensorflow_hub as hub
 
 import warnings
@@ -138,6 +146,14 @@ BACKBONE_REGISTRY: Dict[str, BackboneSpec] = {
         # was built earlier in the process; verified empirically (same layer
         # type/shape at these indices whether built first or 3rd in-process).
         layers=(13, 31, 58, 102, 138),
+        preprocessing=tf.keras.applications.mobilenet_v3.preprocess_input,
+        kwargs={'minimalistic': True},
+    ),
+    'MobileNetV3Small': BackboneSpec(
+        constructor=tf.keras.applications.MobileNetV3Small,
+        # Indices for the same reason as MobileNetV3Large above. The
+        # minimalistic variant has no squeeze-excite and no hard-swish.
+        layers=(4, 13, 31, 75, 102),
         preprocessing=tf.keras.applications.mobilenet_v3.preprocess_input,
         kwargs={'minimalistic': True},
     ),
@@ -298,6 +314,34 @@ del _mobileone_key, _mobileone_ctor
 # assumed. Hybrid-M/L (Mobile-MQA attention variants) are included, per
 # the precedent set by including FastViT's SA/MA attention variants under
 # "all sizes" (plan.md §7).
+# Plain convolutional families for accelerators (`_backbone_plain.py`).
+for _plain_key, _plain_ctor in (('ResNet18', ResNet18), ('ResNet34', ResNet34)):
+    BACKBONE_REGISTRY[_plain_key] = BackboneSpec(
+        constructor=_plain_ctor,
+        layers=resnet_stage_output_names(RESNET_CONFIGS[_plain_key]['model_name'], RESNET_CONFIGS[_plain_key]['blocks']),
+        preprocessing=plain_preprocess_input,
+    )
+for _plain_key, _plain_ctor in (('STDC1', STDC1), ('STDC2', STDC2)):
+    BACKBONE_REGISTRY[_plain_key] = BackboneSpec(
+        constructor=_plain_ctor,
+        layers=stdc_stage_output_names(STDC_CONFIGS[_plain_key]['model_name'], STDC_CONFIGS[_plain_key]['blocks']),
+        preprocessing=plain_preprocess_input,
+    )
+for _plain_key, _plain_ctor in (('QARepVGG-A0', QARepVGG_A0), ('QARepVGG-A1', QARepVGG_A1), ('QARepVGG-B0', QARepVGG_B0)):
+    BACKBONE_REGISTRY[_plain_key] = BackboneSpec(
+        constructor=_plain_ctor,
+        layers=qarepvgg_stage_output_names(
+            QAREPVGG_CONFIGS[_plain_key]['model_name'], QAREPVGG_CONFIGS[_plain_key]['blocks']),
+        preprocessing=plain_preprocess_input,
+    )
+for _plain_key, _plain_ctor in (('CSP-N', CSP_N), ('CSP-S', CSP_S), ('CSP-M', CSP_M)):
+    BACKBONE_REGISTRY[_plain_key] = BackboneSpec(
+        constructor=_plain_ctor,
+        layers=csp_stage_output_names(CSP_CONFIGS[_plain_key]['model_name']),
+        preprocessing=csp_preprocess_input,
+    )
+del _plain_key, _plain_ctor
+
 for _mobilenetv4_key, _mobilenetv4_ctor in [
     ('MobileNetV4-Conv-S', MobileNetV4_ConvS),
     ('MobileNetV4-Conv-M', MobileNetV4_ConvM),

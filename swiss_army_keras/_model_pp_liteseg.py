@@ -300,7 +300,7 @@ def pp_liteseg(input_tensor, n_labels, filter_num_down=[64, 128, 256, 512, 1024]
     m = Model([input_tensor, ], [x, ])
 
     with tfmot.quantization.keras.quantize_scope():
-        m = tfmot.quantization.keras.quantize_apply(m)
+        m = qat_apply(m)
 
     m.preprocessing = preprocessing
 

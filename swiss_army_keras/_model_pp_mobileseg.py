@@ -74,7 +74,7 @@ from tensorflow.keras.utils import register_keras_serializable
 
 import tensorflow_model_optimization as tfmot
 
-from swiss_army_keras.layer_utils import qat_annotate_layer
+from swiss_army_keras.layer_utils import qat_annotate_layer, qat_apply
 from swiss_army_keras._backbone_zoo import backbone_zoo
 
 
@@ -265,7 +265,7 @@ def pp_mobileseg(input_tensor, n_labels, feature_levels=(1, 2, 3), aam_variant='
     m = Model([input_tensor, ], [x, ])
 
     with tfmot.quantization.keras.quantize_scope():
-        m = tfmot.quantization.keras.quantize_apply(m)
+        m = qat_apply(m)
 
     m.preprocessing = backbone_.preprocessing
 

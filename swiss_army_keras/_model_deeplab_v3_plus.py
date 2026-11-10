@@ -285,7 +285,7 @@ def deeplab_v3_plus(input_tensor, n_labels, filter_num_down=[64, 128, 256, 512, 
     m = Model([input_tensor, ], [model_output, ])
 
     with tfmot.quantization.keras.quantize_scope():
-        m = tfmot.quantization.keras.quantize_apply(m)
+        m = qat_apply(m)
 
     m.preprocessing = preprocessing
 
@@ -474,7 +474,7 @@ def deeplab_v3_plus_lite(input_tensor, n_labels, filter_num_down=[64, 128, 256, 
     m = Model([input_tensor, ], [model_output, ])
 
     with tfmot.quantization.keras.quantize_scope():
-        m = tfmot.quantization.keras.quantize_apply(m)
+        m = qat_apply(m)
 
     m.preprocessing = preprocessing
 

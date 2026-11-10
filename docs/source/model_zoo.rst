@@ -21,9 +21,30 @@ time is ``sorted(swiss_army_keras._backbone_zoo.BACKBONE_REGISTRY)``.
      - Pretrained weights
      - Structural reparameterization
    * - MobileNet (Keras)
-     - ``MobileNetV2``, ``MobileNetV3Large`` (minimalistic variant)
+     - ``MobileNetV2``, ``MobileNetV3Large``, ``MobileNetV3Small`` (both V3
+       in the minimalistic variant)
      - 5 (2-32)
      - ``weights='imagenet'``
+     - no
+   * - ResNet, basic blocks
+     - ``ResNet18``, ``ResNet34``
+     - 5 (2-32)
+     - none shipped
+     - no
+   * - STDC
+     - ``STDC1``, ``STDC2``
+     - 5 (2-32)
+     - none shipped
+     - no
+   * - QARepVGG
+     - ``QARepVGG-A0``, ``-A1``, ``-B0``
+     - 5 (2-32)
+     - none shipped
+     - ``reparameterize_qarepvgg``
+   * - CSP, ReLU6
+     - ``CSP-N``, ``CSP-S``, ``CSP-M``
+     - 5 (2-32)
+     - none shipped
      - no
    * - ResNet / ResNetV2
      - ``ResNet50``, ``ResNet101``, ``ResNet152``, ``ResNet50V2``,
@@ -85,6 +106,14 @@ time is ``sorted(swiss_army_keras._backbone_zoo.BACKBONE_REGISTRY)``.
 The VGG taps are taken before each pooling layer, hence the different
 strides.
 
+ResNet-18/34, STDC, QARepVGG and CSP are the plain families for
+accelerators (``swiss_army_keras._backbone_plain``): regular convolutions,
+ReLU or ReLU6, ``'same'`` padding, no squeeze-excite or attention. Their
+exports contain no operator outside the published Axis lists (see
+:doc:`deployment`). The ResNet parameter counts match torchvision; none of
+the four has been compared numerically with its reference, and no
+pretrained weights exist for them here.
+
 .. _pretrained-weights:
 
 Pretrained weights for the custom families
@@ -140,14 +169,36 @@ Semantic segmentation
    * - ``pp_mobileseg``
      - a 3-tap backbone (designed for StrideFormer)
      - AAM fusion; ``feature_levels=(1, 2, 3)``.
+   * - ``fpn_seg``
+     - any registered backbone
+     - Plain pyramid head: 1x1 and 3x3 convolutions, additions and resizes
+       by 2 only. The accelerator-first decoder; also a ``multi_task`` head.
    * - ``ddrnet``
      - own dual-resolution network
      - ``planes=32`` is DDRNet-23-slim, ``64`` is DDRNet-23; with
        ``augment=True`` returns an auxiliary output for deep supervision.
+       Any input size that is a multiple of 8. The cleanest of the
+       stand-alone networks on the Axis lists.
    * - ``pidnet``
      - own three-branch network
      - With ``augment=True`` returns auxiliary and boundary outputs; train
        with ``pidnet_boundary_loss`` / ``pidnet_boundary_attentive_loss``.
+       Any input size that is a multiple of 8. Gated fusion inside: not
+       for accelerators.
+
+DDRNet and PIDNet match their references by structure and parameter count
+(PIDNet-S, M and L exactly; DDRNet-23-slim 5.70M) since 2026-11-10: batch
+norm placement and constants, stem biases. Models saved before that date do
+not load into the new layout. With auxiliary heads, train with one loss per
+output and export the main output only:
+
+.. code-block:: python
+
+   model = pidnet(input_tensor, n_labels=4, augment=True)      # outputs: auxiliary, main, boundary
+   TrainingDriver(model, "pid", optimizer,
+                  loss=[ce, ce, losses.pidnet_boundary_loss], loss_weights=[0.4, 1.0, 20.0],
+                  metrics=[[], [MeanIOU(4)], []], export_outputs=1,
+                  train_set=train_set, val_set=val_set, test_set=test_set, epochs=50).run()
 
 All of them return **raw logits**. The U-Net family inherited from
 keras-unet-collection (``unet_2d``, ``vnet_2d``, ``unet_plus_2d``,
@@ -209,13 +260,24 @@ Classification, regression and embeddings
      - ``n_keypoints`` (x, y) coordinates in [0, 1], single subject.
    * - ``reid_embedding_head``
      - L2-normalized embedding for re-identification / metric learning.
+   * - ``simcc_head``
+     - Keypoints by coordinate classification (SimCC, as in RTMPose): two
+       1-D logit vectors per keypoint, decoded by ``simcc_decode``; train
+       with ``losses.simcc_loss`` on targets from ``simcc_encode``.
+   * - ``reid_training_model``
+     - Wraps an embedding model for training with an identity classifier
+       (cosine outputs, optional batch-norm neck) next to the metric loss.
+   * - ``density_head``
+     - Counting by density map: a non-negative map whose sum is the count.
    * - ``lr_aspp_depth``, ``fastdepth_head``
      - Dense monocular depth map (sigmoid-bounded or linear). Both adapt to
        backbones with five, four or three feature levels.
    * - ``multi_task``
      - Several heads on one shared backbone, one named output per head.
-       Head types: ``lr_aspp``, ``lr_aspp_depth``, ``fastdepth``,
-       ``classifier``, ``iqa``, or a callable.
+       Head types: ``lr_aspp``, ``fpn_seg``, ``density``, ``lr_aspp_depth``,
+       ``fastdepth``, ``classifier``, ``iqa``, or a callable.
+       ``uncertainty_weighted(model)`` balances the task losses with
+       learned weights.
 
 The classifier heads accept ``pre_pool_attention='gem' | 'eca' | 'coordatt'``
 and ``pooling='avg' | 'max'``.
@@ -244,7 +306,14 @@ Losses
      - ``iou_box`` (GIoU / DIoU / CIoU / SIoU modes), ``quality_focal_loss``,
        ``distribution_focal_loss``, ``varifocal_loss``, ``yolact_mask_loss``
    * - Depth
-     - ``scale_invariant_log_loss``, ``berhu_loss``
+     - ``scale_invariant_log_loss``, ``berhu_loss``; for relative depth
+       (teacher pseudo-labels): ``scale_shift_invariant_loss``,
+       ``gradient_matching_loss``, ``midas_loss``
+   * - Classification and embeddings
+     - ``logit_adjusted_crossentropy`` (long tails), ``arcface_loss``,
+       ``cosface_loss`` (margins on cosine outputs)
+   * - Keypoints and counting
+     - ``simcc_loss``, ``density_count_loss`` (with ``points_to_density``)
    * - Other
      - ``triplet_1d``, ``crps2d_tf``
    * - Wrappers
@@ -259,11 +328,42 @@ Optimizers and metrics
 * ``swiss_army_keras.optimizers``: ``Yogi``, ``RectifiedAdam2``,
   ``AdaBeliefOptimizer``, ``Lion``, ``AdaHessian`` (custom ``minimize``, not a
   drop-in for ``model.fit``) and the ``SAM`` sharpness-aware wrapper around
-  any base optimizer.
+  any base optimizer (``adaptive=True`` for ASAM).
+* Schedules: ``WarmupCosine`` and ``OneCycle``.
+* Weight decay: ``adamw(model, ...)`` and ``sgdw(model, ...)`` leave biases
+  and normalization parameters undecayed.
+* Per-group learning rates: ``differential_learning_rate(model, ...)``
+  trains the backbone with a fraction of the head's rate (a
+  ``MultiOptimizer``).
 * ``swiss_army_keras.metrics``: ``MeanIOU`` (one-hot aware),
   ``BoundaryFScore``, ``MeanAveragePrecision``, and for depth
   ``DepthAbsRel``, ``DepthRMSE`` and ``DepthDeltaAccuracy`` (pixels with a
   target of 0 are left out; ``align='median'`` for depth known up to scale).
+
+Training strategies
+*******************
+
+.. list-table::
+   :header-rows: 1
+   :widths: 40 60
+
+   * - Tool
+     - Purpose
+   * - ``training_utils.WeightAveraging``
+     - Callback keeping an exponential moving average (or SWA mean) of the
+       weights; validation, checkpoints and the final model use the
+       average.
+   * - ``training_utils.recalibrate_batch_norm``
+     - Recomputes batch-norm statistics without training (after SWA).
+   * - ``training_utils.sharpness_aware``
+     - Wraps a model so that ``fit`` trains it with SAM or ASAM.
+   * - ``distillation_utils.Distiller``
+     - Student and frozen teacher; logit, channel-wise or MSE distillation
+       next to the task loss.
+   * - ``models.uncertainty_weighted``
+     - Learned balancing of the losses of a multi-output model.
+   * - ``layer_utils.set_qat`` / ``qat_options``
+     - Build models with or without QAT wrappers.
 
 Data loaders
 ************
@@ -306,9 +406,11 @@ Auxiliary utilities
    * - ``deploy_utils``
      - Deployment profiles, ``reparameterize_model`` (fuses the
        training-time branches of a MobileOne / FastViT / RepViT backbone
-       inside any model), ``strip_qat``, ``drop_output_activations``,
-       ``equalize_cross_layer``, ``convert_to_tflite``, ``lint_tflite``,
-       ``tflite_outputs`` and ``quantization_error`` (see
+       inside any model), ``strip_qat``, ``select_outputs``,
+       ``drop_output_activations``, ``replace_global_pooling``,
+       ``fold_batch_norms``, ``equalize_cross_layer``, ``correct_bias``,
+       ``convert_to_tflite``, ``lint_tflite``, ``tflite_outputs``,
+       ``quantization_error`` and ``quantization_debug_report`` (see
        :doc:`deployment`).
    * - ``reparam_utils`` and ``reparameterize_*``
      - The per-family fusion functions and kernel arithmetic that

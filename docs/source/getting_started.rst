@@ -204,12 +204,42 @@ image, so a dataset with one target per head has to be assembled by the
 caller, and ``TrainingDriver`` assumes a single output. See
 :doc:`model_zoo` for the head types.
 
+Training strategies
+*******************
+
+Schedules, weight averaging and a lower learning rate for the backbone are
+separate pieces that combine with ``model.fit`` or ``TrainingDriver``:
+
+.. code-block:: python
+
+   from swiss_army_keras.optimizers import WarmupCosine, differential_learning_rate
+   from swiss_army_keras.training_utils import WeightAveraging
+
+   steps = epochs * len(train_set)
+   optimizer = differential_learning_rate(
+       model,
+       lambda rate: tf.keras.optimizers.AdamW(rate, weight_decay=0.01),
+       learning_rate=lambda factor: WarmupCosine(1e-3 * factor, total_steps=steps),
+       backbone_factor=0.1,                       # the backbone trains ten times slower
+   )
+   callbacks = [WeightAveraging(mode="ema", decay=0.999)]   # averaged weights for validation and export
+
+``sharpness_aware(model)`` gives SAM or ASAM inside ``fit``,
+``Distiller(student, teacher)`` adds a teacher, and
+``uncertainty_weighted(model)`` balances the losses of a ``multi_task``
+model. See :doc:`model_zoo`.
+
 Things to know
 **************
 
 * **Fixed input size.** Builders compute upsampling factors from static
   shapes; pass an ``Input`` with a concrete height and width, both multiples
-  of 32. PP-LiteSeg needs at least 128 x 128.
+  of 32. PP-LiteSeg needs at least 128 x 128. DDRNet and PIDNet accept any
+  multiple of 8 from 64 up, including 720p and 1080p frames.
+* **Targeting an accelerator.** Start from a plain backbone (``ResNet18``,
+  ``STDC1``, ``CSP-S``, ``QARepVGG-A0``) and the ``fpn_seg`` head, or
+  ``ddrnet``; see :doc:`deployment` for the combinations that export with
+  nothing outside the Axis operator lists.
 * **Square inputs with the data loaders.** The loaders do not treat ``width``
   and ``height`` consistently; use equal values.
 * **Feature-pyramid depth differs by backbone.** Most backbones expose five

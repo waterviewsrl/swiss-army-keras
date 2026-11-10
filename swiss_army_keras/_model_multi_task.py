@@ -12,6 +12,11 @@ Available head types (the `type` entry of a head specification):
 * `'lr_aspp'`: LR-ASPP segmentation decoder (`lr_aspp_head`). Options:
   `n_labels` (required), `gate`, `num_filters`, `num_filters_shallow`,
   `deep_layer`, `shallow_layer`.
+* `'fpn_seg'`: plain pyramid head, convolutions and 2x resizes only
+  (`fpn_head`). Options: `n_labels` (required), `levels`, `num_filters`,
+  `output_activation`.
+* `'density'`: the same head with one non-negative channel, for counting
+  by density map. Options: `levels`, `num_filters`.
 * `'lr_aspp_depth'`: LR-ASPP decoder with one output channel. Options:
   `output_mode`, and those of `'lr_aspp'`.
 * `'fastdepth'`: FastDepth decoder (`fastdepth_decoder`). Options:
@@ -34,10 +39,12 @@ from swiss_army_keras._backbone_zoo import backbone_zoo, backbone_num_levels
 from swiss_army_keras._model_lr_aspp import lr_aspp_head
 from swiss_army_keras._model_depth import fastdepth_decoder, _valid_output_mode
 from swiss_army_keras._model_classifier import classification_head
+from swiss_army_keras._model_fpn_seg import fpn_head
 
 from tensorflow.keras.layers import Activation
 from tensorflow.keras.models import Model
 
+import tensorflow as tf
 import tensorflow_model_optimization as tfmot
 
 
@@ -64,6 +71,14 @@ def _lr_aspp_depth(features, input_tensor, name, output_mode='sigmoid', **option
     return depth
 
 
+def _fpn_seg(features, input_tensor, name, n_labels, **options):
+    return fpn_head(features, input_tensor, n_labels, name=name, **options)
+
+
+def _density(features, input_tensor, name, **options):
+    return fpn_head(features, input_tensor, 1, output_activation='relu', name=name, **options)
+
+
 def _fastdepth(features, input_tensor, name, **options):
     return fastdepth_decoder(features, input_tensor, name=name, **options)
 
@@ -80,6 +95,8 @@ def _iqa(features, input_tensor, name, feature_level=None, **options):
 
 HEAD_TYPES = {
     'lr_aspp': _lr_aspp_segmentation,
+    'fpn_seg': _fpn_seg,
+    'density': _density,
     'lr_aspp_depth': _lr_aspp_depth,
     'fastdepth': _fastdepth,
     'classifier': _classifier,
@@ -171,9 +188,84 @@ def multi_task(input_tensor, heads, backbone='MobileNetV4-Conv-S', weights='imag
     m = Model([input_tensor, ], outputs, name=name)
 
     with tfmot.quantization.keras.quantize_scope():
-        m = tfmot.quantization.keras.quantize_apply(m)
+        m = qat_apply(m)
 
     m.preprocessing = backbone_.preprocessing
     m.head_names = list(heads)
 
     return m
+
+
+class UncertaintyWeighted(tf.keras.Model):
+    '''A multi-output model whose task losses are balanced by learned
+    weights (Kendall, Gal and Cipolla, 2018, "Multi-Task Learning Using
+    Uncertainty to Weigh Losses for Scene Geometry and Semantics").
+
+    The training loss is `sum_i exp(-s_i) * L_i + s_i`, with one trainable
+    scalar `s_i` per output, initialized to 0 (every weight 1). A task whose
+    loss stays large gets a smaller weight, and the `+ s_i` term stops the
+    weights from collapsing to zero. This replaces hand-tuned
+    `loss_weights`.
+
+    Build it with `uncertainty_weighted(model)`, then compile and fit as
+    usual, giving one loss per output and no `loss_weights`. The logged
+    `loss` is the plain sum of the task losses; `weighted_loss` is what is
+    minimized, and `task_weights()` returns the current `exp(-s_i)`.
+    '''
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.log_variances = tf.Variable(
+            tf.zeros((len(self.outputs),), dtype=tf.float32), trainable=True, name='task_log_variances')
+        self._weighted_loss_tracker = tf.keras.metrics.Mean(name='weighted_loss')
+
+    def task_weights(self):
+        '''Current weight of each task loss, by output name.'''
+        return dict(zip(self.output_names, tf.exp(-self.log_variances).numpy().tolist()))
+
+    def compute_loss(self, x=None, y=None, y_pred=None, sample_weight=None):
+        # the compiled container keeps the usual per-task and total metrics
+        super().compute_loss(x, y, y_pred, sample_weight)
+
+        losses = self.compiled_loss._losses
+        predictions = tf.nest.flatten(y_pred)
+        targets = tf.nest.flatten(self.compiled_loss._conform_to_outputs(y_pred, y))
+        total = 0.0
+        for index, (loss_fn, target, prediction) in enumerate(zip(tf.nest.flatten(losses), targets, predictions)):
+            if loss_fn is None:
+                continue
+            value = tf.cast(loss_fn(target, prediction), tf.float32)
+            total += tf.exp(-self.log_variances[index]) * value + self.log_variances[index]
+        if self.losses:
+            total += tf.add_n([tf.cast(l, tf.float32) for l in self.losses])
+        self._weighted_loss_tracker.update_state(total)
+        return total
+
+    @property
+    def metrics(self):
+        return super().metrics + [self._weighted_loss_tracker]
+
+
+def uncertainty_weighted(model):
+    '''Wrap a multi-output model so that its task losses are balanced by
+    learned weights; see `UncertaintyWeighted`.
+
+    Input
+    ----------
+        model: a functional model with several outputs, e.g. from
+               `multi_task`.
+
+    Output
+    ----------
+        An `UncertaintyWeighted` model sharing the layers of `model` (train
+        it, then export `model`, which holds the same weights and none of
+        the balancing scalars). `.preprocessing` and `.head_names` are
+        carried over.
+    '''
+    if len(model.outputs) < 2:
+        raise ValueError('uncertainty_weighted needs a model with at least two outputs.')
+    wrapped = UncertaintyWeighted(inputs=model.inputs, outputs=model.outputs, name=model.name + '_uw')
+    for attribute in ('preprocessing', 'head_names'):
+        if hasattr(model, attribute):
+            setattr(wrapped, attribute, getattr(model, attribute))
+    return wrapped

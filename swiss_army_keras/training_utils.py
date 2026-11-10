@@ -202,8 +202,23 @@ class TrainingDriver():
               target the TFLite files are exported and checked for, e.g.
               `export_profile='artpec8'`. After `run()`, the `Quantizer`
               is available as `self.quantizer` (with its `lint_report`).
+        loss_weights: passed to `model.compile`. With a model that has
+              several outputs, give `loss`, `metrics` and `loss_weights`
+              as lists (one entry per output) or as dictionaries keyed by
+              output name. The data loaders yield one target per image,
+              which Keras hands to every output. Example for
+              `pidnet(augment=True)`, whose outputs are the auxiliary
+              logits, the main logits and the boundary logit::
+
+                  loss=[ce, ce, pidnet_boundary_loss], loss_weights=[0.4, 1.0, 20.0],
+                  metrics=[[], [MeanIOU(n_classes)], []], export_outputs=1
+
+        export_outputs: which outputs of the model go into the exported
+              files (`Quantizer(outputs=...)`); None exports all of them.
+        export_options: a dict of further `Quantizer` arguments, e.g.
+              `dict(bias_correction=False, strict=True)`.
     '''
-    def __init__(self, model, model_name, optimizer, loss, metrics, train_set, val_set, test_set, epochs, patience=20, unfreezed_epochs=-1, callbacks=(), quant_batches=1, plot_metrics=True, metrics_name=None, checkpoint_name=None, quantizer_name=None, export_profile='default', reparameterize=True, strip_qat=None, equalize=None, drop_output_activations=False):
+    def __init__(self, model, model_name, optimizer, loss, metrics, train_set, val_set, test_set, epochs, patience=20, unfreezed_epochs=-1, callbacks=(), quant_batches=1, plot_metrics=True, metrics_name=None, checkpoint_name=None, quantizer_name=None, export_profile='default', reparameterize=True, strip_qat=None, equalize=None, drop_output_activations=False, loss_weights=None, export_outputs=None, export_options=None):
         self.model = model
         self.model_name = model_name
         self.optimizer = optimizer
@@ -220,6 +235,9 @@ class TrainingDriver():
         self.strip_qat = strip_qat
         self.equalize = equalize
         self.drop_output_activations = drop_output_activations
+        self.loss_weights = loss_weights
+        self.export_outputs = export_outputs
+        self.export_options = dict(export_options or {})
         self.plot_metrics = plot_metrics
 
         self.patience = patience
@@ -269,6 +287,7 @@ class TrainingDriver():
         is available afterwards as `self.model`.
         '''
         self.model.compile(loss=self.loss,
+                           loss_weights=self.loss_weights,
                            optimizer=self.optimizer,
                            metrics=self.metrics)
 
@@ -328,6 +347,7 @@ class TrainingDriver():
             self.optimizer.build(self.model.trainable_variables)
 
             self.model.compile(loss=self.loss,
+                               loss_weights=self.loss_weights,
                                optimizer=self.optimizer,
                                metrics=self.metrics)
 
@@ -374,7 +394,258 @@ class TrainingDriver():
                       reparameterize=self.reparameterize,
                       strip_qat=self.strip_qat,
                       equalize=self.equalize,
-                      drop_output_activations=self.drop_output_activations)
+                      drop_output_activations=self.drop_output_activations,
+                      outputs=self.export_outputs,
+                      **self.export_options)
 
         q.quantize()
         self.quantizer = q
+
+
+# ========================= #
+# Training strategies
+
+
+class WeightAveraging(tf.keras.callbacks.Callback):
+    '''Keep an average of the model weights during training and use it for
+    validation, for checkpoints and for the final model.
+
+    Averaged weights are more stable than the last iterate on small or
+    noisy datasets, and flatter solutions tolerate quantization better.
+
+    * `mode='ema'`: exponential moving average, updated every
+      `update_every` batches: `average = decay * average + (1 - decay) *
+      weights`. Batch-norm statistics are averaged with everything else, so
+      nothing needs to be recomputed.
+    * `mode='swa'`: stochastic weight averaging (Izmailov et al., 2018): the
+      plain mean of the weights at the end of each epoch from `start_epoch`
+      on. Batch-norm statistics of an average of models are not the average
+      of their statistics: call `recalibrate_batch_norm` after training.
+
+    How it interacts with `fit`: the averaged weights are swapped in when
+    validation starts and swapped out again at the first batch of the next
+    epoch. Callbacks that run at the end of an epoch (model checkpoints,
+    early stopping on a validation metric) therefore see the averaged
+    model. When training ends the averaged weights stay in the model, so an
+    export that follows uses them.
+
+    Input
+    ----------
+        mode: `'ema'` or `'swa'`.
+        decay: EMA decay (0.999 suits a few thousand steps; use a smaller
+               value for short runs).
+        update_every: EMA update period, in batches.
+        start_epoch: first epoch (0-based) whose weights enter the average.
+        warmup: with EMA, use `min(decay, (1 + n) / (10 + n))` for the n-th
+                update, so that the average is not dominated by the
+                initial weights.
+    '''
+
+    def __init__(self, mode='ema', decay=0.999, update_every=1, start_epoch=0, warmup=True):
+        super().__init__()
+        if mode not in ('ema', 'swa'):
+            raise ValueError(f"Unknown mode '{mode}' - expected 'ema' or 'swa'.")
+        self.mode = mode
+        self.decay = decay
+        self.update_every = update_every
+        self.start_epoch = start_epoch
+        self.warmup = warmup
+        self._average = None
+        self._backup = None
+        self._updates = 0
+        self._epoch = 0
+
+    # -- bookkeeping
+    def _variables(self):
+        return [v for v in self.model.weights if v.dtype.is_floating]
+
+    def _reset(self):
+        self._average = [tf.Variable(v, trainable=False) for v in self._variables()]
+        self._updates = 0
+
+    def _accumulate(self):
+        variables = self._variables()
+        if self._average is None or len(self._average) != len(variables):
+            self._reset()
+            return
+        self._updates += 1
+        if self.mode == 'ema':
+            decay = min(self.decay, (1.0 + self._updates) / (10.0 + self._updates)) if self.warmup else self.decay
+        else:
+            decay = self._updates / (self._updates + 1.0)        # running mean
+        for average, variable in zip(self._average, variables):
+            average.assign(decay * average + (1.0 - decay) * variable)
+
+    def _swap_in(self):
+        if self._average is None or self._backup is not None:
+            return
+        variables = self._variables()
+        self._backup = [v.numpy() for v in variables]
+        for variable, average in zip(variables, self._average):
+            variable.assign(average)
+
+    def _swap_out(self):
+        if self._backup is None:
+            return
+        for variable, value in zip(self._variables(), self._backup):
+            variable.assign(value)
+        self._backup = None
+
+    # -- callback hooks
+    def on_train_begin(self, logs=None):
+        self._backup = None
+        self._epoch_done = False
+        if self._average is not None and len(self._average) != len(self._variables()):
+            self._average = None
+
+    def on_epoch_begin(self, epoch, logs=None):
+        self._epoch = epoch
+        self._epoch_done = False
+
+    def on_train_batch_begin(self, batch, logs=None):
+        self._swap_out()
+
+    def on_train_batch_end(self, batch, logs=None):
+        if self.mode == 'ema' and self._epoch >= self.start_epoch and (batch + 1) % self.update_every == 0:
+            self._accumulate()
+
+    def _close_epoch(self):
+        # runs once per epoch, on raw weights: before validation if there is one, else at the end
+        if not self._epoch_done and self.mode == 'swa' and self._epoch >= self.start_epoch \
+                and self._backup is None:
+            self._accumulate()
+        self._epoch_done = True
+        self._swap_in()
+
+    def on_test_begin(self, logs=None):
+        self._close_epoch()
+
+    def on_epoch_end(self, epoch, logs=None):
+        self._close_epoch()
+
+    def on_train_end(self, logs=None):
+        self._swap_in()
+        self._backup = None                 # the averaged weights are final
+
+
+def recalibrate_batch_norm(model, dataset, steps=50):
+    '''Recompute the batch-norm statistics of `model` on `dataset`.
+
+    Needed after `WeightAveraging(mode='swa')`, and useful after any
+    operation that changes weights without training (weight averaging,
+    pruning). The moving statistics are reset and then estimated as the
+    plain average over `steps` batches; no weight is trained.
+
+    Input
+    ----------
+        model: a `tf.keras.Model`.
+        dataset: yields batches of inputs, or `(inputs, ...)` tuples.
+        steps: number of batches to use.
+
+    Output
+    ----------
+        The number of batch-norm layers that were recalibrated.
+    '''
+    def batch_norms(m):
+        found = []
+        for layer in m.layers:
+            inner = getattr(layer, 'layer', layer)
+            if isinstance(inner, tf.keras.layers.BatchNormalization):
+                found.append(inner)
+            elif isinstance(layer, tf.keras.Model):
+                found.extend(batch_norms(layer))
+        return found
+
+    layers = batch_norms(model)
+    if not layers:
+        return 0
+    saved = [(layer.momentum, layer.trainable) for layer in layers]
+    for layer in layers:
+        layer.moving_mean.assign(tf.zeros_like(layer.moving_mean))
+        layer.moving_variance.assign(tf.ones_like(layer.moving_variance))
+    try:
+        for step, batch in enumerate(dataset):
+            if step >= steps:
+                break
+            inputs = batch[0] if isinstance(batch, (tuple, list)) else batch
+            for layer in layers:
+                # momentum k/(k+1) turns the moving average into a running mean
+                layer.momentum = step / (step + 1.0)
+            model(inputs, training=True)
+    finally:
+        for layer, (momentum, trainable) in zip(layers, saved):
+            layer.momentum = momentum
+            layer.trainable = trainable
+    return len(layers)
+
+
+class SharpnessAwareModel(tf.keras.Model):
+    '''A model trained with sharpness-aware minimization inside `fit`.
+
+    Each step computes the gradient, moves the weights to the worst point
+    of a small neighbourhood, computes the gradient there, moves back and
+    applies that second gradient with the compiled optimizer (Foret et al.,
+    2021). `adaptive=True` gives ASAM (Kwon et al., 2021), whose
+    neighbourhood scales with each weight. A step costs two forward and
+    backward passes.
+
+    Build it with `sharpness_aware(model)`. `optimizers.SAM` remains
+    available for custom training loops.
+    '''
+
+    def __init__(self, *args, rho=0.05, adaptive=False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.rho = rho
+        self.adaptive = adaptive
+
+    def train_step(self, data):
+        x, y, sample_weight = tf.keras.utils.unpack_x_y_sample_weight(data)
+        variables = self.trainable_variables
+
+        with tf.GradientTape() as tape:
+            loss = self.compute_loss(x, y, self(x, training=True), sample_weight)
+        gradients = tape.gradient(loss, variables)
+        if self.adaptive:
+            gradients = [None if g is None else tf.square(v) * g for g, v in zip(gradients, variables)]
+            terms = [tf.reduce_sum(tf.square(g / (tf.abs(v) + 1e-12))) for g, v in zip(gradients, variables)
+                     if g is not None]
+        else:
+            terms = [tf.reduce_sum(tf.square(g)) for g in gradients if g is not None]
+        scale = self.rho / (tf.sqrt(tf.add_n(terms)) + 1e-12)
+        perturbations = [None if g is None else g * scale for g in gradients]
+        for variable, perturbation in zip(variables, perturbations):
+            if perturbation is not None:
+                variable.assign_add(perturbation)
+
+        with tf.GradientTape() as tape:
+            y_pred = self(x, training=True)
+            loss = self.compute_loss(x, y, y_pred, sample_weight)
+        gradients = tape.gradient(loss, variables)
+        for variable, perturbation in zip(variables, perturbations):
+            if perturbation is not None:
+                variable.assign_sub(perturbation)
+        self.optimizer.apply_gradients((g, v) for g, v in zip(gradients, variables) if g is not None)
+        return self.compute_metrics(x, y, y_pred, sample_weight)
+
+
+def sharpness_aware(model, rho=0.05, adaptive=False):
+    '''Wrap a functional model so that `fit` trains it with SAM or ASAM;
+    see `SharpnessAwareModel`.
+
+    Input
+    ----------
+        model: a functional `tf.keras.Model`.
+        rho: radius of the neighbourhood (0.05 for SAM; ASAM uses 0.5 to 2).
+        adaptive: use ASAM.
+
+    Output
+    ----------
+        A `SharpnessAwareModel` sharing the layers of `model`: compile and
+        fit it, then export `model`.
+    '''
+    wrapped = SharpnessAwareModel(inputs=model.inputs, outputs=model.outputs, name=model.name + '_sam',
+                                  rho=rho, adaptive=adaptive)
+    for attribute in ('preprocessing', 'head_names'):
+        if hasattr(model, attribute):
+            setattr(wrapped, attribute, getattr(model, attribute))
+    return wrapped

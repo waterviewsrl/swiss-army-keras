@@ -14,6 +14,8 @@ from swiss_army_keras.layer_utils import (
     GeMPooling2D,
     add_embedding_output,
     add_energy_score_output,
+    check_input_size,
+    resize_to,
     apply_pre_pool_attention,
     energy_score,
     uint8_input_wrapper,
@@ -452,3 +454,33 @@ class TestAddEmbeddingOutput:
         # the QAT prefix is tried for a layer given by its builder name
         by_name = add_embedding_output(model, layer="lr_aspp_shallow_proj_bn")
         assert tuple(by_name.outputs[1].shape[1:]) == (16, 16, 48)
+
+
+# `resize_to` and `check_input_size`: the helpers behind free input sizes.
+
+
+def test_resize_to_picks_the_cheapest_layer_and_matches_tf_image_resize():
+    inp = tf.keras.Input((6, 10, 2))
+    assert resize_to(inp, 6, 10) is inp                              # nothing to do
+    doubled = resize_to(inp, 12, 20, name="by_two")
+    odd = resize_to(inp, 15, 23, name="free")
+    model = tf.keras.Model(inp, [doubled, odd])
+    # the integer factor keeps the QAT-annotated UpSampling2D, the free size uses Resizing
+    annotated = [layer.layer for layer in model.layers if hasattr(layer, "layer")]
+    assert [(type(layer).__name__, layer.name) for layer in annotated] == [("UpSampling2D", "by_two")]
+    assert type(model.get_layer("free")).__name__ == "Resizing"
+
+    x = np.random.rand(1, 6, 10, 2).astype("float32")
+    a, b = model.predict(x, verbose=0)
+    np.testing.assert_allclose(a, tf.image.resize(x, (12, 20), method="bilinear").numpy(), atol=1e-6)
+    np.testing.assert_allclose(b, tf.image.resize(x, (15, 23), method="bilinear").numpy(), atol=1e-6)
+
+
+def test_check_input_size_messages():
+    assert check_input_size(tf.keras.Input((64, 96, 3)), multiple=32) == (64, 96)
+    with pytest.raises(ValueError, match="static input size"):
+        check_input_size(tf.keras.Input((None, 96, 3)))
+    with pytest.raises(ValueError, match="multiples of 32"):
+        check_input_size(tf.keras.Input((70, 96, 3)), multiple=32, what="Thing")
+    with pytest.raises(ValueError, match="at least 128"):
+        check_input_size(tf.keras.Input((64, 96, 3)), multiple=32, minimum=128)

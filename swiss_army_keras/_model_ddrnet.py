@@ -98,9 +98,15 @@ from tensorflow.keras.layers import (
 from tensorflow.keras.models import Model
 from tensorflow.keras.initializers import HeNormal
 
-from swiss_army_keras.layer_utils import dummy_preprocessing, qat_annotate_layer
+from swiss_army_keras.layer_utils import check_input_size, dummy_preprocessing, qat_annotate_layer, resize_to, qat_apply
 
 import tensorflow_model_optimization as tfmot
+
+
+# Batch-norm constants of the PyTorch references (`momentum=0.1` there is
+# 0.9 in the Keras convention; epsilon is the PyTorch default). They matter
+# for porting weights and for matching the published training behaviour.
+_BN = dict(momentum=0.9, epsilon=1e-5)
 
 
 def _bn_relu(x, name=''):
@@ -117,7 +123,7 @@ def _bn_relu(x, name=''):
     `Multiply`/`Concatenate`/`Add` in the other two decoders (§3.1/§3.2).
     Left unannotated here for the same reason.
     '''
-    x = BatchNormalization(name=f'{name}_bn')(x)
+    x = BatchNormalization(name=f'{name}_bn', **_BN)(x)
     return Activation('relu', name=f'{name}_relu')(x)
 
 
@@ -126,11 +132,23 @@ def _conv_bn(x, out_channels, kernel_size, stride=1, use_bias=False, name=''):
         out_channels, kernel_size, strides=stride, padding='same', use_bias=use_bias,
         kernel_initializer=HeNormal(), name=f'{name}_conv',
     ))(x)
-    return qat_annotate_layer(BatchNormalization(name=f'{name}_bn'))(x)
+    return qat_annotate_layer(BatchNormalization(name=f'{name}_bn', **_BN))(x)
 
 
-def _conv_bn_relu(x, out_channels, kernel_size, stride=1, name=''):
-    x = _conv_bn(x, out_channels, kernel_size, stride=stride, name=name)
+def _bn_relu_conv(x, out_channels, kernel_size, name=''):
+    '''Pre-activation `BN -> ReLU -> Conv` with nothing after the
+    convolution: the order of every branch of the pooling modules and of
+    the segmentation heads in the DDRNet and PIDNet references.
+    '''
+    x = _bn_relu(x, name=name)
+    return qat_annotate_layer(Conv2D(
+        out_channels, kernel_size, padding='same', use_bias=False,
+        kernel_initializer=HeNormal(), name=f'{name}_conv',
+    ))(x)
+
+
+def _conv_bn_relu(x, out_channels, kernel_size, stride=1, use_bias=False, name=''):
+    x = _conv_bn(x, out_channels, kernel_size, stride=stride, use_bias=use_bias, name=name)
     return qat_annotate_layer(Activation('relu', name=f'{name}_relu'))(x)
 
 
@@ -201,56 +219,49 @@ def dappm(x, branch_channels, out_channels, name='dappm'):
     combined by a **cascade** (each upsampled branch added to the *previous*
     cascade output, then a 3x3 conv), not a plain concat/sum — see module
     docstring for why this distinction matters and where it was verified.
+
+    Every convolution is preceded by its batch norm and followed by
+    nothing, as in the reference. (Up to 2026-11-10 this function added a
+    batch norm after each of its 11 convolutions.)
     '''
     height, width = int(x.shape[1]), int(x.shape[2])
 
-    scale0 = _bn_relu(x, name=f'{name}_scale0')
-    scale0 = _conv_bn(scale0, branch_channels, 1, name=f'{name}_scale0_conv')
+    cascade = [_bn_relu_conv(x, branch_channels, 1, name=f'{name}_scale0')]
 
     stage_specs = [(5, 2, 2), (9, 4, 4), (17, 8, 8)]
-    cascade = [scale0]
     for i, (kernel, stride, pad) in enumerate(stage_specs, start=1):
         pooled = _avg_pool_branch(x, kernel, stride, pad, name=f'{name}_scale{i}')
-        pooled = _bn_relu(pooled, name=f'{name}_scale{i}')
-        pooled = _conv_bn(pooled, branch_channels, 1, name=f'{name}_scale{i}_conv')
-        pooled = qat_annotate_layer(UpSampling2D(
-            size=(height // pooled.shape[1], width // pooled.shape[2]),
-            interpolation='bilinear', name=f'{name}_scale{i}_up',
-        ))(pooled)
+        pooled = _bn_relu_conv(pooled, branch_channels, 1, name=f'{name}_scale{i}')
+        pooled = resize_to(pooled, height, width, name=f'{name}_scale{i}_up')
         merged = Add(name=f'{name}_scale{i}_merge')([pooled, cascade[-1]])
-        merged = _bn_relu(merged, name=f'{name}_process{i}')
-        merged = _conv_bn(merged, branch_channels, 3, name=f'{name}_process{i}_conv')
-        cascade.append(merged)
+        cascade.append(_bn_relu_conv(merged, branch_channels, 3, name=f'{name}_process{i}'))
 
     global_pooled = qat_annotate_layer(AveragePooling2D(
         pool_size=(height, width), name=f'{name}_scale4_pool',
     ))(x)
-    global_pooled = _bn_relu(global_pooled, name=f'{name}_scale4')
-    global_pooled = _conv_bn(global_pooled, branch_channels, 1, name=f'{name}_scale4_conv')
+    global_pooled = _bn_relu_conv(global_pooled, branch_channels, 1, name=f'{name}_scale4')
     global_pooled = qat_annotate_layer(UpSampling2D(
         size=(height, width), interpolation='bilinear', name=f'{name}_scale4_up',
     ))(global_pooled)
     merged = Add(name=f'{name}_scale4_merge')([global_pooled, cascade[-1]])
-    merged = _bn_relu(merged, name=f'{name}_process4')
-    merged = _conv_bn(merged, branch_channels, 3, name=f'{name}_process4_conv')
-    cascade.append(merged)
+    cascade.append(_bn_relu_conv(merged, branch_channels, 3, name=f'{name}_process4'))
 
     concatenated = Concatenate(axis=-1, name=f'{name}_concat')(cascade)
-    compressed = _bn_relu(concatenated, name=f'{name}_compression')
-    compressed = _conv_bn(compressed, out_channels, 1, name=f'{name}_compression_conv')
-
-    shortcut = _bn_relu(x, name=f'{name}_shortcut')
-    shortcut = _conv_bn(shortcut, out_channels, 1, name=f'{name}_shortcut_conv')
+    compressed = _bn_relu_conv(concatenated, out_channels, 1, name=f'{name}_compression')
+    shortcut = _bn_relu_conv(x, out_channels, 1, name=f'{name}_shortcut')
 
     return Add(name=f'{name}_out')([compressed, shortcut])
 
 
 def segmenthead(x, mid_channels, n_labels, name='segmenthead'):
-    x = _bn_relu(x, name=f'{name}_pre')
-    x = _conv_bn_relu(x, mid_channels, 3, name=f'{name}_conv1')
-    # A second pre-activation `BN -> ReLU` (preceding the classifier conv,
-    # not following one) - same unannotated treatment as `_bn_relu` and for
-    # the same reason (see its docstring).
+    '''`BN -> ReLU -> Conv3x3 -> BN -> ReLU -> Conv1x1(bias)`: one batch
+    norm before each of the two convolutions, as in the DDRNet and PIDNet
+    references. (Up to 2026-11-10 this head had a second batch norm and
+    ReLU after the 3x3 convolution.)
+    '''
+    x = _bn_relu_conv(x, mid_channels, 3, name=f'{name}_pre')
+    # A pre-activation `BN -> ReLU` preceding the classifier conv, left
+    # unannotated like every `_bn_relu` (see its docstring).
     x = _bn_relu(x, name=f'{name}_pre2')
     return qat_annotate_layer(
         Conv2D(n_labels, 1, padding='same', use_bias=True, name=f'{name}_classifier'))(x)
@@ -265,7 +276,9 @@ def ddrnet(input_tensor, n_labels, planes=32, layers=(2, 2, 2, 2), spp_planes=12
 
     Input
     ----------
-        input_tensor: the input tensor, e.g., `keras.layers.Input((None, None, 3))`.
+        input_tensor: the input tensor, with a static height and width that
+                      are multiples of 8, at least 64 (the deepest branch is at stride
+                      64), e.g. `keras.layers.Input((512, 1024, 3))`.
         n_labels: number of segmentation classes.
         planes: base channel width — 32 reproduces the official "DDRNet-23-slim"
                 config, 64 reproduces the full-width "DDRNet-23" (both share
@@ -288,10 +301,12 @@ def ddrnet(input_tensor, n_labels, planes=32, layers=(2, 2, 2, 2), spp_planes=12
         spatial resolution.
     '''
 
+    check_input_size(input_tensor, multiple=8, minimum=64, what='DDRNet')
     highres_planes = planes * 2
 
-    x = _conv_bn_relu(input_tensor, planes, 3, stride=2, name=f'{name}_stem1')
-    x = _conv_bn_relu(x, planes, 3, stride=2, name=f'{name}_stem2')
+    # the two stem convolutions carry a bias in the reference
+    x = _conv_bn_relu(input_tensor, planes, 3, stride=2, use_bias=True, name=f'{name}_stem1')
+    x = _conv_bn_relu(x, planes, 3, stride=2, use_bias=True, name=f'{name}_stem2')
 
     x = _make_stage(x, basic_block, planes, layers[0], stride=1, name=f'{name}_layer1')
     x = qat_annotate_layer(Activation('relu', name=f'{name}_layer1_relu'))(x)
@@ -315,10 +330,7 @@ def ddrnet(input_tensor, n_labels, planes=32, layers=(2, 2, 2, 2), spp_planes=12
         qat_annotate_layer(Activation('relu', name=f'{name}_mb3_relu'))(x),
         highres_planes, 1, name=f'{name}_compression3',
     )
-    compression3 = qat_annotate_layer(UpSampling2D(
-        size=(x_.shape[1] // compression3.shape[1], x_.shape[2] // compression3.shape[2]),
-        interpolation='bilinear', name=f'{name}_compression3_up',
-    ))(compression3)
+    compression3 = resize_to(compression3, x_.shape[1], x_.shape[2], name=f'{name}_compression3_up')
 
     x_next = Add(name=f'{name}_fuse3_main')([x, down3])
     x_next_ = Add(name=f'{name}_fuse3_hb')([x_, compression3])
@@ -344,10 +356,7 @@ def ddrnet(input_tensor, n_labels, planes=32, layers=(2, 2, 2, 2), spp_planes=12
         qat_annotate_layer(Activation('relu', name=f'{name}_mb4_relu'))(x),
         highres_planes, 1, name=f'{name}_compression4',
     )
-    compression4 = qat_annotate_layer(UpSampling2D(
-        size=(x_.shape[1] // compression4.shape[1], x_.shape[2] // compression4.shape[2]),
-        interpolation='bilinear', name=f'{name}_compression4_up',
-    ))(compression4)
+    compression4 = resize_to(compression4, x_.shape[1], x_.shape[2], name=f'{name}_compression4_up')
 
     x_next = Add(name=f'{name}_fuse4_main')([x, down4])
     x_next_ = Add(name=f'{name}_fuse4_hb')([x_, compression4])
@@ -368,32 +377,23 @@ def ddrnet(input_tensor, n_labels, planes=32, layers=(2, 2, 2, 2), spp_planes=12
         qat_annotate_layer(Activation('relu', name=f'{name}_layer5_relu'))(x),
         spp_planes, planes * 4, name=f'{name}_dappm',
     )
-    x = qat_annotate_layer(UpSampling2D(
-        size=(x_.shape[1] // x.shape[1], x_.shape[2] // x.shape[2]),
-        interpolation='bilinear', name=f'{name}_dappm_up',
-    ))(x)
+    x = resize_to(x, x_.shape[1], x_.shape[2], name=f'{name}_dappm_up')
 
     x_final = Add(name=f'{name}_fuse5_hb')([x_, x])
 
     main_out = segmenthead(x_final, head_planes, n_labels, name=f'{name}_final_head')
-    main_out = qat_annotate_layer(UpSampling2D(
-        size=(input_tensor.shape[1] // main_out.shape[1], input_tensor.shape[2] // main_out.shape[2]),
-        interpolation='bilinear', name=f'{name}_final_upsample',
-    ))(main_out)
+    main_out = resize_to(main_out, input_tensor.shape[1], input_tensor.shape[2], name=f'{name}_final_upsample')
 
     outputs = [main_out]
     if augment:
         aux_out = segmenthead(aux_feature, head_planes, n_labels, name=f'{name}_aux_head')
-        aux_out = qat_annotate_layer(UpSampling2D(
-            size=(input_tensor.shape[1] // aux_out.shape[1], input_tensor.shape[2] // aux_out.shape[2]),
-            interpolation='bilinear', name=f'{name}_aux_upsample',
-        ))(aux_out)
+        aux_out = resize_to(aux_out, input_tensor.shape[1], input_tensor.shape[2], name=f'{name}_aux_upsample')
         outputs.append(aux_out)
 
     m = Model([input_tensor, ], outputs)
 
     with tfmot.quantization.keras.quantize_scope():
-        m = tfmot.quantization.keras.quantize_apply(m)
+        m = qat_apply(m)
 
     m.preprocessing = dummy_preprocessing
 

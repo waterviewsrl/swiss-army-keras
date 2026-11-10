@@ -3,6 +3,8 @@
 TFLite files, checks the result, and can visualize its predictions. The
 building blocks live in `deploy_utils`.
 '''
+import itertools
+
 import tensorflow as tf
 import numpy as np
 
@@ -126,10 +128,32 @@ class Quantizer():
                then logits and the application applies the activation.
                `self.export_model.dropped_output_activations` lists what was
                dropped. Works best together with `strip_qat`.
+        outputs: export only these outputs of the model (indices or names,
+               see `deploy_utils.select_outputs`). Use it to leave out the
+               auxiliary heads of a network trained with deep supervision,
+               e.g. `outputs=1` for `pidnet(augment=True)`, `outputs=0` for
+               `ddrnet(augment=True)`.
+        fold_batch_norms: fold batch norms into the convolutions before
+               them (`deploy_utils.fold_batch_norms`) before equalizing.
+               None (default) does it whenever the wrappers were stripped.
+        bias_correction: correct the bias of every layer for the mean
+               error its 8-bit weights introduce
+               (`deploy_utils.correct_bias`), using the calibration batches.
+               None (default) does it when the wrappers were stripped and
+               the profile quantizes weights per tensor (`artpec8`). On a
+               trained PP-LiteSeg model, folding, equalization and bias
+               correction together raised per-tensor mIoU from 0.74 to
+               0.81, against 0.83 in float (see the deployment guide).
+        replace_global_pooling: swap `GlobalAveragePooling2D` for a
+               windowed average pooling of the same result
+               (`deploy_utils.replace_global_pooling`). None (default) does
+               it when the wrappers were stripped and the profile's
+               operator list has no `MEAN` (`artpec8`).
     '''
     def __init__(self, dataset, model, name, append_datetime=True, batches=1, weights_checkpoint_name=None,
                  profile='default', reparameterize=True, strip_qat=None, strict=False, equalize=None,
-                 drop_output_activations=False):
+                 drop_output_activations=False, outputs=None, replace_global_pooling=None,
+                 fold_batch_norms=None, bias_correction=None):
         self.dataset = dataset
         self.model = model
         if append_datetime:
@@ -153,6 +177,19 @@ class Quantizer():
         self.equalize = (self.strip_qat and not self.profile.per_channel) if equalize is None else equalize
         self.equalization = None
         self.drop_output_activations = drop_output_activations
+        self.outputs = outputs
+        # Global average pooling exports as MEAN; swap it for a windowed
+        # pooling when the target's operator list does not have MEAN.
+        if replace_global_pooling is None:
+            replace_global_pooling = (self.strip_qat and self.profile.supported_ops is not None
+                                      and 'MEAN' not in self.profile.supported_ops)
+        self.replace_global_pooling = replace_global_pooling
+        # Folding batch norms before equalizing, then correcting the bias,
+        # is what brings per-tensor exports close to per-channel ones.
+        self.fold_batch_norms = self.strip_qat if fold_batch_norms is None else fold_batch_norms
+        self.bias_correction = ((self.strip_qat and not self.profile.per_channel)
+                                if bias_correction is None else bias_correction)
+        self.bias_corrected = None
         self.export_model = None
         self.lint_report = None
         self.tflite_int_path = None
@@ -170,6 +207,8 @@ class Quantizer():
             self.saved_model_dirname = self.name + 'saved_model'
         model.trainable = False
 
+        if self.outputs is not None:
+            model = deploy_utils.select_outputs(model, self.outputs)
         if self.reparameterize:
             try:
                 model = deploy_utils.reparameterize_model(model)
@@ -180,6 +219,12 @@ class Quantizer():
             model = deploy_utils.strip_qat(model)
         if self.drop_output_activations:
             model = deploy_utils.drop_output_activations(model)
+        if self.replace_global_pooling:
+            if deploy_utils.has_qat_layers(model):
+                logging.warning('Global pooling not replaced: the model still has QAT wrappers '
+                                '(it needs `strip_qat=True`).')
+            else:
+                model = deploy_utils.replace_global_pooling(model)
         return model
 
     def quantize(self):
@@ -195,14 +240,26 @@ class Quantizer():
         '''
 
         def representative_data_gen():
-            for i in range(self.batches):
-                vals = self.dataset.__iter__().next()[0]
+            # `batches` consecutive batches (until 2026-11-10 a new iterator
+            # was opened for each, which repeats the first batch of a
+            # dataset that does not shuffle)
+            for batch in itertools.islice(iter(self.dataset), self.batches):
+                vals = batch[0] if isinstance(batch, (tuple, list)) else batch
                 for val in vals:
                     yield [tf.expand_dims(tf.cast(val, tf.float32), axis=0)]
 
         self.export_model = self._prepare_export_model()
 
+        plain = not deploy_utils.has_qat_layers(self.export_model)
+        if self.fold_batch_norms:
+            if plain:
+                self.export_model = deploy_utils.fold_batch_norms(self.export_model)
+            else:
+                logging.warning('Batch norms not folded: the model still has QAT wrappers '
+                                '(it needs `strip_qat=True`).')
+
         self.equalization = None
+        self.bias_corrected = None
         if self.equalize:
             if deploy_utils.has_qat_layers(self.export_model):
                 logging.warning('Cross-layer equalization skipped: the model still has QAT wrappers '
@@ -212,10 +269,22 @@ class Quantizer():
                 logging.info('Cross-layer equalization: %d layer pairs, %d sweeps.',
                              self.equalization.pairs, self.equalization.iterations)
         try:
+            if self.bias_correction:
+                if plain:
+                    calibration = np.concatenate([np.asarray(sample[0]) for sample in representative_data_gen()])
+                    self.bias_corrected = deploy_utils.correct_bias(
+                        self.export_model, calibration, per_channel=self.profile.per_channel)
+                    logging.info('Bias correction: %d layers, largest shift %.4g.',
+                                 self.bias_corrected.layers, self.bias_corrected.max_shift)
+                else:
+                    logging.warning('Bias correction skipped: the model still has QAT wrappers '
+                                    '(it needs `strip_qat=True`).')
             self._convert_and_write(representative_data_gen)
         finally:
             # Layers may be shared with the model being trained: leave its
             # weights as they were.
+            if self.bias_corrected is not None:
+                self.bias_corrected.restore()
             if self.equalization is not None:
                 self.equalization.restore()
 

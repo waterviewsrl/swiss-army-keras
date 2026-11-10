@@ -18,6 +18,9 @@ Backbones
 .. automodule:: swiss_army_keras._backbone_mobileone
    :members:
 
+.. automodule:: swiss_army_keras._backbone_plain
+   :members:
+
 .. automodule:: swiss_army_keras._backbone_mobilenetv4
    :members:
 
@@ -70,7 +73,19 @@ Several heads on one backbone
 -----------------------------
 
 .. automodule:: swiss_army_keras._model_multi_task
-   :members: multi_task
+   :members: multi_task, uncertainty_weighted, UncertaintyWeighted
+
+Plain pyramid head and counting
+-------------------------------
+
+.. automodule:: swiss_army_keras._model_fpn_seg
+   :members:
+
+Keypoints by coordinate classification
+--------------------------------------
+
+.. automodule:: swiss_army_keras._model_keypoints
+   :members:
 
 Object detection and instance segmentation
 ------------------------------------------
@@ -106,6 +121,9 @@ Training
 --------
 
 .. automodule:: swiss_army_keras.training_utils
+   :members:
+
+.. automodule:: swiss_army_keras.distillation_utils
    :members:
 
 Export and inference

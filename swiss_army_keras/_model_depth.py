@@ -259,7 +259,7 @@ def fastdepth_head(input_tensor, output_mode='sigmoid', decoder_channels=(256, 1
     m = Model([input_tensor, ], [raw, ])
 
     with tfmot.quantization.keras.quantize_scope():
-        m = tfmot.quantization.keras.quantize_apply(m)
+        m = qat_apply(m)
 
     m.preprocessing = backbone_.preprocessing
 

@@ -12,6 +12,18 @@ Companion documents: [ASSESSMENT.md](ASSESSMENT.md) section 13 (state of the
 code on the same day, including the PIDNet review), [ROADMAP.md](ROADMAP.md)
 (ordered work list).
 
+> **Status, later on 2026-11-10.** Implemented since this document was
+> written: the seven export repairs of section 2 (and a fixed batch at
+> conversion, which also removes the DeepLab operators), the DDRNet and
+> PIDNet repairs, the ResNet-18/34, STDC, QARepVGG, cross-stage-partial and
+> MobileNetV3Small backbones, the plain pyramid head, the
+> coordinate-classification keypoint head, the density head, the
+> re-identification training wrapper, the affine-invariant depth losses and
+> learned multi-task loss balancing. The tables below describe the state
+> before that work. Still open from this document: GCNet, the detection
+> loader and NMS-free head, ZipDepth, EfficientAD, the out-of-distribution
+> additions, and pretrained weights for everything new.
+
 ## How to read this document
 
 **Hardware tiers** (as in the first pass). A: Axis camera DLPUs (ARTPEC-8,

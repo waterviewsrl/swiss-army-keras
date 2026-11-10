@@ -543,3 +543,56 @@ def test_yolact_mask_loss_is_finite_and_differentiable():
     assert np.isfinite(float(loss))
     assert grad is not None
     assert np.all(np.isfinite(grad.numpy()))
+
+
+# Losses added on 2026-11-10: affine-invariant depth, long-tail adjustment.
+
+from swiss_army_keras.losses import (  # noqa: E402
+    gradient_matching_loss,
+    logit_adjusted_crossentropy,
+    midas_loss,
+    scale_shift_invariant_loss,
+)
+
+
+def _relative_depth_pair():
+    rng = np.random.default_rng(0)
+    y_true = rng.uniform(1.0, 5.0, size=(2, 16, 16, 1)).astype("float32")
+    y_true[:, :2] = 0.0                                   # two rows without depth
+    return y_true
+
+
+def test_scale_shift_invariant_loss_ignores_an_affine_change_and_missing_pixels():
+    y_true = _relative_depth_pair()
+    affine = 3.0 * y_true - 7.0                          # a different scale and shift per batch is not needed here
+    affine[:, :2] = 123.0                                # garbage where the target is missing
+    assert float(scale_shift_invariant_loss(y_true, affine)) < 1e-4
+    assert float(gradient_matching_loss(y_true, affine)) < 1e-3
+    assert float(midas_loss()(y_true, affine)) < 1e-3
+
+    noisy = y_true + np.random.default_rng(1).normal(0, 0.5, y_true.shape).astype("float32")
+    assert float(scale_shift_invariant_loss(y_true, noisy)) > 0.1
+    assert float(gradient_matching_loss(y_true, noisy)) > 0.1
+
+
+def test_scale_shift_invariant_loss_is_differentiable_and_safe_on_constant_predictions():
+    y_true = tf.constant(_relative_depth_pair())
+    prediction = tf.Variable(tf.zeros_like(y_true))      # constant prediction: the alignment is degenerate
+    with tf.GradientTape() as tape:
+        value = midas_loss()(y_true, prediction)
+    gradient = tape.gradient(value, prediction)
+    assert np.isfinite(float(value)) and np.all(np.isfinite(gradient.numpy()))
+
+
+def test_logit_adjusted_crossentropy_matches_its_formula_and_favours_rare_classes():
+    priors = [90.0, 9.0, 1.0]
+    loss = logit_adjusted_crossentropy(priors)
+    logits = tf.constant([[2.0, 1.0, 0.5]])
+    y_true = tf.constant([[0.0, 0.0, 1.0]])
+    adjusted = np.array([2.0, 1.0, 0.5]) + np.log(np.array(priors) / 100.0)
+    expected = -np.log(np.exp(adjusted[2]) / np.exp(adjusted).sum())
+    np.testing.assert_allclose(float(loss(y_true, logits)), expected, rtol=1e-5)
+    plain = float(tf.nn.softmax_cross_entropy_with_logits(y_true, logits)[0])
+    assert float(loss(y_true, logits)) > plain            # the rare class has to win by a larger margin
+    with pytest.raises(ValueError, match="positive"):
+        logit_adjusted_crossentropy([0.5, 0.0])

@@ -1,8 +1,7 @@
 # Roadmap
 
 Open work in priority order, as of 2026-11-10. The reasoning is in
-[ASSESSMENT.md](ASSESSMENT.md) (state of the code; section 13 is the latest
-review), [EDGE_AI_CANDIDATES.md](EDGE_AI_CANDIDATES.md) (what to add, by
+[ASSESSMENT.md](ASSESSMENT.md) (state of the code; sections 13 and 14 are the latest), [EDGE_AI_CANDIDATES.md](EDGE_AI_CANDIDATES.md) (what to add, by
 target hardware) and [CANDIDATES_BY_TASK.md](CANDIDATES_BY_TASK.md)
 (backbones and heads by task, with the export sweep of 2026-11-10). Completed work is recorded in [CHANGELOG.md](CHANGELOG.md);
 [plan.md](plan.md) is the engineering log of the 0.11 cycle and is no longer
@@ -19,6 +18,11 @@ export check against the target's operator list, and stripping of QAT
 wrappers for integer-only targets, which also removed the float operators
 found in LR-ASPP and DeepLabV3+ exports.
 
+Done on 2026-11-10: the export repairs found by the sweep (FCOS without `EXP`, GFL without slices, windowed
+pooling, pose and embedding heads, fixed batch conversion, which also removes the DeepLab `SPACE_TO_BATCH_ND`
+operators), `strip_qat` on graphs Keras cannot clone, the zero-scale and near-zero-scale lint checks, and
+`select_outputs`.
+
 Still open:
 
 | Item | Effort |
@@ -27,32 +31,29 @@ Still open:
 | Cover the remaining published per-operator constraints in the lint (pooling windows, kernel sizes, padding amounts) | S |
 | Export detectors without in-graph decoding and NMS, with a reference decoder | S |
 | Extend `tests/test_tflite_export.py` to every decoder, head and backbone family | M |
-| Intermittent failure of the PP-LiteSeg + fused MobileOne-S0 export test for `artpec9`: the LiteRT CPU delegate (XNNPACK) could not prepare the file in 1 of 7 runs on 2026-11-05. The test uses unseeded random weights and calibration data; find the degenerate case and seed the test | S |
+| The image-quality head still pools with GeM by default, which stays in floating point; the full detectors still decode and run NMS in the graph, so only their `*_base` models suit an accelerator | S |
 | On-device benchmark harness and a published latency table | M |
-| Export repairs found by the sweep of 2026-11-10 (CANDIDATES_BY_TASK.md section 2), about a day each: FCOS distances without `EXP`; GFL sides without `STRIDED_SLICE`; fixed-window average pooling in the classifiers; static reshape in the pose head; average pooling and host-side normalization for the re-identification and image-quality heads; DeepLab without dilation | M in total |
-| `strip_qat` fails on the full detectors (decoding and NMS in the graph); fix it or document that only the `*_base` models export for accelerators | S |
-| Lint check for a zero quantization scale: a tensor that is constant in the calibration data gets scale 0, and the LiteRT runtime aborts on such a file (seen on the QAT export of an untrained PIDNet, see ASSESSMENT.md section 13) | S |
 | Decide the future of QAT wrapping: it no longer contributes activation ranges for accelerator exports. Options: keep it as a training regularizer, make it optional per builder, or drop it in favour of post-training quantization (see section 7) | M |
 
 ## 2. Make quantized models accurate
 
-Done on 2026-11-05: cross-layer equalization (`equalize_cross_layer`, used by
-`Quantizer` for per-tensor profiles), an error measurement
-(`quantization_error`), gate-free options for LR-ASPP and PP-LiteSeg, and the
-root cause of the all-zero QAT output (an untrained output quantizer rounding
-tiny values; not a defect). Measurements on pretrained backbones are in
-`docs/source/deployment.rst`.
+Done on 2026-11-05: cross-layer equalization, an error measurement, gate-free options for LR-ASPP and PP-LiteSeg.
+Done on 2026-11-10: batch-norm folding and bias correction (default for per-tensor profiles), a per-layer error
+report (`quantization_debug_report`), QAT made optional (`set_qat`), and the **first task-accuracy measurement**:
+two models trained in September, re-exported in every variant (table in `docs/source/deployment.rst`).
+Per-tensor PP-LiteSeg on MobileNetV4-Conv-S went from 0.741 to 0.808 mIoU, against 0.832 in float.
 
 Still open, in the order the measurements suggest:
 
 | Item | Effort |
 |---|---|
-| Validate on task accuracy: train one segmentation and one classification model, export per channel and per tensor, compare with the float model (the SQNR figures are only a proxy) | M |
-| Fix post-training quantization of fused MobileOne and RepViT (noise as large as signal at the deepest tap): percentile or MSE activation calibration, bias correction, QARepVGG-style blocks, or QAT of the fused backbone | L |
-| Equalization through ReLU6 (per-channel clipping), or a ReLU variant of MobileNetV2 / EfficientNet-Lite with fine-tuning, so those backbones work per tensor | M |
-| Per-layer quantization error report (wrap `tf.lite.experimental.QuantizationDebugger`) | S |
-| Edge-clean builder switches: ReLU6 or ReLU instead of GELU, hard-swish and swish; no squeeze-excite; channel rounding; SAME padding | M |
-| A gate-free decoder designed for accelerators (feature pyramid with convolutions, 2x resizes and additions only); gate-free variants of PIDNet and PP-MobileSeg | S to M |
+| Repeat the task-accuracy measurement on a model trained with a recorded split, and on a classifier; the September runs did not record their split | M |
+| Fused MobileOne and RepViT lose accuracy under every 8-bit export (LR-ASPP on MobileOne-S1: 0.66 float, 0.52 per channel, at most 0.46 per tensor). Candidates: QARepVGG (now in the library, to be trained and measured), QAT of the fused backbone, percentile or MSE activation calibration | L |
+| Equalization and bias correction interact badly on the fused MobileOne model (bias correction alone was better); understand why before trusting the default on reparameterized backbones | M |
+| Bias correction with the activations of the partly quantized model, as in the original method | M |
+| Equalization through ReLU6 (per-channel clipping), or a ReLU variant of MobileNetV2 / EfficientNet-Lite with fine-tuning | M |
+| Edge-clean builder switches for the phone-oriented backbones: ReLU6 or ReLU instead of GELU, hard-swish and swish; no squeeze-excite; `'same'` padding | M |
+| Decide whether QAT stays the default: on the one model where it could be compared it added 0.001 mIoU over post-training quantization | S |
 
 ## 2b. Depth and out-of-distribution analysis
 
@@ -74,18 +75,17 @@ Still open:
 
 ## 2c. PIDNet and DDRNet
 
-Reviewed on 2026-11-10 (ASSESSMENT.md section 13). The architecture matches
-the official PIDNet source by structure and by parameter count; it has not
-been compared numerically.
+Done on 2026-11-10: free input sizes (any multiple of 8), the reference layer layout and batch-norm constants,
+loss weights and output selection in `TrainingDriver`, export tests. PIDNet-S, M and L match the parameter count
+of the official architecture exactly.
+
+Still open:
 
 | Item | Effort |
 |---|---|
-| Accept any input size that is a multiple of 64 (today only sizes whose pooled maps divide evenly build: 256, 384, 512, 1024 work; 320, 448, 640 and 720x1280 fail). Resize to the target size instead of by an integer factor. DDRNet has the same limit, confirmed | S |
-| Match the reference for weight porting: batch-norm epsilon 1e-5 and momentum 0.9, bias on the two stem convolutions, no batch norm after the convolutions of the DAPPM module | S |
-| Port script and numeric check against the official PyTorch model for PIDNet-S and DDRNet-23-slim; then ImageNet and Cityscapes weights (license review first) | M |
-| Training example with the auxiliary heads: per-output losses and weights; the boundary-attentive term needs a custom training step; `TrainingDriver` has no loss weights | S to M |
-| Export test for both networks; helper that drops the auxiliary outputs before export | S |
-| Make DDRNet the documented segmentation default for Axis accelerators; boundary auxiliary head for DDRNet | S |
+| Port script and numeric check against the official PyTorch models (running the official code was not possible in the session that did the repairs); then ImageNet and Cityscapes weights, after a license review | M |
+| The boundary-attentive term of the PIDNet loss takes two outputs and still needs a custom training step | S |
+| Make DDRNet the documented segmentation default for Axis accelerators once it has weights; boundary auxiliary head for DDRNet | S |
 
 ## 3. Ship pretrained weights
 
@@ -98,24 +98,23 @@ been compared numerically.
 
 | Item | Effort |
 |---|---|
-| Learning-rate schedules and a differential backbone/head rate in `TrainingDriver` | S |
-| EMA and SWA weight averaging used for validation, checkpoints and export | M |
+| Done on 2026-11-10 as separate tools: schedules (`WarmupCosine`, `OneCycle`), per-group learning rates, decay presets, weight averaging (`WeightAveraging`), SAM inside `fit`, distillation (`Distiller`), learned loss balancing. They work with `model.fit`; wiring them into `TrainingDriver` (its second phase rebuilds the optimizer) is open | S |
 | Decide and fix batch-norm handling in the unfrozen phase (backbone batch-norm layers become trainable today) | S |
 | `TrainingDriver` output directory, optional export, resume | S |
 | Loss-weight ramping callback; rare-class and domain-balanced sampling | M |
 | Data loaders: non-square inputs, persisted split manifest, `close()`, unit tests; benchmark the worker pool against plain `tf.data` | M |
-| Knowledge-distillation wrapper | M |
+| Distillation of intermediate features (the wrapper distills one output) | S |
 
 ## 5. New components for Axis-class accelerators
 
 | Item | Effort |
 |---|---|
-| ResNet-18/34 and STDC1/2 backbones | S to M |
+| Done on 2026-11-10: ResNet-18/34, STDC1/2, QARepVGG, CSP with ReLU6, MobileNetV3Small; the plain pyramid head; the coordinate-classification keypoint head; the density head; the re-identification training wrapper. All without pretrained weights and without a numeric comparison with their references | |
+| Weights for the plain backbones: port torchvision ResNet-18/34 and the STDC checkpoints (`torch_padding=True` reproduces their alignment) | S to M |
 | GCNet (CVPR 2025): DDRNet-style segmentation network fused to plain 3x3 convolutions; gate on a post-training quantization measurement | M |
-| Plain pyramid semantic head (the gate-free decoder), also as a `multi_task` head type | S |
-| Depth: affine-invariant and gradient losses, teacher pseudo-label recipe (Depth Anything V2 Small is Apache-2.0); evaluate ZipDepth | S, then M |
-| Re-identification: batch-norm neck and margin classifier. Out-of-distribution: diagonal covariance and per-location statistics | S each |
-| Later: coordinate-classification keypoint head, density counting head, EfficientAD, cross-stage-partial ReLU6 backbone with the detection work | M each |
+| Depth: teacher pseudo-label recipe and notebook (the affine-invariant losses exist; Depth Anything V2 Small is Apache-2.0); evaluate ZipDepth | S, then M |
+| Out-of-distribution: diagonal covariance and per-location statistics | S each |
+| Later: EfficientAD; detection heads as `multi_task` head types | M each |
 | Vendored EfficientNet-Lite; MobileNetV3Small | S |
 | MobileDet-style and QARepVGG-style backbones | M |
 | Detection end to end: data loader, training loop, NMS-free head | L |

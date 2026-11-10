@@ -701,3 +701,69 @@ each. The table is in CANDIDATES_BY_TASK.md section 2.
    documented segmentation default for Axis targets.
 4. Pretrained weights: license review, hosting, download.
 5. Continuous integration for the fast suite and the docs build.
+
+## 14. Follow-up on 2026-11-10: repairs, new components, first task accuracy
+
+Everything listed as a repair in section 13 and in CANDIDATES_BY_TASK.md
+section 2 was done, and the "adopt now" components that need no training
+were added. No model was trained. The complete list is in CHANGELOG.md
+(items 4e and 4f); the open items are in ROADMAP.md.
+
+**Verified in this pass.**
+
+| What | Evidence |
+|---|---|
+| PIDNet and DDRNet against their references | Trainable parameters: PIDNet-S 7,625,715, M 28,538,515, L 36,939,571, each identical to the count derived from the official source; DDRNet-23-slim 5,695,987 (5.7M published). Both build at 192x320, 320, 448, 640, 720p and 1080p |
+| New backbones | ResNet-18 and ResNet-34 match torchvision's parameter counts exactly; QARepVGG fusion is exact to 2e-6 relative at even and odd input sizes; every new family exports with no operator outside either Axis list |
+| Export repairs | Re-export of each repaired head: FCOS, GFL, pose, embedding and classifier heads have nothing off the lists beyond the padding of the MobileNetV4 backbone; `fpn_seg` on ResNet-18 passes the lint for both Axis profiles with no finding except the class-count channel warning |
+| Per-tensor accuracy | Measured on two models trained in September (section below) |
+| Tests | Fast suite: 556 passed (150 backbone tests, 113 classifier, decoder and head tests, 131 detection, layer, loss and training-strategy tests, 162 others). Slow suite: 26 passed. Docs build with warnings as errors |
+
+**First task-accuracy measurement.** Two Pets segmentation models trained
+in September were found on disk with their checkpoints, so each export
+variant could be scored without training (150 images, 32 for calibration;
+the training split was not recorded, so the figures compare variants and
+are not clean test accuracy).
+
+| Export | PP-LiteSeg on MobileNetV4-Conv-S | LR-ASPP on MobileOne-S1, fused |
+|---|---|---|
+| Float | 0.832 | 0.664 |
+| QAT wrappers kept, per channel (the original pipeline) | 0.819 | 0.357 |
+| Post-training, per channel | 0.818 | 0.522 |
+| Per tensor, equalized (the default until today) | 0.741 | 0.374 |
+| Per tensor, folded, equalized, bias-corrected (the default now) | 0.808 | 0.381 |
+| Per tensor, folded and bias-corrected only | 0.756 | 0.456 |
+
+What follows from it:
+
+1. **The deployment pipeline works for the backbone that quantizes well.**
+   A per-tensor export for ARTPEC-8 is now within 0.024 mIoU of the float
+   model on MobileNetV4-Conv-S.
+2. **QAT of the heads contributes almost nothing** where it can be compared
+   (0.001 mIoU), and the original QAT export halves the accuracy of the
+   MobileOne model. Models can now be built without it (`set_qat`).
+3. **Fused MobileOne is confirmed as a poor choice for 8-bit targets** at
+   task level, not only in feature measurements.
+4. **Finding along the way:** `Quantizer` calibrated on the same batch
+   repeatedly for datasets that do not shuffle; fixed.
+
+**Things tried and dropped.** A per-tensor QAT scheme: the library drops
+the weight quantizer of convolutions followed by an activation when
+per-axis quantization is disabled, so the export was still partly per
+channel. A small reproduction of the zero-scale crash: it only appeared on
+the real untrained PIDNet QAT export; the lint check was kept and a
+near-zero-scale warning added, after tracing the intermittent PP-LiteSeg
+test failure to a saturated gate.
+
+**Not done, and why.** Weight-porting scripts for PIDNet and DDRNet: the
+official PyTorch code could not be executed in the session, so a port could
+not be validated. GCNet, the detection data loader and the NMS-free head:
+they need training to be judged. Nothing new has pretrained weights.
+
+**State of the critical points after this pass.** C4 (edge deployable) now
+has one measured accuracy result and a first set of models with nothing
+off the Axis lists; the lists themselves and on-device latency remain
+unverified. C2 (pretrained weights) is unchanged and grew: nine new
+backbone entries start from random weights. C3 (legacy Keras 2) has a
+practical exit: with `set_qat(enabled=False)` nothing in a model depends on
+`tensorflow_model_optimization`.
