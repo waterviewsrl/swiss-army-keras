@@ -116,7 +116,9 @@ class Quantizer():
                against.
         reparameterize: fuse reparameterizable backbones before converting.
         strip_qat: True / False to force, None for the profile-dependent
-               default described above.
+               default described above. A model prepared for whole-model
+               QAT by `deploy_utils.prepare_qat` keeps its wrappers by
+               default: they hold the ranges it was fine-tuned with.
         strict: raise `RuntimeError` if the lint report has errors or
                operators outside the profile's operator list, instead of
                only logging a warning.
@@ -170,7 +172,18 @@ class Quantizer():
 
         self.profile = deploy_utils.get_profile(profile)
         self.reparameterize = reparameterize
-        self.strip_qat = self.profile.integer_only if strip_qat is None else strip_qat
+        # A model prepared by `deploy_utils.prepare_qat` is wrapped as a whole:
+        # its wrappers carry the ranges it was fine-tuned with and are kept.
+        prepared = getattr(model, '_sak_qat_prepared', False)
+        if strip_qat is None:
+            strip_qat = self.profile.integer_only and not prepared
+        if prepared and not strip_qat and getattr(model, 'qat_per_channel', None) not in (None, self.profile.per_channel):
+            logging.warning(
+                "The model was prepared for %s weights and profile '%s' expects %s weights; the export will "
+                "not match the profile. Prepare it again with per_channel=%s.",
+                'per-channel' if model.qat_per_channel else 'per-tensor', self.profile.name,
+                'per-channel' if self.profile.per_channel else 'per-tensor', self.profile.per_channel)
+        self.strip_qat = strip_qat
         self.strict = strict
         # Cross-layer equalization only makes sense on a plain (stripped)
         # model, and measurably helps per-tensor exports only.

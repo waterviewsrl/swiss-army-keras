@@ -363,7 +363,10 @@ Training strategies
    * - ``models.uncertainty_weighted``
      - Learned balancing of the losses of a multi-output model.
    * - ``layer_utils.set_qat`` / ``qat_options``
-     - Build models with or without QAT wrappers.
+     - Build models with or without QAT wrappers on the head.
+   * - ``deploy_utils.prepare_qat``
+     - Whole-model quantization-aware fine-tuning of a trained model, per
+       channel or per tensor, on the graph that will be deployed.
 
 Data loaders
 ************
@@ -410,7 +413,8 @@ Auxiliary utilities
        ``drop_output_activations``, ``replace_global_pooling``,
        ``fold_batch_norms``, ``equalize_cross_layer``, ``correct_bias``,
        ``convert_to_tflite``, ``lint_tflite``, ``tflite_outputs``,
-       ``quantization_error`` and ``quantization_debug_report`` (see
+       ``quantization_error``, ``quantization_debug_report``, and
+       ``prepare_qat`` for whole-model quantization-aware training (see
        :doc:`deployment`).
    * - ``reparam_utils`` and ``reparameterize_*``
      - The per-family fusion functions and kernel arithmetic that

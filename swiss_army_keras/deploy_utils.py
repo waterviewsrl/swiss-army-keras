@@ -1350,6 +1350,528 @@ def quantization_debug_report(model, representative_dataset, profile='default', 
 
 
 # ========================= #
+# Whole-model quantization-aware training
+
+def flatten_model(model):
+    '''
+    Inline every nested sub-model, so that the result is one flat graph of
+    layers.
+
+    The builders of this library keep the backbone as a nested sub-model.
+    `tensorflow_model_optimization` cannot wrap layers inside a nested
+    model, so whole-model quantization-aware training starts from the flat
+    form.
+
+    Input
+    ----------
+        model: a functional `tf.keras.Model`.
+
+    Output
+    ----------
+        A new functional model with a dynamic batch size that shares every
+        layer with `model` and computes the same function.
+    '''
+    new_inputs = [tf.keras.Input(shape=tensor.shape[1:], dtype=tensor.dtype, name=tensor._keras_history.layer.name)
+                  for tensor in model.inputs]
+
+    def run(graph, inputs):
+        usage, tensor_dict = graph._tensor_usage_count, {}
+        for tensor, new in zip(graph.inputs, inputs):
+            tensor_dict[str(id(tensor))] = [new] * usage[str(id(tensor))]
+        for node in _nodes(graph):
+            if any(t_id not in tensor_dict for t_id in node.flat_input_ids):
+                continue
+            args, kwargs = node.map_arguments(tensor_dict)
+            if isinstance(node.layer, tf.keras.Model):
+                outputs = run(node.layer, tf.nest.flatten(args))
+            else:
+                outputs = node.layer(*args, **kwargs)
+            for t_id, tensor in zip(node.flat_output_ids, tf.nest.flatten(outputs)):
+                tensor_dict[t_id] = [tensor] * usage[t_id]
+        return [tensor_dict[str(id(tensor))].pop() for tensor in graph.outputs]
+
+    outputs = run(model, new_inputs)
+    flat = tf.keras.Model(new_inputs if len(new_inputs) > 1 else new_inputs[0],
+                          outputs if len(outputs) > 1 else outputs[0], name=model.name)
+    return _carry_attributes(model, flat)
+
+
+def _relu_kind(layer):
+    '''`'relu'` or `'relu6'` for a layer that only applies that activation, else None.'''
+    if isinstance(layer, tf.keras.layers.Activation):
+        name = getattr(layer.activation, '__name__', '')
+        return name if name in ('relu', 'relu6') else None
+    if isinstance(layer, tf.keras.layers.ReLU) and not layer.negative_slope and not layer.threshold:
+        if layer.max_value is None:
+            return 'relu'
+        if float(layer.max_value) == 6.0:
+            return 'relu6'
+    return None
+
+
+def merge_activations(model):
+    '''
+    Give every convolution or dense layer that is followed only by a ReLU
+    or ReLU6 layer that activation as its own, and turn the activation
+    layer into an identity.
+
+    The function is unchanged. The point is quantization-aware training:
+    `tensorflow_model_optimization` does not fake-quantize the weights of a
+    convolution that is followed by a separate activation layer.
+
+    Input
+    ----------
+        model: a flat functional `tf.keras.Model` (see `flatten_model`).
+
+    Output
+    ----------
+        A new model; merged layers are new layers with the weights copied,
+        every other layer is shared with `model`.
+    '''
+    usage = model._tensor_usage_count
+    calls = collections.Counter(id(node.layer) for node in _nodes(model))
+    merges, identities = {}, set()
+    for node in _nodes(model):
+        kind = _relu_kind(node.layer)
+        inputs = tf.nest.flatten(node.keras_inputs)
+        if kind is None or len(inputs) != 1 or calls[id(node.layer)] != 1:
+            continue
+        source = inputs[0]._keras_history.layer
+        if type(source) not in (tf.keras.layers.Conv2D, tf.keras.layers.DepthwiseConv2D, tf.keras.layers.Dense):
+            continue
+        if not _is_linear(source.activation) or calls[id(source)] != 1 or usage.get(str(id(inputs[0])), 0) != 1:
+            continue
+        merges[id(source)] = kind
+        identities.add(id(node.layer))
+
+    if not merges:
+        return model
+    replaced, pending = {}, []
+
+    def substitute(layer):
+        if id(layer) in replaced:
+            return replaced[id(layer)]
+        new = layer
+        if id(layer) in merges:
+            config = layer.get_config()
+            config['activation'] = merges[id(layer)]
+            new = type(layer).from_config(config)
+            pending.append((new, layer))
+        elif id(layer) in identities:
+            new = tf.keras.layers.Activation('linear', name=layer.name)
+        replaced[id(layer)] = new
+        return new
+
+    merged = _replay(model, substitute)
+    for new, old in pending:
+        new.set_weights(old.get_weights())
+    return merged
+
+
+def untie_shared_layers(model, jitter=0.0):
+    '''
+    Give every call of a layer with weights that is called more than once
+    its own copy, with the same weights.
+
+    The detection heads share their output convolutions across pyramid
+    levels. Untied, each level fine-tunes its own copy during
+    quantization-aware training; the exported file holds one copy per
+    level either way.
+
+    Input
+    ----------
+        model: a flat functional `tf.keras.Model` (see `flatten_model`).
+        jitter: copy `k` (from 0) has its kernel multiplied by
+                `1 + k * jitter`. The TFLite converter merges weight
+                constants that are exactly equal, which would tie the
+                copies again in a file exported before any fine-tuning;
+                `prepare_qat` uses 1e-6, far below the 8-bit rounding step
+                of about 1/127.
+
+    Output
+    ----------
+        `model` itself when nothing is shared, else a new model in which the
+        copies are named `<layer>_untied<k>`; every other layer is shared
+        with `model`.
+    '''
+    calls = collections.Counter(id(node.layer) for node in _nodes(model))
+    shared = {id(layer) for layer in model.layers if calls[id(layer)] > 1 and layer.weights}
+    if not shared:
+        return model
+    counters, pending = collections.Counter(), []
+
+    def substitute(layer):
+        if id(layer) not in shared:
+            return layer
+        config = layer.get_config()
+        config['name'] = '{}_untied{}'.format(layer.name, counters[id(layer)])
+        counters[id(layer)] += 1
+        copy = type(layer).from_config(config)
+        pending.append((copy, layer))
+        return copy
+
+    untied = _replay(model, substitute)
+    for copy, layer in pending:
+        weights = layer.get_weights()
+        index = int(copy.name.rsplit('_untied', 1)[1])
+        if jitter and index:
+            weights = [weights[0] * (1.0 + index * jitter)] + weights[1:]
+        copy.set_weights(weights)
+    return untied
+
+
+def batch_norms_to_affine(model):
+    '''
+    Replace every batch norm on a 4-D tensor by the equivalent 1x1
+    depthwise convolution with bias: `y = x * scale + shift` per channel,
+    with `scale = gamma / sqrt(variance + epsilon)` and
+    `shift = beta - mean * scale`.
+
+    Meant for the batch norms that `fold_batch_norms` cannot fold, those
+    that do not follow a convolution (the pre-activation blocks of DDRNet
+    and PIDNet). `tensorflow_model_optimization` cannot wrap a standalone
+    batch norm, so it would stay in floating point in a whole-model QAT
+    export; as a depthwise convolution it is quantized and keeps training
+    as a per-channel scale and shift. Run `fold_batch_norms` first.
+
+    Input
+    ----------
+        model: a flat functional `tf.keras.Model` (see `flatten_model`) in
+               inference state.
+
+    Output
+    ----------
+        A new model computing the same function, or `model` itself when it
+        has no batch norm on a 4-D tensor.
+    '''
+    targets = {id(layer) for layer in model.layers
+               if isinstance(layer, tf.keras.layers.BatchNormalization) and len(layer.input_shape) == 4
+               and layer.axis in ([3], [-1], 3, -1)}
+    if not targets:
+        return model
+    replaced, pending = {}, []
+
+    def substitute(layer):
+        if id(layer) in replaced:
+            return replaced[id(layer)]
+        new = layer
+        if id(layer) in targets:
+            new = tf.keras.layers.DepthwiseConv2D(1, use_bias=True, name=layer.name + '_affine')
+            pending.append((new, layer))
+        replaced[id(layer)] = new
+        return new
+
+    converted = _replay(model, substitute)
+    for new, bn in pending:
+        weights = dict(zip([w.name.rsplit('/', 1)[-1].split(':')[0] for w in bn.weights], bn.get_weights()))
+        variance, mean = weights['moving_variance'], weights['moving_mean']
+        gamma = weights.get('gamma', np.ones_like(mean))
+        beta = weights.get('beta', np.zeros_like(mean))
+        scale = gamma / np.sqrt(variance + bn.epsilon)
+        new.set_weights([scale.reshape(1, 1, -1, 1).astype(np.float32), (beta - mean * scale).astype(np.float32)])
+    return converted
+
+
+_QAT_CONFIG_CLASS = []
+
+
+def _weighted_layer_quantize_config():
+    '''The quantize config used for convolutions and dense layers in
+    whole-model QAT (created on first use: it needs the QAT library).'''
+    if _QAT_CONFIG_CLASS:
+        return _QAT_CONFIG_CLASS[0]
+    import tensorflow_model_optimization as tfmot
+    quantizers = tfmot.quantization.keras.quantizers
+
+    class WeightedLayerQuantizeConfig(tfmot.quantization.keras.QuantizeConfig):
+        '''Fake-quantizes the kernel (symmetric 8 bits, per tensor or per
+        output channel) and the output of the layer after its own
+        activation. Unlike the stock configuration it accepts any built-in
+        activation, ReLU6 included, and always quantizes the weights.'''
+
+        def __init__(self, per_channel=True):
+            self.per_channel = per_channel
+
+        @staticmethod
+        def _attribute(layer):
+            return 'depthwise_kernel' if isinstance(layer, tf.keras.layers.DepthwiseConv2D) else 'kernel'
+
+        def get_weights_and_quantizers(self, layer):
+            # per channel only where the last kernel axis is the output channel
+            per_axis = self.per_channel and type(layer) is tf.keras.layers.Conv2D
+            quantizer = quantizers.LastValueQuantizer(num_bits=8, per_axis=per_axis, symmetric=True, narrow_range=True)
+            return [(getattr(layer, self._attribute(layer)), quantizer)]
+
+        def get_activations_and_quantizers(self, layer):
+            return []
+
+        def set_quantize_weights(self, layer, quantize_weights):
+            setattr(layer, self._attribute(layer), quantize_weights[0])
+
+        def set_quantize_activations(self, layer, quantize_activations):
+            pass
+
+        def get_output_quantizers(self, layer):
+            return [quantizers.MovingAverageQuantizer(num_bits=8, per_axis=False, symmetric=False, narrow_range=False)]
+
+        def get_config(self):
+            return {'per_channel': self.per_channel}
+
+    class OutputOnlyQuantizeConfig(tfmot.quantization.keras.QuantizeConfig):
+        '''Fake-quantizes only the output of a layer without weights that
+        the QAT library has no configuration for (tensor products, the
+        custom gate layers, `Resizing`), so that the converter can
+        quantize the operator instead of leaving it in floating point.'''
+
+        def get_weights_and_quantizers(self, layer):
+            return []
+
+        def get_activations_and_quantizers(self, layer):
+            return []
+
+        def set_quantize_weights(self, layer, quantize_weights):
+            pass
+
+        def set_quantize_activations(self, layer, quantize_activations):
+            pass
+
+        def get_output_quantizers(self, layer):
+            return [quantizers.MovingAverageQuantizer(num_bits=8, per_axis=False, symmetric=False, narrow_range=False)]
+
+        def get_config(self):
+            return {}
+
+    _QAT_CONFIG_CLASS.extend([WeightedLayerQuantizeConfig, OutputOnlyQuantizeConfig])
+    return WeightedLayerQuantizeConfig
+
+
+def _output_only_quantize_config():
+    _weighted_layer_quantize_config()
+    return _QAT_CONFIG_CLASS[1]
+
+
+def qat_scope():
+    '''
+    The custom-object scope needed to load a saved model that was prepared
+    by `prepare_qat`::
+
+        with deploy_utils.qat_scope():
+            model = tf.keras.models.load_model('qat_model.h5')
+    '''
+    import tensorflow_model_optimization as tfmot
+    return tfmot.quantization.keras.quantize_scope(
+        {'WeightedLayerQuantizeConfig': _weighted_layer_quantize_config(),
+         'OutputOnlyQuantizeConfig': _output_only_quantize_config()})
+
+
+def _layer_output_ranges(model, inputs, batch_size):
+    '''`{layer name: (min, max)}` of every layer output over `inputs`.'''
+    names, tensors = [], []
+    for node in _nodes(model):
+        names.append(node.layer.name)
+        tensors.append(tf.nest.flatten(node.outputs)[0])
+    probe = tf.keras.Model(model.inputs, tensors)
+    ranges = {}
+    for start in range(0, len(inputs), batch_size):
+        outputs = probe(inputs[start:start + batch_size], training=False)
+        for name, output in zip(names, outputs):
+            low, high = float(tf.reduce_min(output)), float(tf.reduce_max(output))
+            previous = ranges.get(name, (low, high))
+            ranges[name] = (min(previous[0], low), max(previous[1], high))
+    return ranges
+
+
+def calibrate_qat_ranges(qat_model, float_model, inputs, batch_size=4, min_width=1e-3):
+    '''
+    Set the activation ranges of a model prepared by `prepare_qat` from
+    data, the way post-training calibration does.
+
+    The fake-quantization wrappers start with a range of -6 to 6 and move
+    it slowly while training. Setting it from the float model first means
+    the prepared model starts from the post-training result instead of
+    from an arbitrary range. `prepare_qat` calls this; call it again after
+    changing the weights without training.
+
+    Input
+    ----------
+        qat_model: the model returned by `prepare_qat`.
+        float_model: its float counterpart (`qat_model.float_model`).
+        inputs: float array of calibration inputs, normalized as the model
+                expects.
+        batch_size: batch size of the forward passes.
+        min_width: smallest range given to a tensor. A tensor that is
+                constant on the calibration data (a dead activation, common
+                in untrained models) would otherwise get a zero or
+                near-zero scale, which the LiteRT runtime can refuse.
+
+    Output
+    ----------
+        The number of activation ranges that were set.
+    '''
+    inputs = np.asarray(inputs, dtype=np.float32)
+    # one pass in training mode records the weight ranges (they follow the weights)
+    qat_model(inputs[:batch_size], training=True)
+    ranges = {}
+    for name, (low, high) in _layer_output_ranges(float_model, inputs, batch_size).items():
+        low, high = min(low, 0.0), max(high, 0.0)
+        if high - low < min_width:
+            high = low + min_width
+        ranges[name] = (low, high)
+    count = 0
+    for layer in qat_model.layers:
+        base = layer.name[len('quant_'):] if layer.name.startswith('quant_') else None
+        for variable in layer.weights:
+            tail = variable.name.rsplit('/', 1)[-1]
+            if 'kernel' in tail:
+                continue
+            if tail == 'quantize_layer_min:0':
+                variable.assign(min(float(inputs.min()), 0.0))
+            elif tail == 'quantize_layer_max:0':
+                variable.assign(max(float(inputs.max()), 0.0))
+            elif base in ranges and tail.endswith('min:0'):
+                variable.assign(ranges[base][0])
+                count += 1
+            elif base in ranges and tail.endswith('max:0'):
+                variable.assign(ranges[base][1])
+    return count
+
+
+def prepare_qat(model, calibration_inputs, per_channel=True, equalize=None, batch_size=4):
+    '''
+    Turn a trained model into one that can be fine-tuned with
+    quantization-aware training of the **whole network**, backbone
+    included, on the graph that will be deployed.
+
+    The builders of this library wrap only the head for QAT, and for
+    accelerator profiles those wrappers are stripped at export, so their
+    effect is small (see the deployment guide). Post-training quantization
+    is enough for backbones that quantize well. For those that do not
+    (fused reparameterized backbones, ReLU6 networks per tensor), the
+    remedy is to fine-tune every weight against the quantization it will
+    meet. This function prepares that:
+
+    1. fuse reparameterizable backbones, strip the head's wrappers;
+    2. fold batch norms into their convolutions;
+    3. inline the nested backbone, give every layer that is called more
+       than once (the output convolutions the detection heads share across
+       pyramid levels) one copy per call (`untie_shared_layers`), turn the
+       remaining batch norms into 1x1 depthwise convolutions
+       (`batch_norms_to_affine`), and merge ReLU / ReLU6 layers into the
+       convolutions before them. A shared layer with QAT wrappers is
+       exported with per-channel weights whatever the converter is told;
+       untied, each pyramid level fine-tunes its own copy;
+    4. for per-tensor targets, equalize consecutive layers;
+    5. wrap every layer: convolutions and dense layers get their kernel
+       and output fake-quantized, per channel or per tensor; other layers
+       get the library's default configuration, or an output quantizer
+       when they have none (tensor products, the custom gate layers);
+    6. set the activation ranges from `calibration_inputs`.
+
+    The result starts at about the accuracy of the post-training export.
+    Fine-tune it for a few epochs with a small learning rate (a tenth to a
+    hundredth of the training rate), then convert it with its wrappers:
+    `Quantizer` keeps them for a prepared model, and
+    `convert_to_tflite(prepared, ...)` works directly. Its simulated
+    predictions match those of the exported file closely, which is what
+    makes the fine-tuning meaningful.
+
+    Input
+    ----------
+        model: a trained functional `tf.keras.Model` of this library (QAT
+               wrappers on the head or not).
+        calibration_inputs: float array `(n, H, W, C)` of normalized
+               inputs; a few dozen images.
+        per_channel: weight quantization granularity of the target:
+               `True` for one scale per output channel (ARTPEC-9, CPU),
+               `False` for one per tensor (ARTPEC-8). Depthwise and dense
+               kernels are always quantized per tensor during training.
+        equalize: apply cross-layer equalization before wrapping. `None`
+               does it for per-tensor targets.
+        batch_size: batch size of the calibration passes.
+
+    Output
+    ----------
+        A new model with independent weights (the input model is not
+        modified) and a dynamic batch size. Attributes: `float_model`, the
+        float network it was wrapped from, with identical weights at this
+        point (usable as a distillation teacher); `preprocessing`;
+        `qat_per_channel`, the granularity it was prepared for;
+        `unwrapped_layers`, the names of layers that could not be wrapped
+        (layers with weights the QAT library does not know, batch norms on
+        2-D tensors, and raw `tf` operations such as `x * 2.0`); the
+        converter quantizes the latter post-training when it can, and the
+        lint reports any operator left in floating point.
+
+    To keep fine-tuned weights, `save_weights` and later `load_weights`
+    into a model prepared the same way from the same trained model. To
+    load a whole saved model, wrap the call in `qat_scope()`.
+    '''
+    import tensorflow_model_optimization as tfmot
+    from tensorflow_model_optimization.python.core.quantization.keras.default_8bit import (
+        default_8bit_quantize_registry, default_8bit_quantize_scheme)
+
+    calibration_inputs = np.asarray(calibration_inputs, dtype=np.float32)
+    plain = fold_batch_norms(strip_qat(reparameterize_model(model)))
+    plain = flatten_model(plain)
+    plain = merge_activations(batch_norms_to_affine(untie_shared_layers(plain, jitter=1e-6)))
+
+    # an independent float copy: nothing below may touch the caller's weights
+    try:
+        float_model = tf.keras.models.clone_model(plain)
+    except Exception as error:
+        raise ValueError('prepare_qat cannot copy this model (it contains operations Keras cannot rebuild from '
+                         'their configuration): {}'.format(error))
+    float_model.set_weights(plain.get_weights())
+    if (not per_channel) if equalize is None else equalize:
+        equalize_cross_layer(float_model)
+
+    registry = default_8bit_quantize_registry.Default8BitQuantizeRegistry()
+    config_class = _weighted_layer_quantize_config()
+    output_only = _output_only_quantize_config()
+    weighted = (tf.keras.layers.Conv2D, tf.keras.layers.DepthwiseConv2D, tf.keras.layers.Dense)
+    unwrapped = []
+
+    def annotate(layer):
+        copy = type(layer).from_config(layer.get_config())
+        if isinstance(layer, tf.keras.layers.InputLayer):
+            return copy
+        if type(layer) in weighted:
+            return tfmot.quantization.keras.quantize_annotate_layer(copy, quantize_config=config_class(per_channel))
+        if isinstance(layer, tf.keras.layers.BatchNormalization):
+            unwrapped.append(layer.name)
+            return copy
+        if registry.supports(layer):
+            return tfmot.quantization.keras.quantize_annotate_layer(copy)
+        if type(layer).__name__ in ('TFOpLambda', 'SlicingOpLambda'):
+            # raw `tf` operations: the wrapper cannot infer their output shape
+            unwrapped.append(layer.name)
+            return copy
+        if not layer.weights:
+            return tfmot.quantization.keras.quantize_annotate_layer(copy, quantize_config=output_only())
+        unwrapped.append(layer.name)
+        return copy
+
+    annotated = tf.keras.models.clone_model(float_model, clone_function=annotate)
+    annotated.set_weights(float_model.get_weights())
+    with qat_scope():
+        prepared = tfmot.quantization.keras.quantize_apply(
+            annotated, scheme=default_8bit_quantize_scheme.Default8BitQuantizeScheme(disable_per_axis=not per_channel))
+
+    calibrate_qat_ranges(prepared, float_model, calibration_inputs, batch_size=batch_size)
+    _carry_attributes(model, prepared)
+    if hasattr(model, 'preprocessing'):
+        float_model.preprocessing = model.preprocessing
+    # plain attributes: Keras would otherwise track the float model as a
+    # sub-layer of the prepared one and list its weights as trainable
+    object.__setattr__(prepared, 'float_model', float_model)
+    object.__setattr__(prepared, 'unwrapped_layers', tuple(unwrapped))
+    object.__setattr__(prepared, 'qat_per_channel', bool(per_channel))
+    prepared._sak_qat_prepared = True
+    prepared._sak_reparameterized = True
+    return prepared
+
+
+# ========================= #
 # Inspection of exported models
 
 _WEIGHTED_OPS = ('CONV_2D', 'DEPTHWISE_CONV_2D', 'TRANSPOSE_CONV', 'FULLY_CONNECTED')

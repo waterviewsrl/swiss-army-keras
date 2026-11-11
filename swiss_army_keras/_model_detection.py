@@ -158,6 +158,7 @@ from tensorflow.keras.layers import (
     Conv2D,
     DepthwiseConv2D,
     Layer,
+    Rescaling,
     UpSampling2D,
 )
 from tensorflow.keras.models import Model
@@ -558,7 +559,8 @@ def _fcos_distances(reg_raw, stride, distance_activation, name):
         return tf.exp(reg_raw) * float(stride)
     if distance_activation == 'relu':
         reg_raw = qat_annotate_layer(Activation('relu', name=f'{name}_reg_relu'))(reg_raw)
-        return reg_raw * float(stride)
+        # a layer rather than `* stride`, so that whole-model QAT can wrap it
+        return Rescaling(float(stride), name=f'{name}_stride')(reg_raw)
     raise ValueError(f"Unknown distance_activation '{distance_activation}' - expected 'exp' or 'relu'.")
 
 

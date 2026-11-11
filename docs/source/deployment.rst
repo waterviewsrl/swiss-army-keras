@@ -149,6 +149,10 @@ fused and stripped, ``artpec8`` profile       61           1.4 MB
 QAT wrappers and why they are stripped for accelerators
 *******************************************************
 
+This section is about the wrappers the builders put on the **head**. For
+quantization-aware training of the whole network, see
+:ref:`whole-model-qat` below.
+
 Every head built by this library (except the inherited U-Net family) is
 wrapped for quantization-aware training with
 ``tensorflow_model_optimization``; the backbone is not. Training therefore
@@ -385,10 +389,97 @@ These are feature-level measurements on a small image set, a proxy for task
 accuracy, not a substitute: no trained head was evaluated. Measure your own
 model with ``deploy_utils.quantization_error`` before deploying.
 
+.. _whole-model-qat:
+
+Whole-model quantization-aware training
+***************************************
+
+The head wrappers above cover a small part of the network and are stripped
+for accelerators, so their effect is small. When post-training quantization
+loses too much, fine-tune the **whole** network against the quantization it
+will meet:
+
+.. code-block:: python
+
+   from swiss_army_keras import deploy_utils
+   from swiss_army_keras.quantization_utils import Quantizer
+
+   prepared = deploy_utils.prepare_qat(trained_model, calibration_images, per_channel=False)  # False: ARTPEC-8
+   prepared.compile(optimizer=tf.keras.optimizers.Adam(2e-5), loss=loss, metrics=metrics)
+   prepared.fit(train_set, validation_data=val_set, epochs=3)
+   Quantizer(test_set, prepared, "my_model_qat", profile="artpec8").quantize()   # keeps the wrappers
+
+``prepare_qat`` builds the graph that will be deployed and wraps all of it:
+it fuses reparameterizable backbones, folds batch norms, inlines the nested
+backbone, turns the remaining batch norms into 1x1 depthwise convolutions,
+merges each ReLU or ReLU6 into the convolution before it, gives layers that
+are called more than once their own copy, equalizes for per-tensor targets,
+and fake-quantizes every kernel (per channel or per tensor) and every
+output. Activation ranges start from the calibration images, so the
+prepared model starts at about the accuracy of a post-training export and
+the fine-tuning only has to recover the rest. The input model is not
+modified; ``prepared.float_model`` is its float counterpart, usable as a
+distillation teacher.
+
+The prepared model simulates the exported file closely: across eleven model
+families built with random weights, the mean difference between simulated
+and exported outputs was 0.1% to 5%. After the fine-tune below, simulated
+and exported mIoU agreed to 0.0004. Every family exports with no lint
+error except PIDNet, which keeps two float requantization steps after its
+custom gate layer.
+
+**Measured.** The LR-ASPP on fused MobileOne-S1 from the table above (the
+model that quantizes worst), fine-tuned for five minutes on CPU (about 525
+steps of 8 images at 256 x 256, learning rate 2e-5) on 480 Pets images
+disjoint from the 150 evaluation images. The control fine-tunes the same
+float graph for the same time and is then exported post-training.
+``scripts/measure_qat_finetune.py`` reproduces each row.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 46 27 27
+
+   * - Export, mIoU
+     - Per channel (ARTPEC-9, CPU)
+     - Per tensor (ARTPEC-8)
+   * - Trained model, post-training (best of the strategies above)
+     - 0.522
+     - 0.456
+   * - Float fine-tune, then post-training (with bias correction per tensor)
+     - 0.699 (float 0.728)
+     - 0.676 (float 0.731)
+   * - Whole-model QAT fine-tune
+     - 0.704
+     - 0.713
+
+What this says:
+
+* **Fine-tuning the fused network at all does most of the work** here: the
+  float model gains and quantizes far better. That model had been trained
+  with a frozen backbone, so this partly measures unfreezing it; the
+  checkpoint's training split was not recorded either.
+* **Per tensor, QAT is clearly better** than the same fine-tune followed by
+  post-training export (0.713 against 0.676), and it ends above the
+  per-channel post-training export. With QAT, the fast per-tensor mode of
+  ARTPEC-8 costs this model nothing.
+* **Per channel, QAT and the plain fine-tune are equal** within the
+  run-to-run spread (about 0.01 between two runs of the same setting).
+* A QAT step costs 1.7 times a float step.
+
+These are single runs on one model and 150 images. Use QAT where
+post-training export loses accuracy (fused reparameterized backbones, ReLU6
+networks per tensor, small models); for a backbone that quantizes well,
+such as MobileNetV4-Conv, post-training export is already within 0.02 mIoU
+of float.
+
+The prepared model saves and loads its weights with ``save_weights`` /
+``load_weights`` into a model prepared the same way; to load a whole saved
+model, wrap the call in ``deploy_utils.qat_scope()``.
+
 Building models without QAT wrappers
 ************************************
 
-Given the measurements above, quantization-aware training is optional:
+Given the measurements above, the head wrappers are optional:
 
 .. code-block:: python
 
@@ -691,11 +782,15 @@ them, in depth.
 Known limitations
 *****************
 
-* For accelerator profiles the QAT ranges are discarded at export (see
-  above).
+* For accelerator profiles the ranges of the head wrappers are discarded at
+  export (see above); whole-model QAT (``prepare_qat``) keeps its own.
+* Whole-model QAT: PIDNet keeps two float requantization steps after its
+  custom gate layer; raw ``tf`` operations in a graph (``x * 2.0``, the
+  exponential of the FCOS ``'exp'`` variant) are not wrapped and are
+  quantized post-training; the input model must be one Keras can clone.
 * Post-training quantization of fused MobileOne and RepViT backbones is
-  poor (see the measurements above), and none of the strategies here fixes
-  it; equalization does not cover ReLU6 networks; bias correction uses
+  poor (see the measurements above); none of the post-training strategies
+  fixes it, whole-model QAT does on the one model measured; equalization does not cover ReLU6 networks; bias correction uses
   float activations only.
 * The lint reports a zero quantization scale as an error and a near-zero
   one as a warning. Both mean a tensor was constant during calibration (an

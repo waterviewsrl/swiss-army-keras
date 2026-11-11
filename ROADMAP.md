@@ -42,18 +42,22 @@ Done on 2026-11-10: batch-norm folding and bias correction (default for per-tens
 report (`quantization_debug_report`), QAT made optional (`set_qat`), and the **first task-accuracy measurement**:
 two models trained in September, re-exported in every variant (table in `docs/source/deployment.rst`).
 Per-tensor PP-LiteSeg on MobileNetV4-Conv-S went from 0.741 to 0.808 mIoU, against 0.832 in float.
+Done on 2026-11-11: whole-model quantization-aware training (`prepare_qat`), per channel and per tensor, with a
+measured gain per tensor on fused MobileOne-S1 (ASSESSMENT.md section 15).
 
 Still open, in the order the measurements suggest:
 
 | Item | Effort |
 |---|---|
 | Repeat the task-accuracy measurement on a model trained with a recorded split, and on a classifier; the September runs did not record their split | M |
-| Fused MobileOne and RepViT lose accuracy under every 8-bit export (LR-ASPP on MobileOne-S1: 0.66 float, 0.52 per channel, at most 0.46 per tensor). Candidates: QARepVGG (now in the library, to be trained and measured), QAT of the fused backbone, percentile or MSE activation calibration | L |
+| Fused MobileOne and RepViT: whole-model QAT (`prepare_qat`, 2026-11-11) brought LR-ASPP on MobileOne-S1 to 0.713 mIoU per tensor after a five-minute fine-tune (float 0.731 after the same fine-tune). Open: confirm on a second model and with a recorded split, measure RepViT, train QARepVGG and compare | M |
 | Equalization and bias correction interact badly on the fused MobileOne model (bias correction alone was better); understand why before trusting the default on reparameterized backbones | M |
 | Bias correction with the activations of the partly quantized model, as in the original method | M |
 | Equalization through ReLU6 (per-channel clipping), or a ReLU variant of MobileNetV2 / EfficientNet-Lite with fine-tuning | M |
 | Edge-clean builder switches for the phone-oriented backbones: ReLU6 or ReLU instead of GELU, hard-swish and swish; no squeeze-excite; `'same'` padding | M |
-| Decide whether QAT stays the default: on the one model where it could be compared it added 0.001 mIoU over post-training quantization | S |
+| Decide whether the head QAT wrappers stay the default: they added 0.001 mIoU over post-training quantization; whole-model QAT (`prepare_qat`) is what helps | S |
+| `TrainingDriver` option for a whole-model QAT phase after training (today: `prepare_qat`, then `compile` / `fit` / `Quantizer` by hand) | S |
+| Whole-model QAT for PIDNet: give its custom gate layers a quantization config that matches the fixed sigmoid output scale, removing the two float requantization steps | S |
 
 ## 2b. Depth and out-of-distribution analysis
 

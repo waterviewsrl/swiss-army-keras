@@ -51,11 +51,10 @@ def set_qat(enabled=None):
         The previous state, as a dict that can be passed back:
         `set_qat(**previous)`.
 
-    A per-tensor QAT scheme was tried and is not offered:
-    `tensorflow_model_optimization` drops the weight quantizer of a
-    convolution that is followed by an activation layer when per-axis
-    quantization is disabled, and the converter then quantizes those
-    weights per channel anyway.
+    This switch concerns the wrappers the builders put on the head. To
+    fine-tune the whole network, backbone included, against the
+    quantization it will meet (per channel or per tensor), use
+    `deploy_utils.prepare_qat` on the trained model instead.
     '''
     previous = dict(_QAT_OPTIONS)
     if enabled is not None:

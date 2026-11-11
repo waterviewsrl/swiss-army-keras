@@ -398,3 +398,37 @@ def test_repaired_heads_export_without_their_former_off_list_operators():
     reid = export_ops(reid_embedding_head(inp(), pre_pool_attention=None, activation="relu", **kwargs))
     assert not {"L2_NORMALIZATION", "POW", "MEAN"} & reid
     assert not {"MEAN", "SOFTMAX", "LOGISTIC"} & export_ops(classifier(inp(), 4, activation="relu", **kwargs))
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("build", [
+    lambda inp: lr_aspp(inp, n_labels=N_LABELS, backbone="MobileOne-S0", weights=None, freeze_backbone=False),
+    lambda inp: __import__("swiss_army_keras._model_detection", fromlist=["x"]).gfl_lite_detection_base(
+        inp, n_classes=3, flat_reg=True, backbone="ResNet18", weights=None),
+], ids=["lr_aspp-MobileOne-S0", "gfl_base-ResNet18"])
+def test_whole_model_qat_fine_tunes_and_exports_per_tensor(tmp_path, build):
+    """`prepare_qat` on real library models: a fused reparameterized
+    backbone with a gated head, and a detector whose output convolutions
+    are shared across pyramid levels. One optimizer step, then the
+    `Quantizer` export for ARTPEC-8 must be integer-only with per-tensor
+    weights and match the prepared model's simulation.
+    """
+    from swiss_army_keras import deploy_utils
+    from swiss_army_keras.quantization_utils import Quantizer
+
+    tf.keras.utils.set_random_seed(0)
+    model = build(tf.keras.Input((INPUT_SIZE, INPUT_SIZE, 3)))
+    images = np.random.default_rng(0).random((12, INPUT_SIZE, INPUT_SIZE, 3), dtype=np.float32)
+    prepared = deploy_utils.prepare_qat(model, images[:8], per_channel=False)
+    assert prepared.unwrapped_layers == ()
+
+    targets = [np.zeros((len(images),) + tuple(shape[1:]), "float32") for shape in
+               (prepared.output_shape if isinstance(prepared.output_shape, list) else [prepared.output_shape])]
+    prepared.compile(optimizer=tf.keras.optimizers.Adam(1e-5), loss="mse")
+    prepared.fit(images, targets if len(targets) > 1 else targets[0], batch_size=4, epochs=1, steps_per_epoch=1,
+                 verbose=0)
+
+    dataset = tf.data.Dataset.from_tensor_slices((images, np.zeros((len(images), 1), "float32"))).batch(4)
+    quantizer = Quantizer(dataset, prepared, str(tmp_path / "qat"), append_datetime=False, batches=2, profile="artpec8")
+    quantizer.quantize()
+    assert quantizer.lint_report.errors == [], str(quantizer.lint_report)

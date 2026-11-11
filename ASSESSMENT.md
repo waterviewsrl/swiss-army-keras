@@ -767,3 +767,54 @@ unverified. C2 (pretrained weights) is unchanged and grew: nine new
 backbone entries start from random weights. C3 (legacy Keras 2) has a
 practical exit: with `set_qat(enabled=False)` nothing in a model depends on
 `tensorflow_model_optimization`.
+
+## 15. Follow-up on 2026-11-11: whole-model quantization-aware training
+
+The question was how good QAT support is and whether it can help deploy
+fast and accurate models. Before this pass it wrapped only the heads, and
+the accelerator profiles stripped even that, so its measured effect was
+0.001 mIoU. `deploy_utils.prepare_qat` now prepares a trained model for
+quantization-aware fine-tuning of the whole export graph, per channel or
+per tensor.
+
+**How it was made to work.** Five obstacles in `tensorflow_model_optimization`
+and the converter, each found with a probe and handled in the preparation:
+nested backbones cannot be wrapped (the graph is flattened); a convolution
+followed by a separate activation layer gets no weight quantizer (the
+activation is merged into it); a batch norm that does not follow a
+convolution cannot be wrapped (it becomes a 1x1 depthwise convolution);
+layers without a configuration, such as tensor products and the custom
+gate layers, stay in floating point (they get an output quantizer); a
+wrapped layer called at several pyramid levels is exported per channel
+whatever the converter is told (each call gets its own copy, with a
+one-in-a-million weight offset so the converter does not merge them back).
+Calibrated ranges get a minimum width, because dead activations otherwise
+produce files the runtime refuses.
+
+**Verified.** Eleven model families built with random weights prepare and
+export with no lint error per channel and per tensor, except PIDNet (two
+float requantization steps after its custom gate); simulated and exported
+outputs differ by 0.1% to 5%. Ten new fast tests (`tests/test_qat.py`) and two slow ones on library models. Whole suite: 566 fast and 28 slow tests pass; docs build clean.
+
+**Measured, with a short training run approved for this purpose.** LR-ASPP
+on fused MobileOne-S1, the model that quantizes worst, five minutes of
+fine-tuning on CPU, against a float fine-tune of the same length:
+
+| Export, mIoU | Per channel | Per tensor |
+|---|---|---|
+| Trained model, best post-training | 0.522 | 0.456 |
+| Float fine-tune, then post-training | 0.699 | 0.676 |
+| Whole-model QAT fine-tune | 0.704 | 0.713 |
+
+Per tensor, QAT beats the plain fine-tune by 0.037 and ends above the
+per-channel post-training export, so the fast mode of ARTPEC-8 costs this
+model nothing. Per channel the difference is within the spread between two
+runs (about 0.01). Most of the gain over the original export comes from
+fine-tuning the fused network at all; that model had been trained with a
+frozen backbone. One model, single runs, an unrecorded original split: the
+direction is clear, the sizes are not settled.
+
+**What it means for deployment.** QAT does not make a model faster. It lets
+a fast configuration keep its accuracy: a fused reparameterized backbone,
+which has the fewest operators, and per-tensor weights, which Axis says are
+much faster on ARTPEC-8. Latency on a device is still unmeasured.
