@@ -818,3 +818,59 @@ direction is clear, the sizes are not settled.
 a fast configuration keep its accuracy: a fused reparameterized backbone,
 which has the fewest operators, and per-tensor weights, which Axis says are
 much faster on ARTPEC-8. Latency on a device is still unmeasured.
+
+## 16. Follow-up on 2026-11-12: six small next steps
+
+Six items from the roadmap, none of which needed training.
+
+**The split is recorded.** Every accuracy number so far came from
+checkpoints whose training images are unknown. The data loaders now decide
+the split once, expose it (`loader.split`), and read it from or write it to
+a JSON file (`split_manifest=`); `TrainingDriver(data_loader=...)` writes it
+next to the checkpoint. The seeded order is the same as before. A seed
+alone never pinned the split across machines, because directory listing
+order depends on the file system; the manifest does.
+
+**A QAT phase in `TrainingDriver`.** `qat_epochs=N` reloads the best
+weights, prepares the model for the weight granularity of the export
+profile, fine-tunes it and exports it. Losses given by output name are
+remapped to the renamed outputs, and `export_outputs` still applies.
+
+**Detectors without decoding in the graph.** Full detectors expose their
+convolutional part (`.base_model`); `Quantizer` writes a JSON description of
+the exported outputs (role, pyramid level, scale, zero point), and
+`detection_utils`, which needs NumPy only, decodes boxes and runs NMS on
+the host. On random-weight FCOS and GFL detectors it returns the same
+detections as the graph of the full detector. Not covered: instance
+segmentation. Not measured: its speed on a device.
+
+**PIDNet in whole-model QAT.** The two floating-point steps came from a
+learned range after the sigmoid gate (1/255) meeting the scale the
+converter imposes on a sigmoid (1/256). The gate layer now declares a fixed
+range, and the export is integer-only per channel and per tensor. The
+simulation of PIDNet remains the least exact: simulated and exported
+outputs differ by 7% to 12% with random weights, with or without this
+change, because the operations inside its custom layers are simulated as
+one step.
+
+**Continuous integration.** `.github/workflows/tests.yml` runs the fast
+tests in four parallel chunks and the docs build on push and pull request,
+and the slow tests nightly. It has not run yet; the first run on GitHub
+will show what the runner lacks.
+
+**Roadmap.** Done and duplicated items removed or merged.
+
+**Found on the way.** Five numeric tests failed depending on test order.
+The cause is outside the library: with PyTorch installed (albumentations
+imports it when present), loading it after TensorFlow and before
+TensorFlow's first convolution makes float32 convolutions on this machine
+(TF 2.21, torch 2.14) about a thousand times less exact (relative error
+2e-4 instead of 3e-7). The mechanism was not identified; disabling oneDNN
+does not change it. It is harmless for training, but it affects any exact
+comparison made in a process that imports `dataset_utils`. The test suite
+now loads PyTorch first, which gives exact results in every order.
+
+**Verified.** 572 fast and 35 slow tests pass; the docs build without
+warnings. New tests: split recording (2, slow), the training driver end to
+end with a QAT phase (2, slow), the reference decoder (5 fast, 2 slow), the
+fixed gate range (1 fast, and PIDNet in the slow export test).

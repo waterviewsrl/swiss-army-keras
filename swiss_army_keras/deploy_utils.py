@@ -435,8 +435,8 @@ def strip_qat(model):
 
 def _carry_attributes(source, target):
     '''Copy the attributes this library attaches to its models.'''
-    for attribute in ('preprocessing', 'head_names', 'strides', 'reg_max', 'dropped_output_activations',
-                      '_sak_reparameterized'):
+    for attribute in ('preprocessing', 'head_names', 'strides', 'reg_max', 'detection',
+                      'dropped_output_activations', '_sak_reparameterized'):
         if hasattr(source, attribute):
             setattr(target, attribute, getattr(source, attribute))
     return target
@@ -1641,13 +1641,34 @@ def _weighted_layer_quantize_config():
         def get_config(self):
             return {}
 
-    _QAT_CONFIG_CLASS.extend([WeightedLayerQuantizeConfig, OutputOnlyQuantizeConfig])
+    class FixedRangeOutputQuantizeConfig(OutputOnlyQuantizeConfig):
+        '''For a layer without weights whose output range is fixed by its
+        last operation, such as a gate ending in a sigmoid. A learned
+        range would differ slightly from the scale the converter imposes
+        on that operation (1/256 for a sigmoid), and the converter then
+        inserts a floating-point requantization after it.'''
+
+        def __init__(self, low=0.0, high=255.0 / 256.0):
+            self.low, self.high = float(low), float(high)
+
+        def get_output_quantizers(self, layer):
+            return [quantizers.FixedQuantizer(num_bits=8, init_min=self.low, init_max=self.high, narrow_range=False)]
+
+        def get_config(self):
+            return {'low': self.low, 'high': self.high}
+
+    _QAT_CONFIG_CLASS.extend([WeightedLayerQuantizeConfig, OutputOnlyQuantizeConfig, FixedRangeOutputQuantizeConfig])
     return WeightedLayerQuantizeConfig
 
 
 def _output_only_quantize_config():
     _weighted_layer_quantize_config()
     return _QAT_CONFIG_CLASS[1]
+
+
+def _fixed_range_quantize_config():
+    _weighted_layer_quantize_config()
+    return _QAT_CONFIG_CLASS[2]
 
 
 def qat_scope():
@@ -1661,7 +1682,8 @@ def qat_scope():
     import tensorflow_model_optimization as tfmot
     return tfmot.quantization.keras.quantize_scope(
         {'WeightedLayerQuantizeConfig': _weighted_layer_quantize_config(),
-         'OutputOnlyQuantizeConfig': _output_only_quantize_config()})
+         'OutputOnlyQuantizeConfig': _output_only_quantize_config(),
+         'FixedRangeOutputQuantizeConfig': _fixed_range_quantize_config()})
 
 
 def _layer_output_ranges(model, inputs, batch_size):
@@ -1847,7 +1869,11 @@ def prepare_qat(model, calibration_inputs, per_channel=True, equalize=None, batc
             unwrapped.append(layer.name)
             return copy
         if not layer.weights:
-            return tfmot.quantization.keras.quantize_annotate_layer(copy, quantize_config=output_only())
+            # a layer can declare the fixed range of its output (`qat_output_range`),
+            # as the sigmoid gates of PIDNet do
+            fixed = getattr(layer, 'qat_output_range', None)
+            config = output_only() if fixed is None else _fixed_range_quantize_config()(*fixed)
+            return tfmot.quantization.keras.quantize_annotate_layer(copy, quantize_config=config)
         unwrapped.append(layer.name)
         return copy
 
@@ -1941,6 +1967,72 @@ def tflite_outputs(tflite_model):
             'zero_point': int(zero_point),
         })
     return described
+
+
+def detection_export_spec(model, tflite_model=None):
+    '''
+    Describe the exported file of a base detector for the reference decoder
+    (`swiss_army_keras.detection_utils.decode_detections`): which output
+    of the file is which prediction of which pyramid level, and how to
+    turn its integers into real values.
+
+    The converter does not keep the output order of the Keras model, so
+    the application cannot rely on it; this function matches the outputs
+    by name.
+
+    Input
+    ----------
+        model: the Keras model the file was converted from: a base
+               detector (`fcos_lite_detection_base`,
+               `gfl_lite_detection_base`) or what the export steps made of
+               it (`Quantizer.export_model`, a model from `prepare_qat`).
+        tflite_model: the flatbuffer as `bytes`, or the path of the file.
+               `None` describes the outputs of the Keras model itself
+               (float, in its own order), to check the decoder against
+               `model.predict` on the workstation.
+
+    Output
+    ----------
+        A dict that serializes to JSON: `kind` (`'fcos'` or `'gfl'`),
+        `n_classes`, `strides`, `reg_max` (GFL), `input_size` `[height,
+        width]`, and `outputs`, one entry per output in file order with
+        `position`, `role` (`'cls'`, `'reg'` or `'centerness'`), `level`,
+        `shape`, `dtype`, `scale` and `zero_point`.
+    '''
+    detection = getattr(model, 'detection', None)
+    if not detection:
+        raise ValueError('The model is not a base detector of this library (it has no `detection` attribute). '
+                         'For a full detector, export `model.base_model`.')
+    roles = list(detection['roles'])
+    if len(model.outputs) != len(roles) * len(detection['strides']):
+        raise ValueError('The model has {} outputs; a {} detector with {} levels has {}.'.format(
+            len(model.outputs), detection['kind'], len(detection['strides']), len(roles) * len(detection['strides'])))
+    by_name = {name: (roles[index % len(roles)], index // len(roles))
+               for index, name in enumerate(model.output_names)}
+
+    if tflite_model is None:
+        described = [{'position': position, 'name': name, 'shape': tuple(int(d or 1) for d in tensor.shape),
+                      'dtype': 'float32', 'scale': 0.0, 'zero_point': 0}
+                     for position, (name, tensor) in enumerate(zip(model.output_names, model.outputs))]
+    else:
+        described = tflite_outputs(tflite_model)
+    outputs = []
+    for entry in described:
+        if entry['name'] not in by_name:
+            raise ValueError("Output '{}' of the file is not an output of the model ({}); pass the Keras model the "
+                             'file was converted from.'.format(entry['name'], ', '.join(model.output_names)))
+        role, level = by_name[entry['name']]
+        outputs.append({'position': entry['position'], 'role': role, 'level': level, 'name': entry['name'],
+                        'shape': list(entry['shape']), 'dtype': entry['dtype'], 'scale': entry['scale'],
+                        'zero_point': entry['zero_point']})
+    if len({(o['role'], o['level']) for o in outputs}) != len(by_name):
+        raise ValueError('The file has {} outputs; the model has {}.'.format(len(outputs), len(by_name)))
+
+    spec = {key: value for key, value in detection.items() if key != 'roles'}
+    spec['strides'] = [int(v) for v in spec['strides']]
+    spec['input_size'] = [int(model.inputs[0].shape[1]), int(model.inputs[0].shape[2])]
+    spec['outputs'] = outputs
+    return spec
 
 
 def list_tflite_ops(tflite_model):

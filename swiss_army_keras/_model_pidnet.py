@@ -183,6 +183,11 @@ class ChannelSumSigmoid(Layer):
     (`_backbone_mobilenetv4.py`) already are proper `Layer` subclasses.
     '''
 
+    # The range an 8-bit sigmoid output has in a TFLite file (scale 1/256).
+    # `deploy_utils.prepare_qat` fixes the fake-quantization range of this
+    # layer to it, so that the export has no requantization after the gate.
+    qat_output_range = (0.0, 255.0 / 256.0)
+
     def call(self, inputs):
         x, y = inputs
         return tf.sigmoid(tf.reduce_sum(x * y, axis=-1, keepdims=True))

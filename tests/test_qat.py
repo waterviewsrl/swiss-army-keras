@@ -275,3 +275,43 @@ def test_prepared_weights_round_trip_and_the_quantizer_keeps_the_wrappers(tmp_pa
     quantizer.quantize()
     assert quantizer.lint_report.errors == [], str(quantizer.lint_report)
     assert du.has_qat_layers(quantizer.export_model)
+
+
+class _SumGate(L.Layer):
+    """A gate ending in a sigmoid, like PIDNet's `ChannelSumSigmoid`."""
+
+    qat_output_range = (0.0, 255.0 / 256.0)
+
+    def call(self, inputs):
+        a, b = inputs
+        return tf.sigmoid(tf.reduce_sum(a * b, axis=-1, keepdims=True))
+
+
+def test_a_layer_can_declare_a_fixed_output_range():
+    """A learned range after a sigmoid differs slightly from the scale the
+    converter gives the operator (1/256); in PIDNet that cost two
+    floating-point requantizations (covered by the slow export test). A
+    layer that declares `qat_output_range` gets a fixed range instead."""
+    tf.keras.utils.set_random_seed(0)
+    inp = tf.keras.Input((SIZE, SIZE, 3))
+    a = L.Conv2D(8, 3, padding="same", name="a")(inp)
+    b = L.Conv2D(8, 3, padding="same", name="b")(inp)
+    mask = _SumGate(name="gate")([a, b])
+    out = L.Conv2D(4, 1, name="out")(L.Multiply(name="apply")([a, mask]))
+    model = tf.keras.Model(inp, out)
+
+    inputs = _inputs()
+    with tf.keras.utils.custom_object_scope({"_SumGate": _SumGate}):
+        prepared = du.prepare_qat(model, inputs, per_channel=False)
+        flatbuffer = du.convert_to_tflite(prepared, _representative(inputs), profile="artpec8")
+    assert prepared.unwrapped_layers == ()
+    # a fixed range has no variables to learn, unlike the output range of the product after it
+    assert not [w for w in prepared.get_layer("quant_gate").weights if "min" in w.name or "max" in w.name]
+    assert [w for w in prepared.get_layer("quant_apply").weights if "min" in w.name]
+    assert du.lint_tflite(flatbuffer, profile="artpec8").errors == []
+    _, ops, tensors, _, _ = du._graph(flatbuffer)
+    gate_output = [tensors[op["outputs"][0]] for op in ops if op["op_name"] == "LOGISTIC"][0]
+    assert abs(gate_output["quantization"][0] - 1.0 / 256.0) < 1e-9
+    # and the product reads the gate without a requantization in between
+    consumers = [op["op_name"] for op in ops if gate_output["index"] in op["inputs"]]
+    assert consumers == ["MUL"]

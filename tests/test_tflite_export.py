@@ -405,7 +405,10 @@ def test_repaired_heads_export_without_their_former_off_list_operators():
     lambda inp: lr_aspp(inp, n_labels=N_LABELS, backbone="MobileOne-S0", weights=None, freeze_backbone=False),
     lambda inp: __import__("swiss_army_keras._model_detection", fromlist=["x"]).gfl_lite_detection_base(
         inp, n_classes=3, flat_reg=True, backbone="ResNet18", weights=None),
-], ids=["lr_aspp-MobileOne-S0", "gfl_base-ResNet18"])
+    # its sigmoid gates declare a fixed output range; with a learned one the
+    # export had two floating-point requantizations
+    lambda inp: __import__("swiss_army_keras.models", fromlist=["x"]).pidnet(inp, N_LABELS),
+], ids=["lr_aspp-MobileOne-S0", "gfl_base-ResNet18", "pidnet"])
 def test_whole_model_qat_fine_tunes_and_exports_per_tensor(tmp_path, build):
     """`prepare_qat` on real library models: a fused reparameterized
     backbone with a gated head, and a detector whose output convolutions

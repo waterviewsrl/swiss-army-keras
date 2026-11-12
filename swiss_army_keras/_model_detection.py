@@ -1830,6 +1830,10 @@ def fcos_lite_detection_base(input_tensor, n_classes, feature_levels=(3, 4, 5), 
 
     m.preprocessing = backbone_.preprocessing
     m.strides = strides
+    # what `deploy_utils.detection_export_spec` and the reference decoder
+    # (`detection_utils`) need to know about the outputs
+    m.detection = {'kind': 'fcos', 'n_classes': int(n_classes), 'strides': [int(v) for v in strides],
+                   'roles': ['cls', 'reg', 'centerness']}
 
     return m
 
@@ -1928,6 +1932,9 @@ def fcos_lite_detection(input_tensor, n_classes, feature_levels=(3, 4, 5), fpn_c
 
     m = Model([input_tensor, ], [nms_boxes, nms_scores, nms_classes, valid_detections])
     m.preprocessing = base_model.preprocessing
+    # the convolutional part, sharing its weights: export this one for an
+    # accelerator and decode with `swiss_army_keras.detection_utils`
+    m.base_model = base_model
 
     return m
 
@@ -1999,6 +2006,8 @@ def gfl_lite_detection_base(input_tensor, n_classes, feature_levels=(3, 4, 5), n
     m.preprocessing = backbone_.preprocessing
     m.strides = strides
     m.reg_max = reg_max
+    m.detection = {'kind': 'gfl', 'n_classes': int(n_classes), 'strides': [int(v) for v in strides],
+                   'reg_max': int(reg_max), 'roles': ['cls', 'reg']}
 
     return m
 
@@ -2007,7 +2016,7 @@ def gfl_lite_detection(input_tensor, n_classes, feature_levels=(3, 4, 5), neck_c
                        stem_channels=96, stem_layers=2, reg_max=7, num_extra_levels=0,
                        backbone='MobileNetV2', weights='imagenet', freeze_backbone=True,
                        freeze_batch_norm=True, score_threshold=0.05, iou_threshold=0.5,
-                       max_detections=100, name='gfl_lite'):
+                       max_detections=100, name='gfl_lite', flat_reg=False):
     '''Full GFL-lite detector: `gfl_lite_detection_base` plus
     `gfl_integral_decode` (distribution -> pixel distance), `decode_boxes`,
     and `_nms_dispatch`-based NMS, for inference use - mirrors
@@ -2023,6 +2032,9 @@ def gfl_lite_detection(input_tensor, n_classes, feature_levels=(3, 4, 5), neck_c
     ----------
         (see `gfl_lite_detection_base` for the shared arguments)
         score_threshold, iou_threshold, max_detections: as `fcos_lite_detection`.
+        flat_reg: build the base with 4-D regression outputs
+                  (`gfl_lite_detection_base(flat_reg=True)`), the form to
+                  export `model.base_model` for an accelerator.
 
     Output
     ----------
@@ -2034,7 +2046,7 @@ def gfl_lite_detection(input_tensor, n_classes, feature_levels=(3, 4, 5), neck_c
         input_tensor, n_classes, feature_levels=feature_levels, neck_channels=neck_channels,
         stem_channels=stem_channels, stem_layers=stem_layers, reg_max=reg_max,
         num_extra_levels=num_extra_levels, backbone=backbone, weights=weights,
-        freeze_backbone=freeze_backbone, freeze_batch_norm=freeze_batch_norm, name=name,
+        freeze_backbone=freeze_backbone, freeze_batch_norm=freeze_batch_norm, name=name, flat_reg=flat_reg,
     )
 
     raw_outputs = base_model(input_tensor)
@@ -2071,6 +2083,9 @@ def gfl_lite_detection(input_tensor, n_classes, feature_levels=(3, 4, 5), neck_c
 
     m = Model([input_tensor, ], [nms_boxes, nms_scores, nms_classes, valid_detections])
     m.preprocessing = base_model.preprocessing
+    # the convolutional part, sharing its weights: export this one for an
+    # accelerator and decode with `swiss_army_keras.detection_utils`
+    m.base_model = base_model
 
     return m
 

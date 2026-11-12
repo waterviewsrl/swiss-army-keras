@@ -7,6 +7,9 @@ default run. It is the only test of the data pipeline: it also builds a
 share the worker protocol.
 """
 
+import json
+import os
+
 import numpy as np
 import pytest
 import tensorflow as tf
@@ -17,7 +20,9 @@ pytest.importorskip("IronDomo")
 
 from swiss_army_keras.dataset_utils import (  # noqa: E402
     DepthAlbumentationsDataLoader,
+    ClassificationAlbumentationsDataLoader,
     SegmentationAlbumentationsDataLoader,
+    read_split_manifest,
 )
 
 pytestmark = pytest.mark.slow
@@ -110,3 +115,65 @@ def test_segmentation_loader_still_yields_one_hot_masks(dataset_root):
     assert not _left_is_brighter(images)
     row = masks[0, SIZE // 2, :, 1]
     assert row[:SIZE // 2 - 2].mean() == 0.0 and row[SIZE // 2 + 2:].mean() == 1.0
+
+
+# --- the recorded train / validation / test split ---
+
+
+def test_split_is_recorded_and_reused(dataset_root, tmp_path):
+    manifest_path = str(tmp_path / "runs" / "split.json")
+    options = dict(width=SIZE, height=SIZE, batch_size=2, num_classes=2, train_val_test_split=[0.5, 0.25, 0.25])
+    loader = SegmentationAlbumentationsDataLoader(dataset_root, seed=3, split_manifest=manifest_path, **options)
+    with pytest.raises(RuntimeError):
+        loader.save_split(str(tmp_path / "too_early.json"))
+    loader.build_datasets()
+
+    split = loader.split
+    assert [len(split[name]) for name in ("train", "val", "test")] == [6, 3, 3]
+    everything = split["train"] + split["val"] + split["test"]
+    assert sorted(everything) == [f"images/{i:03d}.png" for i in range(12)]
+    # the same order as the seeded shuffle of the file list that defined the split before it was recorded
+    shuffled = tf.data.Dataset.from_tensor_slices(loader.images).shuffle(12, seed=3, reshuffle_each_iteration=False)
+    assert everything == ["images/" + os.path.basename(p.decode()) for p in shuffled.as_numpy_iterator()]
+
+    manifest = read_split_manifest(manifest_path)
+    assert manifest["seed"] == 3 and manifest["counts"] == {"train": 6, "val": 3, "test": 3}
+    assert {name: manifest[name] for name in ("train", "val", "test")} == split
+
+    # another seed and other fractions: the manifest wins
+    again = SegmentationAlbumentationsDataLoader(
+        dataset_root, seed=99, split_manifest=manifest_path, width=SIZE, height=SIZE, batch_size=1, num_classes=2)
+    train, val, test = again.build_datasets()
+    assert again.split == split
+    assert sum(1 for _ in test) == 3 and sum(1 for _ in val) == 3
+
+    # a manifest that names a file the dataset does not have is refused
+    manifest["test"][0] = "images/not_there.png"
+    broken = str(tmp_path / "broken.json")
+    with open(broken, "w") as f:
+        json.dump(manifest, f)
+    again.split_manifest = broken
+    with pytest.raises(FileNotFoundError):
+        again.build_datasets()
+
+
+def test_classification_split_is_recorded(tmp_path):
+    root = tmp_path / "classes"
+    for label, value in (("bright", 220), ("dark", 30)):
+        (root / label).mkdir(parents=True)
+        for i in range(6):
+            cv2.imwrite(str(root / label / f"{i}.png"), np.full((40, 40, 3), value, np.uint8))
+    manifest_path = str(tmp_path / "class_split.json")
+    options = dict(width=32, height=32, batch_size=2, train_val_test_split=[0.5, 0.25, 0.25])
+    loader = ClassificationAlbumentationsDataLoader(str(root), seed=1, split_manifest=manifest_path, **options)
+    loader.build_datasets()
+    assert sorted(loader.split["train"] + loader.split["val"] + loader.split["test"]) == sorted(
+        f"{label}/{i}.png" for label in ("bright", "dark") for i in range(6))
+
+    again = ClassificationAlbumentationsDataLoader(str(root), seed=7, split_manifest=manifest_path, **options)
+    _, _, test = again.build_datasets()
+    assert again.split == loader.split
+    # labels still follow the files: bright images are class 0
+    for images, labels in test:
+        for image, label in zip(images.numpy(), labels.numpy()):
+            assert int(np.argmax(label)) == (0 if image.mean() > 0.5 else 1)

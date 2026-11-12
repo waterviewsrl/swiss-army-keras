@@ -40,6 +40,8 @@ from PIL import Image
 
 import time
 
+import json
+
 # helper function for data visualization
 
 
@@ -190,7 +192,101 @@ class WorkerProcess(Process):
         self.worker.loop()
 
 
-class SegmentationAlbumentationsDataLoader:
+# ========================= #
+# Train / validation / test split, and its record on disk
+
+SPLIT_MANIFEST_VERSION = 1
+_SPLIT_NAMES = ('train', 'val', 'test')
+
+
+def read_split_manifest(path):
+    '''Read a split manifest written by a data loader (`save_split`, or the
+    `split_manifest` argument).
+
+    Output
+    ----------
+        A dict with `version`, `seed`, `counts`, and under `train`, `val`
+        and `test` the image files of each set, as paths relative to the
+        dataset root with `/` separators.
+    '''
+    with open(path, encoding='utf-8') as f:
+        manifest = json.load(f)
+    if manifest.get('version') != SPLIT_MANIFEST_VERSION:
+        raise ValueError(f"{path}: unsupported split manifest version {manifest.get('version')!r}.")
+    for name in _SPLIT_NAMES:
+        if not isinstance(manifest.get(name), list):
+            raise ValueError(f"{path}: not a split manifest (no '{name}' list).")
+    return manifest
+
+
+class _RecordedSplit:
+    '''What the data loaders share to decide, record and reuse the
+    train / validation / test split.
+
+    The split is decided once, in `build_datasets()`: from the manifest
+    file if `split_manifest` names an existing one, otherwise by a shuffle
+    of the file list seeded with `seed`. It is then available as
+    `self.split`, and written to `split_manifest` if that file did not
+    exist. A seed alone does not pin the split across machines (the order
+    in which a directory is listed depends on the file system) or after
+    files were added; the manifest does.
+    '''
+
+    split = None
+
+    def _relative(self, path):
+        return os.path.relpath(path, self._split_root).replace(os.sep, '/')
+
+    def _split_indices(self, files):
+        '''Indices into `files` for each of train, val and test.'''
+        keys = [self._relative(f) for f in files]
+        manifest_path = getattr(self, 'split_manifest', None)
+        if manifest_path is not None and os.path.exists(manifest_path):
+            manifest = read_split_manifest(manifest_path)
+            position = {key: index for index, key in enumerate(keys)}
+            listed = [key for name in _SPLIT_NAMES for key in manifest[name]]
+            if len(set(listed)) != len(listed):
+                raise ValueError(f'{manifest_path}: a file is listed more than once.')
+            missing = [key for key in listed if key not in position]
+            if missing:
+                raise FileNotFoundError(
+                    f'{manifest_path} lists {len(missing)} file(s) that are not in the dataset, e.g. {missing[0]}.')
+            unlisted = len(keys) - len(listed)
+            if unlisted:
+                logging.warning('%d file(s) of the dataset are not in %s and are not used.', unlisted, manifest_path)
+            indices = {name: [position[key] for key in manifest[name]] for name in _SPLIT_NAMES}
+        else:
+            # the same seeded shuffle the loaders have always used, made
+            # once here so that the three sets are known file by file
+            order = [int(i) for i in tf.data.Dataset.range(len(keys)).shuffle(
+                max(len(keys), 1), seed=self.seed, reshuffle_each_iteration=False).as_numpy_iterator()]
+            n_train, n_val = self.train_val_test_split[0], self.train_val_test_split[1]
+            indices = {'train': order[:n_train], 'val': order[n_train:n_train + n_val],
+                       'test': order[n_train + n_val:]}
+        self.split = {name: [keys[i] for i in indices[name]] for name in _SPLIT_NAMES}
+        if manifest_path is not None and not os.path.exists(manifest_path):
+            self.save_split(manifest_path)
+        return indices
+
+    def save_split(self, path):
+        '''Write the split to a JSON file: which image files are in the
+        training, validation and test sets. Pass the file back as
+        `split_manifest` to get the same three sets again, on any machine.
+        Call it after `build_datasets()`.
+        '''
+        if self.split is None:
+            raise RuntimeError('The split is decided by build_datasets(); call it first.')
+        manifest = {'version': SPLIT_MANIFEST_VERSION, 'seed': self.seed,
+                    'counts': {name: len(self.split[name]) for name in _SPLIT_NAMES}}
+        manifest.update({name: list(self.split[name]) for name in _SPLIT_NAMES})
+        if os.path.dirname(path):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(manifest, f, indent=1)
+        return path
+
+
+class SegmentationAlbumentationsDataLoader(_RecordedSplit):
 
     '''`tf.data` input pipeline for semantic segmentation with albumentations
     augmentation.
@@ -244,6 +340,13 @@ class SegmentationAlbumentationsDataLoader:
         seed: seed of the one-off shuffle that defines the train/val/test
               split. `None` gives a different split in every process; pass
               an int for a reproducible split.
+        split_manifest: path of a JSON file recording which images are in
+              each set. If the file exists, the split is read from it and
+              `seed` and `train_val_test_split` are ignored; if it does not,
+              the split is written to it by `build_datasets()`. Use it to
+              evaluate a model later on images it was not trained on. The
+              split is also available as `loader.split` and can be written
+              with `loader.save_split(path)`.
     '''
     # Type of the label array exchanged with the augmentation workers, the
     # worker mode, and the extension of the label files. Subclasses with
@@ -253,8 +356,10 @@ class SegmentationAlbumentationsDataLoader:
     _worker_mode = 'segmentation'
     _label_extension = 'png'
 
-    def __init__(self, dataset_path, precache=False, train_augmentations=None, val_augmentations=None, test_augmentations=None, images_dir='images', masks_dir='annotations', resize=True, width=512, height=512, batch_size=16, num_classes=2, mask_downsample=1, train_val_test_split=[0.8, 0.1, 0.1], buffer_size=4, label_shift=0, normalization=(0, 1), dinamic_range=255, ignore_errors=False, seed=None):
+    def __init__(self, dataset_path, precache=False, train_augmentations=None, val_augmentations=None, test_augmentations=None, images_dir='images', masks_dir='annotations', resize=True, width=512, height=512, batch_size=16, num_classes=2, mask_downsample=1, train_val_test_split=[0.8, 0.1, 0.1], buffer_size=4, label_shift=0, normalization=(0, 1), dinamic_range=255, ignore_errors=False, seed=None, split_manifest=None):
 
+        self._split_root = dataset_path
+        self.split_manifest = split_manifest
         self.ids = os.listdir(os.path.join(dataset_path, images_dir))
         self.num_classes = num_classes
         # self.mask_ids = os.listdir(masks_dir)
@@ -645,16 +750,14 @@ class SegmentationAlbumentationsDataLoader:
             (train_dataset, val_dataset, test_dataset); also stored in
             `self.datasets['train' | 'val' | 'test']`.
         '''
-        dataset = tf.data.Dataset.from_tensor_slices(
-            (self.images, self.labels)
-        )
-        dataset = dataset.shuffle(
-            len(self.images), seed=self.seed, reshuffle_each_iteration=False)
-        train_dataset = dataset.take(self.train_val_test_split[0])
-        val_dataset = dataset.skip(self.train_val_test_split[0]).take(
-            self.train_val_test_split[1])
-        test_dataset = dataset.skip(self.train_val_test_split[0]).skip(
-            self.train_val_test_split[1])
+        indices = self._split_indices(self.images)
+
+        def subset(name):
+            return tf.data.Dataset.from_tensor_slices(
+                (tf.constant([self.images[i] for i in indices[name]], dtype=tf.string),
+                 tf.constant([self.labels[i] for i in indices[name]], dtype=tf.string)))
+
+        train_dataset, val_dataset, test_dataset = subset('train'), subset('val'), subset('test')
 
         train_dataset = self.prepare_dataset(train_dataset, 'train')
         val_dataset = self.prepare_dataset(val_dataset, 'val')
@@ -788,12 +891,14 @@ class DepthAlbumentationsDataLoader(SegmentationAlbumentationsDataLoader):
         ignore_errors: skip files that fail to decode instead of raising.
         seed: seed of the one-off shuffle that defines the train/val/test
               split.
+        split_manifest: file recording the split, as for
+              `SegmentationAlbumentationsDataLoader`.
     '''
 
     _mask_dtype = np.float32
     _worker_mode = 'depth'
 
-    def __init__(self, dataset_path, precache=False, train_augmentations=None, val_augmentations=None, test_augmentations=None, images_dir='images', depths_dir='depth', depth_extension='png', depth_divisor=256.0, min_depth=1e-3, max_depth=80.0, target='depth', width=512, height=512, batch_size=16, depth_downsample=1, train_val_test_split=[0.8, 0.1, 0.1], buffer_size=4, normalization=(0, 1), dinamic_range=255, ignore_errors=False, seed=None):
+    def __init__(self, dataset_path, precache=False, train_augmentations=None, val_augmentations=None, test_augmentations=None, images_dir='images', depths_dir='depth', depth_extension='png', depth_divisor=256.0, min_depth=1e-3, max_depth=80.0, target='depth', width=512, height=512, batch_size=16, depth_downsample=1, train_val_test_split=[0.8, 0.1, 0.1], buffer_size=4, normalization=(0, 1), dinamic_range=255, ignore_errors=False, seed=None, split_manifest=None):
 
         if target not in ('depth', 'normalized', 'inverse'):
             raise ValueError(f"Unknown target '{target}' - expected 'depth', 'normalized' or 'inverse'.")
@@ -815,7 +920,7 @@ class DepthAlbumentationsDataLoader(SegmentationAlbumentationsDataLoader):
             batch_size=batch_size, num_classes=1, mask_downsample=depth_downsample,
             train_val_test_split=train_val_test_split, buffer_size=buffer_size,
             normalization=normalization, dinamic_range=dinamic_range,
-            ignore_errors=ignore_errors, seed=seed)
+            ignore_errors=ignore_errors, seed=seed, split_manifest=split_manifest)
 
     def get_class_weights(self):
         raise NotImplementedError('Depth targets have no classes.')
@@ -905,7 +1010,7 @@ class DepthAlbumentationsDataLoader(SegmentationAlbumentationsDataLoader):
             )
 
 
-class ClassificationAlbumentationsDataLoader:
+class ClassificationAlbumentationsDataLoader(_RecordedSplit):
 
     '''`tf.data` input pipeline for image classification with albumentations
     augmentation.
@@ -942,10 +1047,14 @@ class ClassificationAlbumentationsDataLoader:
         ignore_errors: skip files that fail to decode instead of raising.
         seed: seed of the split shuffle; `None` for a different split in
               every process.
+        split_manifest: file recording the split, as for
+              `SegmentationAlbumentationsDataLoader`.
     '''
-    def __init__(self, dataset_path, precache=False, train_augmentations=None, val_augmentations=None, test_augmentations=None, resize=True, width=512, height=512, batch_size=16, train_val_test_split=[0.8, 0.1, 0.1], buffer_size=4, normalization=(0, 1), dinamic_range=255, ignore_errors=False, seed=None):
+    def __init__(self, dataset_path, precache=False, train_augmentations=None, val_augmentations=None, test_augmentations=None, resize=True, width=512, height=512, batch_size=16, train_val_test_split=[0.8, 0.1, 0.1], buffer_size=4, normalization=(0, 1), dinamic_range=255, ignore_errors=False, seed=None, split_manifest=None):
 
         self.data_root = pathlib.Path(dataset_path)
+        self._split_root = dataset_path
+        self.split_manifest = split_manifest
 
         self.path_parts = len(dataset_path.split(os.sep))
 
@@ -961,6 +1070,7 @@ class ClassificationAlbumentationsDataLoader:
                 for f in fnames:
                     filelist.append(os.path.join(dirpath, f))
 
+        self.files = filelist
         self.files_ds = tf.data.Dataset.from_tensor_slices(filelist)
 
         self.classes_map = {}
@@ -1352,15 +1462,13 @@ class ClassificationAlbumentationsDataLoader:
             #lbl = tf.strings.split(file_path, os.sep)[-2]
             return file_path, lbl
 
-        dataset = dataset.map(process_path)
+        indices = self._split_indices(self.files)
 
-        dataset = dataset.shuffle(
-            len(self.files_ds), seed=self.seed, reshuffle_each_iteration=False)
-        train_dataset = dataset.take(self.train_val_test_split[0])
-        val_dataset = dataset.skip(self.train_val_test_split[0]).take(
-            self.train_val_test_split[1])
-        test_dataset = dataset.skip(self.train_val_test_split[0]).skip(
-            self.train_val_test_split[1])
+        def subset(name):
+            return tf.data.Dataset.from_tensor_slices(
+                tf.constant([self.files[i] for i in indices[name]], dtype=tf.string)).map(process_path)
+
+        train_dataset, val_dataset, test_dataset = subset('train'), subset('val'), subset('test')
 
         train_dataset = self.prepare_dataset(train_dataset, 'train')
         val_dataset = self.prepare_dataset(val_dataset, 'val')

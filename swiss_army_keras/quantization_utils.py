@@ -4,6 +4,7 @@ TFLite files, checks the result, and can visualize its predictions. The
 building blocks live in `deploy_utils`.
 '''
 import itertools
+import json
 
 import tensorflow as tf
 import numpy as np
@@ -95,6 +96,13 @@ class Quantizer():
     After converting, the flatbuffer is checked against the profile
     (`deploy_utils.lint_tflite`); the report is logged and kept in
     `self.lint_report`.
+
+    For a base detector (`fcos_lite_detection_base`,
+    `gfl_lite_detection_base`, or the `.base_model` of a full detector) a
+    third file, `<name>_quant_ui8_detection.json`, describes the outputs
+    of the integer file for the reference decoder that runs on the host
+    (`swiss_army_keras.detection_utils.decode_detections`); the same
+    description is kept in `self.detection_spec`.
 
     Input
     ----------
@@ -207,6 +215,8 @@ class Quantizer():
         self.lint_report = None
         self.tflite_int_path = None
         self.tflite_f16_path = None
+        self.detection_spec = None
+        self.detection_spec_path = None
 
     def _prepare_export_model(self):
         '''Load weights, then fuse and strip the model as configured.'''
@@ -317,6 +327,16 @@ class Quantizer():
             if self.strict:
                 raise RuntimeError('Exported model does not match profile \'{}\':\n{}'.format(
                     self.profile.name, self.lint_report))
+
+        # a base detector: describe its outputs for the reference decoder
+        # (`detection_utils.decode_detections`), which runs on the host
+        self.detection_spec = None
+        self.detection_spec_path = None
+        if getattr(self.export_model, 'detection', None):
+            self.detection_spec = deploy_utils.detection_export_spec(self.export_model, self.tflite_ui8_model)
+            self.detection_spec_path = f'{self.name}quant_{suffix}_detection.json'
+            with open(self.detection_spec_path, 'w', encoding='utf-8') as f:
+                json.dump(self.detection_spec, f, indent=1)
 
         self.tflite_f16_model = deploy_utils.convert_to_tflite(self.export_model, float16=True)
         self.tflite_f16_path = f'{self.name}quant_f16.tflite'

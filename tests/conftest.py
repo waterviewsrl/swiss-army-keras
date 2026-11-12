@@ -14,3 +14,15 @@ import order.
 import os
 
 os.environ.setdefault("TF_USE_LEGACY_KERAS", "1")
+
+# When PyTorch is installed (albumentations imports it if it is there) and
+# gets loaded after TensorFlow but before TensorFlow's first convolution,
+# float32 convolutions on this stack (TF 2.21, torch 2.14) come out with a
+# relative error of about 2e-4 instead of 3e-7. That is harmless for
+# training, but it made five tests with tight tolerances depend on whether
+# a test file importing `dataset_utils` had been collected first. Loading
+# PyTorch first gives the exact results in every order.
+try:
+    import torch  # noqa: F401
+except ImportError:
+    pass

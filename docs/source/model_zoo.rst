@@ -414,8 +414,11 @@ Auxiliary utilities
        ``fold_batch_norms``, ``equalize_cross_layer``, ``correct_bias``,
        ``convert_to_tflite``, ``lint_tflite``, ``tflite_outputs``,
        ``quantization_error``, ``quantization_debug_report``, and
-       ``prepare_qat`` for whole-model quantization-aware training (see
-       :doc:`deployment`).
+       ``prepare_qat`` for whole-model quantization-aware training, and
+       ``detection_export_spec`` (see :doc:`deployment`).
+   * - ``detection_utils``
+     - NumPy-only reference decoder (box decoding and NMS) for detectors
+       exported without them; runs on the host next to an accelerator.
    * - ``reparam_utils`` and ``reparameterize_*``
      - The per-family fusion functions and kernel arithmetic that
        ``deploy_utils.reparameterize_model`` builds on.

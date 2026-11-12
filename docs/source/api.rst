@@ -138,6 +138,9 @@ Export and inference
 .. automodule:: swiss_army_keras.inference_utils
    :members:
 
+.. automodule:: swiss_army_keras.detection_utils
+   :members:
+
 Out-of-distribution and image-quality utilities
 -----------------------------------------------
 

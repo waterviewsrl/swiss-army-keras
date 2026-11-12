@@ -409,6 +409,18 @@ will meet:
    prepared.fit(train_set, validation_data=val_set, epochs=3)
    Quantizer(test_set, prepared, "my_model_qat", profile="artpec8").quantize()   # keeps the wrappers
 
+``TrainingDriver`` runs the same steps after its float phases when
+``qat_epochs`` is set, and exports the fine-tuned model:
+
+.. code-block:: python
+
+   TrainingDriver(model, "my_model", optimizer, loss, metrics, train_set, val_set, test_set,
+                  epochs=30, export_profile="artpec8",
+                  qat_epochs=3, qat_learning_rate=2e-5).run()
+
+The float model stays in ``driver.model`` and the fine-tuned one is
+``driver.qat_model``.
+
 ``prepare_qat`` builds the graph that will be deployed and wraps all of it:
 it fuses reparameterizable backbones, folds batch norms, inlines the nested
 backbone, turns the remaining batch norms into 1x1 depthwise convolutions,
@@ -425,8 +437,14 @@ The prepared model simulates the exported file closely: across eleven model
 families built with random weights, the mean difference between simulated
 and exported outputs was 0.1% to 5%. After the fine-tune below, simulated
 and exported mIoU agreed to 0.0004. Every family exports with no lint
-error except PIDNet, which keeps two float requantization steps after its
-custom gate layer.
+error. PIDNet needed one more step: the range of its sigmoid gate layer is
+fixed to the scale the converter gives a sigmoid (1/256) instead of being
+learned, because the small difference between the two cost a
+floating-point requantization after each gate. A custom layer declares
+such a range with a ``qat_output_range`` class attribute. PIDNet's
+simulation is also the least exact of the families (7% to 12% with random
+weights), because the operations inside its gate and blend layers are not
+simulated one by one.
 
 **Measured.** The LR-ASPP on fused MobileOne-S1 from the table above (the
 model that quantizes worst), fine-tuned for five minutes on CPU (about 525
@@ -563,7 +581,7 @@ themselves are unverified on a device):
 Not in this list: PIDNet and PP-MobileSeg (gates and attention in the
 network), ``lr_aspp`` and ``pp_liteseg`` with their default gates, and the
 full detectors, whose box decoding and NMS run on the host: export the
-``*_base`` models and decode in the application.
+``*_base`` models and decode in the application (:ref:`detector-decoding`).
 
 Fixed batch size
 ****************
@@ -618,6 +636,49 @@ position:
    # {'position': 2, 'name': 'seg',   'shape': (1, 384, 384, 4), 'dtype': 'uint8', 'scale': ..., 'zero_point': ...}
 
 The real value of a stored value ``q`` is ``scale * (q - zero_point)``.
+
+.. _detector-decoding:
+
+Detectors: decoding on the host
+*******************************
+
+The full detectors (``fcos_lite_detection``, ``gfl_lite_detection``) decode
+boxes and run NMS inside the graph, with operators an accelerator does not
+run. For an accelerator, export the convolutional part only, and let the
+application decode. The convolutional part is the ``*_base`` model, also
+available as ``.base_model`` of a full detector (it shares its weights):
+
+.. code-block:: python
+
+   detector = gfl_lite_detection(inputs, n_classes, backbone="ResNet18", flat_reg=True)
+   # ... train detector.base_model, then:
+   quantizer = Quantizer(test_set, detector.base_model, "detector", profile="artpec8")
+   quantizer.quantize()
+   # detector_..._quant_ui8.tflite and detector_..._quant_ui8_detection.json
+
+The JSON file (also ``quantizer.detection_spec``) says which output of the
+file is which prediction of which pyramid level, with its scale and zero
+point, the strides and the input size. ``swiss_army_keras.detection_utils``
+decodes with it. The module needs NumPy only and does not import
+TensorFlow, so it can be copied to the device:
+
+.. code-block:: python
+
+   from swiss_army_keras import detection_utils
+
+   spec = detection_utils.load_detection_spec("detector_quant_ui8_detection.json")
+   # raw_outputs: the output tensors of one frame, in the order the runtime returns them
+   detections = detection_utils.decode_detections(raw_outputs, spec, score_threshold=0.3, iou_threshold=0.5)
+   detections["boxes"]     # (n, 4): x_min, y_min, x_max, y_max in input pixels
+   detections["scores"]    # (n,)
+   detections["classes"]   # (n,)
+
+The decoder gives the same detections as the graph of the full detector
+(the tests compare the two). Build the base for an accelerator with
+``distance_activation='relu'`` (FCOS) or ``flat_reg=True`` (GFL), which
+keep the exported graph on the operator lists.
+``deploy_utils.detection_export_spec(model)`` without a file describes the
+float outputs of a Keras model, to try the decoder on ``model.predict``.
 
 Out-of-distribution scores on a device
 **************************************
@@ -784,10 +845,11 @@ Known limitations
 
 * For accelerator profiles the ranges of the head wrappers are discarded at
   export (see above); whole-model QAT (``prepare_qat``) keeps its own.
-* Whole-model QAT: PIDNet keeps two float requantization steps after its
-  custom gate layer; raw ``tf`` operations in a graph (``x * 2.0``, the
+* Whole-model QAT: raw ``tf`` operations in a graph (``x * 2.0``, the
   exponential of the FCOS ``'exp'`` variant) are not wrapped and are
-  quantized post-training; the input model must be one Keras can clone.
+  quantized post-training; the operations inside custom layers (the gates
+  of PIDNet) are not simulated one by one; the input model must be one
+  Keras can clone.
 * Post-training quantization of fused MobileOne and RepViT backbones is
   poor (see the measurements above); none of the post-training strategies
   fixes it, whole-model QAT does on the one model measured; equalization does not cover ReLU6 networks; bias correction uses
@@ -805,8 +867,10 @@ Known limitations
   target (in ``multi_task``: ``dict(type='iqa', pooling='avg')``).
 * The lint checks only part of the published per-operator constraints (for
   example not the pooling window limits of ARTPEC-9).
-* The detectors run box decoding and NMS inside the graph; on an accelerator
-  it is usually better to export the ``*_base`` model and decode on the CPU.
+* The full detectors run box decoding and NMS inside the graph. For an
+  accelerator, export the base model and decode on the CPU (see
+  :ref:`detector-decoding`). The reference decoder covers the FCOS and GFL
+  detectors, not instance segmentation, and has not been timed on a device.
 * ``tf.lite.Interpreter`` is deprecated upstream in favour of the LiteRT
   package (``ai_edge_litert``); the library still uses the TensorFlow one.
 * An untrained QAT-wrapped model can output exact zeros. The output

@@ -5,12 +5,16 @@ import os
 import datetime
 from matplotlib import pyplot as plt
 
+import itertools
+
+import numpy as np
 import tensorflow as tf
 
 import logging
 
 from swiss_army_keras.utils import unfreeze_model
 from swiss_army_keras.quantization_utils import Quantizer
+from swiss_army_keras import deploy_utils
 
 from tensorflow.python.util.tf_export import keras_export
 
@@ -156,7 +160,17 @@ class TrainingDriver():
        fitted for `unfreezed_epochs` more epochs with the same optimizer
        instance (so the same learning rate, unless a schedule or callback
        changes it).
-    3. **Export**: the best weights checkpoint is reloaded and `Quantizer`
+    3. **Whole-model QAT phase** (only when `qat_epochs > 0`): the best
+       weights are reloaded, the model is prepared with
+       `deploy_utils.prepare_qat` for the weight granularity of
+       `export_profile` (ranges calibrated on training batches), and
+       fine-tuned for `qat_epochs` epochs with a small learning rate. The
+       float model stays in `self.model`; the fine-tuned one is
+       `self.qat_model`, and it is the one exported. Use it for a backbone
+       that loses accuracy at export, above all with a per-tensor profile
+       (see the deployment guide). An epoch costs about 1.7 times a float
+       epoch.
+    4. **Export**: the best weights checkpoint is reloaded and `Quantizer`
        writes `<quantizer_name>_quant_ui8.tflite` (full integer, uint8
        input/output) and `<quantizer_name>_quant_f16.tflite` (float16).
 
@@ -217,8 +231,21 @@ class TrainingDriver():
               files (`Quantizer(outputs=...)`); None exports all of them.
         export_options: a dict of further `Quantizer` arguments, e.g.
               `dict(bias_correction=False, strict=True)`.
+        qat_epochs: epochs of whole-model quantization-aware fine-tuning
+              before the export; 0 (default) skips the phase.
+        qat_learning_rate: learning rate of that phase (Adam). A tenth to
+              a hundredth of the training rate is the usual range.
+        qat_optimizer: an optimizer instance to use instead of
+              `Adam(qat_learning_rate)`.
+        qat_calibration_batches: number of `train_set` batches used to set
+              the activation ranges before the fine-tuning starts.
+        data_loader: the data loader the three sets come from. When given,
+              `run()` writes which images are in each set to
+              `<checkpoint_name>_split.json` (`self.split_manifest_name`),
+              so that the trained model can later be evaluated on images
+              it did not see (`split_manifest=` of the loaders).
     '''
-    def __init__(self, model, model_name, optimizer, loss, metrics, train_set, val_set, test_set, epochs, patience=20, unfreezed_epochs=-1, callbacks=(), quant_batches=1, plot_metrics=True, metrics_name=None, checkpoint_name=None, quantizer_name=None, export_profile='default', reparameterize=True, strip_qat=None, equalize=None, drop_output_activations=False, loss_weights=None, export_outputs=None, export_options=None):
+    def __init__(self, model, model_name, optimizer, loss, metrics, train_set, val_set, test_set, epochs, patience=20, unfreezed_epochs=-1, callbacks=(), quant_batches=1, plot_metrics=True, metrics_name=None, checkpoint_name=None, quantizer_name=None, export_profile='default', reparameterize=True, strip_qat=None, equalize=None, drop_output_activations=False, loss_weights=None, export_outputs=None, export_options=None, qat_epochs=0, qat_learning_rate=1e-5, qat_optimizer=None, qat_calibration_batches=4, data_loader=None):
         self.model = model
         self.model_name = model_name
         self.optimizer = optimizer
@@ -238,6 +265,14 @@ class TrainingDriver():
         self.loss_weights = loss_weights
         self.export_outputs = export_outputs
         self.export_options = dict(export_options or {})
+        self.qat_epochs = qat_epochs
+        self.qat_learning_rate = qat_learning_rate
+        self.qat_optimizer = qat_optimizer
+        self.qat_calibration_batches = qat_calibration_batches
+        self.data_loader = data_loader
+        self.qat_model = None
+        self.qat_history = None
+        self.user_callbacks = list(callbacks)
         self.plot_metrics = plot_metrics
 
         self.patience = patience
@@ -254,6 +289,9 @@ class TrainingDriver():
         self.weights_checkpoint_name = checkpoint_name + '.weights' if checkpoint_name is not None else model_name + \
             self.datestr + '.weights'
         self.quantizer_name = quantizer_name if quantizer_name is not None else model_name + self.datestr
+        prefix = checkpoint_name if checkpoint_name is not None else model_name + self.datestr
+        self.qat_weights_checkpoint_name = prefix + '_qat.weights'
+        self.split_manifest_name = prefix + '_split.json'
 
         self.callbacks.append(
             tf.keras.callbacks.TensorBoard(
@@ -286,6 +324,10 @@ class TrainingDriver():
         (see the class docstring). Blocking; returns nothing. The trained model
         is available afterwards as `self.model`.
         '''
+        if self.data_loader is not None:
+            self.data_loader.save_split(self.split_manifest_name)
+            logging.warning('Split written to %s', self.split_manifest_name)
+
         self.model.compile(loss=self.loss,
                            loss_weights=self.loss_weights,
                            optimizer=self.optimizer,
@@ -382,13 +424,18 @@ class TrainingDriver():
                 except Exception as e:
                     logging.error(e)
 
+        export_model, export_checkpoint = self.model, self.weights_checkpoint_name
+        if self.qat_epochs > 0:
+            self._run_qat_phase()
+            export_model, export_checkpoint = self.qat_model, self.qat_weights_checkpoint_name
+
         logging.warning('Quantizing Model')
 
         q = Quantizer(self.test_set,
-                      self.model,
+                      export_model,
                       self.quantizer_name,
                       batches=self.quant_batches,
-                      weights_checkpoint_name=self.weights_checkpoint_name,
+                      weights_checkpoint_name=export_checkpoint,
                       append_datetime=False,
                       profile=self.export_profile,
                       reparameterize=self.reparameterize,
@@ -400,6 +447,44 @@ class TrainingDriver():
 
         q.quantize()
         self.quantizer = q
+
+    def _run_qat_phase(self):
+        '''Prepare the trained model for whole-model QAT and fine-tune it.'''
+        logging.warning('Whole-model QAT fine-tuning')
+        self.model.load_weights(self.weights_checkpoint_name)
+
+        calibration = []
+        for batch in itertools.islice(iter(self.train_set), self.qat_calibration_batches):
+            calibration.append(np.asarray(batch[0] if isinstance(batch, (tuple, list)) else batch, dtype=np.float32))
+        calibration = np.concatenate(calibration)
+
+        profile = deploy_utils.get_profile(self.export_profile)
+        prepared = deploy_utils.prepare_qat(self.model, calibration, per_channel=profile.per_channel)
+        if prepared.unwrapped_layers:
+            logging.warning('Layers left out of QAT: %s', ', '.join(prepared.unwrapped_layers))
+
+        # losses and metrics given by output name follow the outputs,
+        # whose layers were renamed by the preparation
+        renamed = dict(zip(self.model.output_names, prepared.output_names))
+
+        def by_output(spec):
+            return {renamed.get(key, key): value for key, value in spec.items()} if isinstance(spec, dict) else spec
+
+        optimizer = self.qat_optimizer if self.qat_optimizer is not None else tf.keras.optimizers.Adam(
+            self.qat_learning_rate)
+        prepared.compile(loss=by_output(self.loss), loss_weights=by_output(self.loss_weights),
+                         optimizer=optimizer, metrics=by_output(self.metrics))
+
+        callbacks = [
+            tf.keras.callbacks.TensorBoard(log_dir=self.logsname + '_qat'),
+            tf.keras.callbacks.ModelCheckpoint(self.qat_weights_checkpoint_name, save_weights_only=True,
+                                               save_best_only=True),
+            tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=self.patience, mode='min',
+                                             restore_best_weights=True),
+        ] + self.user_callbacks
+        self.qat_history = prepared.fit(self.train_set, epochs=self.qat_epochs, validation_data=self.val_set,
+                                        callbacks=callbacks)
+        self.qat_model = prepared
 
 
 # ========================= #

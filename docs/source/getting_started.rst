@@ -74,8 +74,14 @@ Segmentation in five steps
           train_augmentations=albu.Compose([albu.HorizontalFlip(p=0.5)]),
           normalization=model.preprocessing,
           seed=0,                        # reproducible train/val/test split
+          split_manifest="pets_split.json",   # written now, read back on later runs
       )
       train_set, val_set, test_set = loader.build_datasets()
+
+   The manifest lists which images are in each set. Keep it with the
+   checkpoint: a loader given the same file serves the same three sets
+   on any machine, so the model can be evaluated later on images it was
+   not trained on. A seed alone does not guarantee that.
 
 3. **Choose loss, optimizer and metrics.** The segmentation models return raw
    logits, so wrap probability-based losses with ``loss_adapter``.
@@ -101,7 +107,12 @@ Segmentation in five steps
           AdaBeliefOptimizer(learning_rate=1e-3), loss, model_metrics,
           train_set, val_set, test_set,
           epochs=20, unfreezed_epochs=20, patience=10,
+          data_loader=loader,            # also writes <name>_<timestamp>_split.json
       ).run()
+
+   Add ``qat_epochs=3`` for a short quantization-aware fine-tune of the
+   whole network before the export, when a model loses accuracy at export
+   (see :ref:`whole-model-qat`).
 
 5. **Collect the outputs**, written to the current directory:
 
@@ -201,7 +212,8 @@ file:
 
 Outputs are named after the heads. The data loaders yield one target per
 image, so a dataset with one target per head has to be assembled by the
-caller, and ``TrainingDriver`` assumes a single output. See
+caller. ``TrainingDriver`` takes the losses, loss weights and metrics of
+such a model as dictionaries keyed by head name. See
 :doc:`model_zoo` for the head types.
 
 Training strategies
