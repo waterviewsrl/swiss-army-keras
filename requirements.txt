@@ -6,6 +6,8 @@ tf-keras>=2.16
 git+https://github.com/waterviewsrl/efficientnet-lite-keras.git
 tensorflow_hub
 irondomo
+pyzmq
+setuptools<81
 nbsphinx
 sphinx
 sphinx_rtd_theme

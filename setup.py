@@ -57,7 +57,13 @@ setup(name='swiss_army_keras',
           # EfficientNet-Lite feature-vector backbones) - was never declared
           # (ASSESSMENT.md C1).
           'tensorflow_hub',
+          # tensorflow_hub 0.16 imports `pkg_resources`, which setuptools
+          # removed in version 81; a fresh environment gets the newest
+          # setuptools and then cannot import this package.
+          'setuptools<81',
           'irondomo',
+          # irondomo imports `zmq` without declaring it.
+          'pyzmq',
           'pillow',
           'tensorflow_model_optimization',
           # Previously used unconditionally (`dataset_utils.py`,
@@ -90,7 +96,8 @@ setup(name='swiss_army_keras',
           ],
           # One-time PyTorch -> Keras weight conversion (scripts/port_*_weights.py).
           'porting': ['torch', 'timm', 'safetensors'],
-          'docs': ['sphinx', 'sphinx_rtd_theme', 'nbsphinx'],
+          # ipython provides the `ipython3` lexer the notebooks are highlighted with
+          'docs': ['sphinx', 'sphinx_rtd_theme', 'nbsphinx', 'ipython'],
           'test': ['pytest'],
       },
       zip_safe=False)
